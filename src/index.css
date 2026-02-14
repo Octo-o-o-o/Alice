@@ -1,0 +1,187 @@
+@import "tailwindcss";
+
+/* Design Tokens from UI_SPEC.md */
+@theme {
+  /* Color Palette */
+  --color-gray-750: #2d3342;
+  --color-gray-850: #1a202c;
+  --color-gray-900: #111827;
+  --color-gray-950: #0B0F19;
+  --color-alice-bg: rgba(20, 20, 30, 0.75);
+  --color-alice-border: rgba(255, 255, 255, 0.08);
+
+  /* Shadows */
+  --shadow-glass: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  --shadow-glow-blue: 0 0 15px rgba(59, 130, 246, 0.3);
+  --shadow-glow-red: 0 0 15px rgba(239, 68, 68, 0.3);
+  --shadow-glow-yellow: 0 0 15px rgba(245, 158, 11, 0.3);
+  --shadow-glow-green: 0 0 15px rgba(16, 185, 129, 0.3);
+
+  /* Animations */
+  --animate-float: float 6s ease-in-out infinite;
+  --animate-pulse-slow: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  --animate-shimmer: shimmer-slide 1.5s infinite;
+  --animate-toast-in: toast-in 0.3s ease-out;
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-5px); }
+  }
+
+  @keyframes shimmer-slide {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+
+  @keyframes toast-in {
+    0% { opacity: 0; transform: translate(-50%, 8px); }
+    100% { opacity: 1; transform: translate(-50%, 0); }
+  }
+}
+
+/* Font imports - Inter and JetBrains Mono */
+@font-face {
+  font-family: 'Inter';
+  src: url('./assets/fonts/Inter-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('./assets/fonts/JetBrainsMono-Variable.woff2') format('woff2');
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Base styles */
+:root {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  background: transparent;
+  color: #e5e7eb;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Glass effect utility classes */
+.glass-panel {
+  background: rgba(20, 20, 30, 0.75);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+}
+
+/* For Windows fallback */
+@supports not (backdrop-filter: blur(16px)) {
+  .glass-panel {
+    background: rgba(11, 15, 25, 0.95);
+  }
+}
+
+/* Monospace font utility */
+.font-mono {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+/* Drag handle for window */
+.drag-region {
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* Status dot animations */
+.status-dot-active {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+.status-dot-warning {
+  animation: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Progress shimmer */
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.1),
+    transparent
+  );
+  animation: shimmer-slide 1.5s infinite;
+}
+
+/* Shadow glow utilities */
+.shadow-glow-blue {
+  box-shadow: 0 0 15px rgba(59, 130, 246, 0.3);
+}
+
+.shadow-glow-green {
+  box-shadow: 0 0 15px rgba(16, 185, 129, 0.3);
+}
+
+.shadow-glow-yellow {
+  box-shadow: 0 0 15px rgba(245, 158, 11, 0.3);
+}
+
+.shadow-glow-red {
+  box-shadow: 0 0 15px rgba(239, 68, 68, 0.3);
+}
+
+/* Line clamp utilities */
+.line-clamp-1 {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+}
+
+.line-clamp-2 {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.line-clamp-3 {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
