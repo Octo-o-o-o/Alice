@@ -88,8 +88,7 @@ fn now() -> Instant {
 
 /// Get the Claude directory path
 fn get_claude_dir() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    Ok(home.join(".claude"))
+    Ok(crate::platform::get_claude_dir())
 }
 
 /// Perform initial scan of existing session files
@@ -175,41 +174,9 @@ fn process_session_file(app: &AppHandle, path: &Path) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// Decode the encoded project path
-/// Claude Code encodes project paths by replacing / with - and other special handling
+/// Decode the encoded project path (delegates to platform module for cross-platform support)
 fn decode_project_path(encoded: &str) -> String {
-    // The encoding is: replace '/' with '-', URL-encode special chars
-    // For simplicity, we'll just handle common cases
-
-    // First try URL decoding
-    let decoded = urlencoding::decode(encoded).unwrap_or_else(|_| encoded.into());
-
-    // Claude Code uses base64-like encoding for paths
-    // The format appears to be the full path with '/' replaced by certain sequences
-    // For now, we'll try to reconstruct a reasonable path
-
-    // Check if it starts with typical path indicators
-    if decoded.starts_with("-Users-") || decoded.starts_with("-home-") {
-        // Replace leading dash and remaining dashes that represent /
-        return decoded
-            .strip_prefix("-")
-            .unwrap_or(&decoded)
-            .replace("-", "/");
-    }
-
-    // If it looks like an absolute path already, return as-is
-    if decoded.starts_with("/") {
-        return decoded.to_string();
-    }
-
-    // Otherwise, assume it's a relative path from home
-    if let Some(home) = dirs::home_dir() {
-        if decoded.contains("-") {
-            return format!("{}/{}", home.display(), decoded.replace("-", "/"));
-        }
-    }
-
-    decoded.to_string()
+    crate::platform::decode_project_path(encoded)
 }
 
 /// Watch for history.jsonl changes

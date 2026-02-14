@@ -17,6 +17,7 @@ import HistoryView from "./views/HistoryView";
 import ConfigView from "./views/ConfigView";
 import SearchOverlay from "./components/SearchOverlay";
 import OnboardingWizard from "./components/OnboardingWizard";
+import { getModKey } from "./lib/platform";
 import { ToastProvider } from "./contexts/ToastContext";
 
 interface AppConfig {
@@ -181,7 +182,7 @@ function App() {
             <Search size={14} />
             <span className="text-xs">Search sessions...</span>
             <kbd className="ml-auto text-[10px] text-gray-600 bg-gray-800 border border-gray-700 rounded px-1 py-0.5 font-mono">
-              ⌘K
+              {getModKey()}K
             </kbd>
           </button>
         </header>

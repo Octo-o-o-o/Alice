@@ -12,6 +12,9 @@ import {
   useSensor,
   useSensors,
   DragEndEvent,
+  DragOverEvent,
+  DragStartEvent,
+  useDroppable,
 } from "@dnd-kit/core";
 import {
   arrayMove,
@@ -34,6 +37,8 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps) {
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [selectedTasks, setSelectedTasks] = useState<Set<string>>(new Set());
   const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [overId, setOverId] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const toast = useToast();
 
@@ -152,36 +157,113 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps) {
     }
   };
 
-  const handleDragEnd = async (event: DragEndEvent, taskList: Task[], status: "backlog" | "queued") => {
+  const handleDragStart = (event: DragStartEvent) => {
+    setActiveId(event.active.id as string);
+  };
+
+  const handleDragOver = (event: DragOverEvent) => {
+    const { over } = event;
+    setOverId(over?.id as string | null);
+  };
+
+  const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event;
+    setActiveId(null);
+    setOverId(null);
 
-    if (over && active.id !== over.id) {
-      const oldIndex = taskList.findIndex((t) => t.id === active.id);
-      const newIndex = taskList.findIndex((t) => t.id === over.id);
-      const reordered = arrayMove(taskList, oldIndex, newIndex);
+    if (!over) return;
 
-      // Optimistically update UI
-      if (status === "backlog") {
-        setTasks((prev) => {
-          const others = prev.filter((t) => t.status !== "backlog");
-          return [...reordered, ...others];
-        });
-      } else {
-        setTasks((prev) => {
-          const others = prev.filter((t) => t.status !== "queued" && t.status !== "running");
-          return [...others, ...reordered];
-        });
-      }
+    const activeTaskId = active.id as string;
+    const overTaskId = over.id as string;
 
-      // Persist to backend
+    // Find which section the task is being dragged from and to
+    const activeTask = tasks.find(t => t.id === activeTaskId);
+    if (!activeTask) return;
+
+    const fromBacklog = activeTask.status === "backlog";
+    const fromQueue = activeTask.status === "queued" || activeTask.status === "running";
+
+    // Determine target section from the over element
+    const isOverBacklogDropzone = overTaskId === "backlog-dropzone";
+    const isOverQueueDropzone = overTaskId === "queue-dropzone";
+    const overTask = tasks.find(t => t.id === overTaskId);
+    const toBacklog = isOverBacklogDropzone || (overTask && overTask.status === "backlog");
+    const toQueue = isOverQueueDropzone || (overTask && (overTask.status === "queued" || overTask.status === "running"));
+
+    // Handle cross-section moves
+    if (fromBacklog && toQueue) {
+      // Move from backlog to queue
       try {
-        await invoke("reorder_tasks", {
-          taskIds: reordered.map((t) => t.id),
+        await invoke("update_task", {
+          id: activeTaskId,
+          status: "queued",
+          prompt: null,
+          priority: null,
+          sortOrder: null,
         });
+        loadTasks();
+        toast.success("Task moved to queue");
       } catch (error) {
-        console.error("Failed to reorder tasks:", error);
-        toast.error("Failed to save order");
-        loadTasks(); // Revert to actual state
+        console.error("Failed to move task to queue:", error);
+        toast.error("Failed to move task");
+      }
+      return;
+    }
+
+    if (fromQueue && toBacklog && activeTask.status !== "running") {
+      // Move from queue to backlog
+      try {
+        await invoke("update_task", {
+          id: activeTaskId,
+          status: "backlog",
+          prompt: null,
+          priority: null,
+          sortOrder: null,
+        });
+        loadTasks();
+        toast.success("Task moved to backlog");
+      } catch (error) {
+        console.error("Failed to move task to backlog:", error);
+        toast.error("Failed to move task");
+      }
+      return;
+    }
+
+    // Handle reordering within the same section
+    if (activeTaskId !== overTaskId && overTask) {
+      const sameSection = (fromBacklog && toBacklog) || (fromQueue && toQueue);
+      if (sameSection) {
+        const taskList = fromBacklog ? backlogTasks : queuedTasks;
+        const oldIndex = taskList.findIndex((t) => t.id === activeTaskId);
+        const newIndex = taskList.findIndex((t) => t.id === overTaskId);
+
+        if (oldIndex !== -1 && newIndex !== -1) {
+          const reordered = arrayMove(taskList, oldIndex, newIndex);
+
+          // Optimistically update UI
+          if (fromBacklog) {
+            setTasks((prev) => {
+              const others = prev.filter((t) => t.status !== "backlog");
+              return [...reordered, ...others];
+            });
+          } else {
+            setTasks((prev) => {
+              const others = prev.filter((t) => t.status !== "queued" && t.status !== "running");
+              return [...others, ...reordered];
+            });
+          }
+
+          // Persist to backend
+          try {
+            await invoke("reorder_tasks", {
+              taskIds: reordered.map((t) => t.id),
+            });
+          } catch (error) {
+            console.error("Failed to reorder tasks:", error);
+            toast.error("Failed to save order");
+            loadTasks(); // Revert to actual state
+          }
+        }
       }
     }
   };
@@ -291,139 +373,145 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps) {
         </form>
       </div>
 
-      <div className="flex-1 overflow-y-auto">
-        {/* Backlog section */}
-        <div className="p-3">
-          <div className="flex items-center justify-between mb-2">
-            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-              Backlog ({backlogTasks.length})
-            </h3>
-            {backlogTasks.length > 0 && (
-              <div className="flex items-center gap-2">
-                {selectedTasks.size > 0 ? (
-                  <>
-                    <span className="text-[10px] text-blue-400">
-                      {selectedTasks.size} selected
-                    </span>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragStart={handleDragStart}
+        onDragOver={handleDragOver}
+        onDragEnd={handleDragEnd}
+      >
+        <div className="flex-1 overflow-y-auto">
+          {/* Backlog section */}
+          <div className="p-3">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                Backlog ({backlogTasks.length})
+              </h3>
+              {backlogTasks.length > 0 && (
+                <div className="flex items-center gap-2">
+                  {selectedTasks.size > 0 ? (
+                    <>
+                      <span className="text-[10px] text-blue-400">
+                        {selectedTasks.size} selected
+                      </span>
+                      <button
+                        onClick={queueSelected}
+                        className="flex items-center gap-1 px-2 py-1 text-xs text-blue-400 hover:text-blue-300 bg-blue-500/10 hover:bg-blue-500/20 rounded transition-colors"
+                      >
+                        <Play size={10} />
+                        Queue Selected
+                      </button>
+                      <button
+                        onClick={clearSelection}
+                        className="text-[10px] text-gray-500 hover:text-gray-300"
+                      >
+                        Clear
+                      </button>
+                    </>
+                  ) : (
                     <button
-                      onClick={queueSelected}
-                      className="flex items-center gap-1 px-2 py-1 text-xs text-blue-400 hover:text-blue-300 bg-blue-500/10 hover:bg-blue-500/20 rounded transition-colors"
-                    >
-                      <Play size={10} />
-                      Queue Selected
-                    </button>
-                    <button
-                      onClick={clearSelection}
+                      onClick={selectAllBacklog}
                       className="text-[10px] text-gray-500 hover:text-gray-300"
                     >
-                      Clear
+                      Select all
                     </button>
-                  </>
-                ) : (
-                  <button
-                    onClick={selectAllBacklog}
-                    className="text-[10px] text-gray-500 hover:text-gray-300"
-                  >
-                    Select all
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-
-          {backlogTasks.length === 0 ? (
-            <div className="text-center py-6 text-gray-500 text-sm">
-              <ListTodo size={24} className="mx-auto mb-2 opacity-50" />
-              <p>No tasks yet</p>
-            </div>
-          ) : (
-            <DndContext
-              sensors={sensors}
-              collisionDetection={closestCenter}
-              onDragEnd={(e) => handleDragEnd(e, backlogTasks, "backlog")}
-            >
-              <SortableContext items={backlogTasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
-                <div className="space-y-2">
-                  {backlogTasks.map((task) => (
-                    <SortableTaskItem
-                      key={task.id}
-                      task={task}
-                      isSelected={selectedTasks.has(task.id)}
-                      onToggleSelect={(shiftKey) => toggleTaskSelection(task.id, shiftKey)}
-                      onMoveToQueue={() => updateTaskStatus(task.id, "queued")}
-                      onDelete={() => deleteTask(task.id)}
-                    />
-                  ))}
+                  )}
                 </div>
-              </SortableContext>
-            </DndContext>
-          )}
-        </div>
-
-        {/* Queue section */}
-        <div className="p-3 border-t border-white/5">
-          <div className="flex items-center justify-between mb-2">
-            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-2">
-              Queue ({queuedTasks.length})
-              {queueRunning && (
-                <span className="inline-flex items-center gap-1 text-[10px] text-blue-400 bg-blue-500/20 px-1.5 py-0.5 rounded">
-                  <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-pulse" />
-                  Running
-                </span>
               )}
-            </h3>
-            {queuedTasks.length > 0 && (
-              <div className="flex items-center gap-1">
-                {queueRunning ? (
-                  <button
-                    onClick={stopQueue}
-                    className="flex items-center gap-1 px-2 py-1 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded transition-colors"
-                    title="Stop queue"
-                  >
-                    <Square size={12} />
-                    Stop
-                  </button>
-                ) : (
-                  <button
-                    onClick={startQueue}
-                    className="flex items-center gap-1 px-2 py-1 text-xs text-green-400 hover:text-green-300 hover:bg-green-500/10 rounded transition-colors"
-                    title="Start queue"
-                  >
-                    <Play size={12} />
-                    Start
-                  </button>
-                )}
-              </div>
-            )}
+            </div>
+
+            <DroppableSection id="backlog-dropzone" isOver={overId === "backlog-dropzone"}>
+              {backlogTasks.length === 0 ? (
+                <div className="text-center py-6 text-gray-500 text-sm">
+                  <ListTodo size={24} className="mx-auto mb-2 opacity-50" />
+                  <p>No tasks yet</p>
+                  {activeId && queuedTasks.find(t => t.id === activeId) && (
+                    <p className="text-xs text-blue-400 mt-2">Drop here to move to backlog</p>
+                  )}
+                </div>
+              ) : (
+                <SortableContext items={backlogTasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
+                  <div className="space-y-2">
+                    {backlogTasks.map((task) => (
+                      <SortableTaskItem
+                        key={task.id}
+                        task={task}
+                        isSelected={selectedTasks.has(task.id)}
+                        onToggleSelect={(shiftKey) => toggleTaskSelection(task.id, shiftKey)}
+                        onMoveToQueue={() => updateTaskStatus(task.id, "queued")}
+                        onDelete={() => deleteTask(task.id)}
+                      />
+                    ))}
+                  </div>
+                </SortableContext>
+              )}
+            </DroppableSection>
           </div>
 
-          {queuedTasks.length === 0 ? (
-            <div className="text-center py-4 text-gray-600 text-xs">
-              Move tasks here to queue them for execution
-            </div>
-          ) : (
-            <DndContext
-              sensors={sensors}
-              collisionDetection={closestCenter}
-              onDragEnd={(e) => handleDragEnd(e, queuedTasks, "queued")}
-            >
-              <SortableContext items={queuedTasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
-                <div className="space-y-2">
-                  {queuedTasks.map((task, index) => (
-                    <SortableQueueItem
-                      key={task.id}
-                      task={task}
-                      isFirst={index === 0}
-                      isLast={index === queuedTasks.length - 1}
-                      isCurrent={task.id === currentTaskId}
-                      onRemove={() => updateTaskStatus(task.id, "backlog")}
-                    />
-                  ))}
+          {/* Queue section */}
+          <div className="p-3 border-t border-white/5">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-2">
+                Queue ({queuedTasks.length})
+                {queueRunning && (
+                  <span className="inline-flex items-center gap-1 text-[10px] text-blue-400 bg-blue-500/20 px-1.5 py-0.5 rounded">
+                    <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-pulse" />
+                    Running
+                  </span>
+                )}
+              </h3>
+              {queuedTasks.length > 0 && (
+                <div className="flex items-center gap-1">
+                  {queueRunning ? (
+                    <button
+                      onClick={stopQueue}
+                      className="flex items-center gap-1 px-2 py-1 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded transition-colors"
+                      title="Stop queue"
+                    >
+                      <Square size={12} />
+                      Stop
+                    </button>
+                  ) : (
+                    <button
+                      onClick={startQueue}
+                      className="flex items-center gap-1 px-2 py-1 text-xs text-green-400 hover:text-green-300 hover:bg-green-500/10 rounded transition-colors"
+                      title="Start queue"
+                    >
+                      <Play size={12} />
+                      Start
+                    </button>
+                  )}
                 </div>
-              </SortableContext>
-            </DndContext>
-          )}
-        </div>
+              )}
+            </div>
+
+            <DroppableSection id="queue-dropzone" isOver={overId === "queue-dropzone"}>
+              {queuedTasks.length === 0 ? (
+                <div className="text-center py-4 text-gray-600 text-xs">
+                  {activeId && backlogTasks.find(t => t.id === activeId) ? (
+                    <p className="text-blue-400">Drop here to add to queue</p>
+                  ) : (
+                    <p>Move tasks here to queue them for execution</p>
+                  )}
+                </div>
+              ) : (
+                <SortableContext items={queuedTasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
+                  <div className="space-y-2">
+                    {queuedTasks.map((task, index) => (
+                      <SortableQueueItem
+                        key={task.id}
+                        task={task}
+                        isFirst={index === 0}
+                        isLast={index === queuedTasks.length - 1}
+                        isCurrent={task.id === currentTaskId}
+                        onRemove={() => updateTaskStatus(task.id, "backlog")}
+                      />
+                    ))}
+                  </div>
+                </SortableContext>
+              )}
+            </DroppableSection>
+          </div>
 
         {/* Completed section */}
         {completedTasks.length > 0 && (
@@ -464,7 +552,8 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps) {
             </details>
           </div>
         )}
-      </div>
+        </div>
+      </DndContext>
     </div>
   );
 }
@@ -564,6 +653,27 @@ interface SortableQueueItemProps {
   onRemove: () => void;
 }
 
+interface DroppableSectionProps {
+  id: string;
+  children: React.ReactNode;
+  isOver?: boolean;
+}
+
+function DroppableSection({ id, children, isOver }: DroppableSectionProps) {
+  const { setNodeRef, isOver: dropIsOver } = useDroppable({ id });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={`min-h-[60px] rounded-lg transition-colors ${
+        (isOver || dropIsOver) ? "bg-blue-500/10 border-2 border-dashed border-blue-500/30" : ""
+      }`}
+    >
+      {children}
+    </div>
+  );
+}
+
 function SortableQueueItem({ task, isLast, isCurrent, onRemove }: SortableQueueItemProps) {
   const isRunning = task.status === "running" || isCurrent;
 
@@ -633,7 +743,7 @@ function SortableQueueItem({ task, isLast, isCurrent, onRemove }: SortableQueueI
         <div className="flex items-center gap-2 mt-1">
           {task.project_path && (
             <span className="text-[10px] text-gray-500 bg-gray-800 px-1.5 py-0.5 rounded">
-              {task.project_path.split("/").pop()}
+              {task.project_path.split(/[/\\]/).pop()}
             </span>
           )}
           <span className={`text-[10px] ${isRunning ? "text-blue-400" : "text-gray-500"}`}>

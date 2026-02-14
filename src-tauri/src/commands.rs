@@ -377,3 +377,125 @@ pub async fn export_session(
         _ => Err("Invalid format. Use 'json' or 'markdown'".to_string()),
     }
 }
+
+/// Install Alice hooks into Claude Code settings
+#[tauri::command]
+pub async fn install_hooks() -> Result<HooksInstallResult, String> {
+    let settings_path = crate::platform::get_claude_dir().join("settings.json");
+
+    // Create the hooks configuration for Alice (platform-aware commands)
+    let alice_hooks = serde_json::json!({
+        "hooks": {
+            "SessionStart": [
+                {
+                    "type": "command",
+                    "command": crate::platform::get_hook_command("session_start", true)
+                }
+            ],
+            "Stop": [
+                {
+                    "type": "command",
+                    "command": crate::platform::get_hook_command("stop", false)
+                }
+            ],
+            "SessionEnd": [
+                {
+                    "type": "command",
+                    "command": crate::platform::get_hook_command("session_end", false)
+                }
+            ]
+        }
+    });
+
+    // Read existing settings or create new
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = std::fs::read_to_string(&settings_path)
+            .map_err(|e| format!("Failed to read settings: {}", e))?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // Merge hooks into settings
+    if let Some(hooks) = alice_hooks.get("hooks") {
+        if let Some(settings_obj) = settings.as_object_mut() {
+            if let Some(existing_hooks) = settings_obj.get_mut("hooks") {
+                // Merge with existing hooks
+                if let (Some(existing), Some(new)) = (existing_hooks.as_object_mut(), hooks.as_object()) {
+                    for (key, value) in new {
+                        existing.insert(key.clone(), value.clone());
+                    }
+                }
+            } else {
+                settings_obj.insert("hooks".to_string(), hooks.clone());
+            }
+        }
+    }
+
+    // Write settings back
+    let settings_content = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("Failed to serialize settings: {}", e))?;
+
+    // Create .claude directory if it doesn't exist
+    let claude_dir = crate::platform::get_claude_dir();
+    std::fs::create_dir_all(&claude_dir)
+        .map_err(|e| format!("Failed to create .claude directory: {}", e))?;
+
+    std::fs::write(&settings_path, &settings_content)
+        .map_err(|e| format!("Failed to write settings: {}", e))?;
+
+    // Create the hooks events file if it doesn't exist
+    let alice_dir = crate::platform::get_alice_dir();
+    std::fs::create_dir_all(&alice_dir)
+        .map_err(|e| format!("Failed to create .alice directory: {}", e))?;
+
+    let hooks_file = alice_dir.join("hooks-events.jsonl");
+    if !hooks_file.exists() {
+        std::fs::write(&hooks_file, "")
+            .map_err(|e| format!("Failed to create hooks events file: {}", e))?;
+    }
+
+    // Update config to mark hooks as installed
+    let mut config = crate::config::load_config();
+    config.hooks_installed = true;
+    let _ = crate::config::save_config(&config);
+
+    Ok(HooksInstallResult {
+        success: true,
+        settings_path: settings_path.to_string_lossy().to_string(),
+        hooks_file: hooks_file.to_string_lossy().to_string(),
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HooksInstallResult {
+    pub success: bool,
+    pub settings_path: String,
+    pub hooks_file: String,
+}
+
+/// Check if hooks are installed
+#[tauri::command]
+pub async fn check_hooks_installed() -> bool {
+    let config = crate::config::load_config();
+    config.hooks_installed
+}
+
+/// Generate AI summary for a daily report
+#[tauri::command]
+pub async fn generate_report_ai_summary(date: String) -> Result<crate::report::DailyReport, String> {
+    // Load the existing report
+    let report = crate::report::load_report(&date)?;
+
+    // Generate AI summary
+    let summary = crate::report::generate_ai_summary(&report).await?;
+
+    // Update report with summary
+    crate::report::update_report_with_summary(&date, &summary)
+}
+
+/// Get Anthropic service status
+#[tauri::command]
+pub async fn get_anthropic_status() -> Result<crate::usage::AnthropicStatus, String> {
+    crate::usage::fetch_anthropic_status().await
+}

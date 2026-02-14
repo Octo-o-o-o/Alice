@@ -76,6 +76,59 @@ impl QueueExecutor {
         self.current_task.lock().await.clone()
     }
 
+    /// Find the next task that has all dependencies satisfied
+    fn find_next_executable_task(&self, tasks: &[Task]) -> Option<Task> {
+        // Get all tasks to check dependency status
+        let all_tasks = database::get_tasks(&self.app, None, None).ok()?;
+
+        for task in tasks {
+            if let Some(ref depends_on_id) = task.depends_on {
+                // Find the dependency task
+                let dependency = all_tasks.iter().find(|t| &t.id == depends_on_id);
+
+                match dependency {
+                    Some(dep) => {
+                        // Check if dependency is completed
+                        if dep.status == TaskStatus::Completed {
+                            // Dependency is satisfied, this task can run
+                            return Some(task.clone());
+                        } else if dep.status == TaskStatus::Failed || dep.status == TaskStatus::Skipped {
+                            // Dependency failed, skip this task
+                            tracing::warn!(
+                                "Skipping task {} because dependency {} has status {:?}",
+                                task.id, depends_on_id, dep.status
+                            );
+                            let _ = database::update_task(
+                                &self.app,
+                                &task.id,
+                                Some(TaskStatus::Skipped),
+                                None,
+                                None,
+                                None,
+                            );
+                            continue;
+                        }
+                        // Dependency not yet completed, skip to next task
+                        continue;
+                    }
+                    None => {
+                        // Dependency task not found, treat as satisfied (may have been deleted)
+                        tracing::warn!(
+                            "Dependency {} for task {} not found, proceeding anyway",
+                            depends_on_id, task.id
+                        );
+                        return Some(task.clone());
+                    }
+                }
+            } else {
+                // No dependency, this task can run
+                return Some(task.clone());
+            }
+        }
+
+        None
+    }
+
     /// Emit queue status to frontend
     async fn emit_status(&self) {
         let queued = database::get_tasks(&self.app, Some(TaskStatus::Queued), None)
@@ -103,11 +156,19 @@ impl QueueExecutor {
                 }
             };
 
-            let task = match tasks.into_iter().next() {
+            // Find the next task that has all dependencies satisfied
+            let task = self.find_next_executable_task(&tasks);
+
+            let task = match task {
                 Some(t) => t,
                 None => {
-                    // No more tasks, stop queue
-                    tracing::info!("Queue empty, stopping executor");
+                    if tasks.is_empty() {
+                        // No more tasks, stop queue
+                        tracing::info!("Queue empty, stopping executor");
+                    } else {
+                        // Tasks exist but all have unmet dependencies
+                        tracing::info!("All queued tasks have unmet dependencies, stopping executor");
+                    }
                     break;
                 }
             };
@@ -120,7 +181,7 @@ impl QueueExecutor {
                     // Notify completion
                     let project_name = task.project_path
                         .as_ref()
-                        .and_then(|p| p.split('/').last())
+                        .map(|p| crate::platform::path_file_name(p))
                         .unwrap_or("Unknown")
                         .to_string();
 
@@ -138,7 +199,7 @@ impl QueueExecutor {
                     // Notify error
                     let project_name = task.project_path
                         .as_ref()
-                        .and_then(|p| p.split('/').last())
+                        .map(|p| crate::platform::path_file_name(p))
                         .unwrap_or("Unknown")
                         .to_string();
 
@@ -165,7 +226,7 @@ impl QueueExecutor {
         // Emit queue started notification
         let project_name = task.project_path
             .as_ref()
-            .and_then(|p| p.split('/').last())
+            .map(|p| crate::platform::path_file_name(p))
             .unwrap_or("Unknown")
             .to_string();
         let _ = notification::notify_queue_started(&self.app, &project_name, &task.prompt);
@@ -177,9 +238,26 @@ impl QueueExecutor {
         cmd.arg("-p")
             .arg(&task.prompt)
             .arg("--output-format")
-            .arg("json")
-            .arg("--max-turns")
-            .arg("50");
+            .arg("json");
+
+        // Use task's max_turns if specified, otherwise default to 50
+        let max_turns = task.max_turns.unwrap_or(50);
+        cmd.arg("--max-turns").arg(max_turns.to_string());
+
+        // Add system prompt if specified
+        if let Some(ref system_prompt) = task.system_prompt {
+            cmd.arg("--system-prompt").arg(system_prompt);
+        }
+
+        // Add allowed tools if specified
+        if let Some(ref allowed_tools) = task.allowed_tools {
+            // allowed_tools is stored as JSON array, parse and add each
+            if let Ok(tools) = serde_json::from_str::<Vec<String>>(allowed_tools) {
+                for tool in tools {
+                    cmd.arg("--allowedTools").arg(tool);
+                }
+            }
+        }
 
         // Set working directory if project path is specified
         if let Some(ref project_path) = task.project_path {

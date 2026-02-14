@@ -90,8 +90,7 @@ static DB: once_cell::sync::OnceCell<Mutex<Connection>> = once_cell::sync::OnceC
 
 /// Get the Alice data directory
 fn get_alice_dir() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    home.join(".alice")
+    crate::platform::get_alice_dir()
 }
 
 /// Get the database path

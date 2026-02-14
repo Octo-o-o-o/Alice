@@ -220,7 +220,7 @@ export default function HistoryView() {
                   <option value="">All projects</option>
                   {projects.map((p) => (
                     <option key={p} value={p}>
-                      {p.split("/").pop()}
+                      {p.split(/[/\\]/).pop()}
                     </option>
                   ))}
                 </select>

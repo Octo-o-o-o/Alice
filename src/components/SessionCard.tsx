@@ -220,7 +220,7 @@ export default function SessionCard({ session, compact = false, onLabelChange, o
 
       if (filePath) {
         await writeTextFile(filePath, content);
-        toast.success(`Session exported to ${filePath.split("/").pop()}`);
+        toast.success(`Session exported to ${filePath.split(/[/\\]/).pop()}`);
       }
       setShowActions(false);
     } catch (error) {

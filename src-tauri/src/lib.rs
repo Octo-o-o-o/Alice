@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod database;
 mod notification;
+mod platform;
 mod queue;
 mod report;
 mod session;
@@ -55,7 +56,7 @@ pub fn run() {
             let app_handle_tray = app.handle().clone();
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().unwrap().clone())
-                .icon_as_template(true)
+                .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("Alice - Claude Code Assistant")
                 .on_tray_icon_event(move |tray, event| {
                     if let TrayIconEvent::Click {
@@ -70,14 +71,20 @@ pub fn run() {
                             if window.is_visible().unwrap_or(false) {
                                 let _ = window.hide();
                             } else {
-                                // Position window near tray icon (top-right on macOS)
-                                // Simplified positioning for Tauri 2.0 API compatibility
+                                // Position window near tray area
                                 if let Ok(Some(monitor)) = window.current_monitor() {
                                     let size = monitor.size();
                                     let window_size = window.outer_size().unwrap_or_default();
-                                    // Position at top-right, below menu bar
                                     let x = (size.width as i32 - window_size.width as i32) - 20;
-                                    let y = 30; // Below menu bar
+
+                                    // macOS: tray is at top → position below menu bar
+                                    // Windows: taskbar is at bottom → position above taskbar
+                                    let y = if cfg!(target_os = "windows") {
+                                        (size.height as i32 - window_size.height as i32) - 60
+                                    } else {
+                                        30
+                                    };
+
                                     let _ = window.set_position(tauri::Position::Physical(
                                         tauri::PhysicalPosition::new(x, y),
                                     ));
@@ -134,6 +141,10 @@ pub fn run() {
             commands::reorder_tasks,
             commands::update_session_label,
             commands::scan_claude_directory,
+            commands::install_hooks,
+            commands::check_hooks_installed,
+            commands::generate_report_ai_summary,
+            commands::get_anthropic_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

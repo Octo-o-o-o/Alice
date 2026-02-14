@@ -18,6 +18,9 @@ pub struct AppConfig {
     /// Play notification sound
     #[serde(default = "default_true")]
     pub notification_sound: bool,
+    /// Voice notifications using TTS (macOS say command)
+    #[serde(default)]
+    pub voice_notifications: bool,
     /// Notification settings
     #[serde(default)]
     pub notifications: NotificationConfig,
@@ -63,6 +66,7 @@ impl Default for AppConfig {
             launch_at_login: false,
             auto_hide_on_blur: true,
             notification_sound: true,
+            voice_notifications: false,
             notifications: NotificationConfig::default(),
             hooks_installed: false,
             data_retention_days: 0,
@@ -85,8 +89,7 @@ impl Default for NotificationConfig {
 
 /// Get the config file path
 fn get_config_path() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    home.join(".alice").join("config.json")
+    crate::platform::get_alice_dir().join("config.json")
 }
 
 /// Load configuration from disk
@@ -138,6 +141,9 @@ pub fn update_config_value(key: &str, value: serde_json::Value) -> Result<AppCon
         "notification_sound" => {
             config.notification_sound = value.as_bool().unwrap_or(true);
         }
+        "voice_notifications" => {
+            config.voice_notifications = value.as_bool().unwrap_or(false);
+        }
         "hooks_installed" => {
             config.hooks_installed = value.as_bool().unwrap_or(false);
         }
@@ -171,9 +177,7 @@ pub fn update_config_value(key: &str, value: serde_json::Value) -> Result<AppCon
 
 /// Get database statistics
 pub fn get_db_stats() -> DbStats {
-    let alice_dir = dirs::home_dir()
-        .expect("Could not find home directory")
-        .join(".alice");
+    let alice_dir = crate::platform::get_alice_dir();
 
     let db_path = alice_dir.join("alice.db");
     let db_size = std::fs::metadata(&db_path)
@@ -204,11 +208,7 @@ pub struct DbStats {
 
 /// Check if Claude Code is installed
 pub fn is_claude_installed() -> bool {
-    std::process::Command::new("which")
-        .arg("claude")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    crate::platform::is_cli_installed("claude")
 }
 
 /// Get Claude Code version

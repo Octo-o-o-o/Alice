@@ -19,6 +19,8 @@ pub struct DailyReport {
     pub pending_tasks: Vec<TaskSummary>,
     pub generated_at: i64,
     pub markdown: String,
+    #[serde(default)]
+    pub ai_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +125,7 @@ pub fn generate_report(app: &AppHandle, date: &str) -> Result<DailyReport, Strin
         pending_tasks,
         generated_at: Utc::now().timestamp_millis(),
         markdown,
+        ai_summary: None,
     };
 
     // Save report to disk
@@ -345,8 +348,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 
 /// Save report to disk
 fn save_report(report: &DailyReport) -> Result<(), String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    let reports_dir = home.join(".alice").join("reports");
+    let reports_dir = crate::platform::get_alice_dir().join("reports");
 
     std::fs::create_dir_all(&reports_dir)
         .map_err(|e| format!("Failed to create reports directory: {}", e))?;
@@ -367,8 +369,7 @@ fn save_report(report: &DailyReport) -> Result<(), String> {
 
 /// Load report from disk
 pub fn load_report(date: &str) -> Result<DailyReport, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    let json_path = home.join(".alice").join("reports").join(format!("{}.json", date));
+    let json_path = crate::platform::get_alice_dir().join("reports").join(format!("{}.json", date));
 
     let content = std::fs::read_to_string(&json_path)
         .map_err(|e| format!("Failed to read report: {}", e))?;
@@ -379,8 +380,7 @@ pub fn load_report(date: &str) -> Result<DailyReport, String> {
 
 /// List available reports
 pub fn list_reports() -> Result<Vec<String>, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    let reports_dir = home.join(".alice").join("reports");
+    let reports_dir = crate::platform::get_alice_dir().join("reports");
 
     if !reports_dir.exists() {
         return Ok(Vec::new());
@@ -407,4 +407,90 @@ pub fn list_reports() -> Result<Vec<String>, String> {
 pub fn generate_today_report(app: &AppHandle) -> Result<DailyReport, String> {
     let today = Local::now().format("%Y-%m-%d").to_string();
     generate_report(app, &today)
+}
+
+/// Generate AI summary for a report using Claude Haiku
+pub async fn generate_ai_summary(report: &DailyReport) -> Result<String, String> {
+    // Build a prompt with the report data
+    let mut prompt = String::new();
+    prompt.push_str("Based on the following daily coding activity, write a concise 2-3 sentence summary highlighting the key accomplishments and work done. Be specific about what was achieved.\n\n");
+
+    prompt.push_str(&format!("Date: {}\n", report.date));
+    prompt.push_str(&format!("Sessions: {}\n", report.usage_summary.total_sessions));
+    prompt.push_str(&format!("Total tokens used: {}\n", report.usage_summary.total_tokens));
+    prompt.push_str(&format!("Total cost: ${:.2}\n\n", report.usage_summary.total_cost_usd));
+
+    if !report.sessions.is_empty() {
+        prompt.push_str("Session topics:\n");
+        for s in report.sessions.iter().take(10) {
+            prompt.push_str(&format!("- {}: {}\n", s.project_name, truncate(&s.prompt, 100)));
+        }
+        prompt.push('\n');
+    }
+
+    if !report.git_commits.is_empty() {
+        let cc_commits: Vec<_> = report.git_commits.iter().filter(|c| c.is_cc_assisted).collect();
+        if !cc_commits.is_empty() {
+            prompt.push_str("CC-assisted commits:\n");
+            for c in cc_commits.iter().take(5) {
+                prompt.push_str(&format!("- {}: {}\n", c.project_name, c.message));
+            }
+        }
+    }
+
+    prompt.push_str("\nWrite only the summary, no explanations or extra text.");
+
+    // Call claude CLI with haiku model
+    let output = tokio::process::Command::new("claude")
+        .args([
+            "-p", &prompt,
+            "--model", "haiku",
+            "--max-turns", "1",
+            "--output-format", "text",
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run claude: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Claude failed: {}", stderr));
+    }
+
+    let summary = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Clean up any markdown formatting from the response
+    let summary = summary
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+        .to_string();
+
+    Ok(summary)
+}
+
+/// Update report with AI summary
+pub fn update_report_with_summary(date: &str, summary: &str) -> Result<DailyReport, String> {
+    let mut report = load_report(date)?;
+    report.ai_summary = Some(summary.to_string());
+
+    // Regenerate markdown with AI summary at the top
+    let mut new_markdown = String::new();
+    new_markdown.push_str(&format!("# Daily Report — {}\n\n", report.date));
+    new_markdown.push_str(&format!("> **AI Summary**: {}\n\n", summary));
+
+    // Add the rest of the markdown (skip the original header)
+    let original_content = report.markdown
+        .lines()
+        .skip(2) // Skip "# Daily Report — ..." and empty line
+        .collect::<Vec<_>>()
+        .join("\n");
+    new_markdown.push_str(&original_content);
+
+    report.markdown = new_markdown;
+
+    // Save updated report
+    save_report(&report)?;
+
+    Ok(report)
 }
