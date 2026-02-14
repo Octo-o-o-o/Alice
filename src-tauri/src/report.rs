@@ -1,8 +1,10 @@
 // Daily Report Generator
 
+#![allow(dead_code)]
+
 use crate::database::{self, TaskStatus};
 use crate::session::Session;
-use chrono::{DateTime, Local, NaiveDate, Utc};
+use chrono::{Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -144,6 +146,15 @@ fn get_git_commits_for_date(project_paths: &[String], date: &NaiveDate) -> Vec<G
     let mut commits = Vec::new();
     let date_str = date.format("%Y-%m-%d").to_string();
 
+    // Check if git is available on this platform
+    let git_cmd = match crate::platform::get_git_command() {
+        Some(cmd) => cmd,
+        None => {
+            tracing::warn!("Git not found on PATH, skipping commit collection");
+            return commits;
+        }
+    };
+
     for project_path in project_paths {
         let path = PathBuf::from(project_path);
         if !path.exists() {
@@ -158,7 +169,7 @@ fn get_git_commits_for_date(project_paths: &[String], date: &NaiveDate) -> Vec<G
             .to_string();
 
         // Run git log
-        let output = Command::new("git")
+        let output = Command::new(git_cmd)
             .current_dir(&path)
             .args([
                 "log",
@@ -440,8 +451,8 @@ pub async fn generate_ai_summary(report: &DailyReport) -> Result<String, String>
 
     prompt.push_str("\nWrite only the summary, no explanations or extra text.");
 
-    // Call claude CLI with haiku model
-    let output = tokio::process::Command::new("claude")
+    // Call claude CLI with haiku model (use platform-appropriate executable name)
+    let output = tokio::process::Command::new(crate::platform::get_claude_command())
         .args([
             "-p", &prompt,
             "--model", "haiku",

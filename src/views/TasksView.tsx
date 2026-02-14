@@ -1,8 +1,8 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Plus, ListTodo, Play, Pause, Trash2, GripVertical, Square, ChevronRight, CheckSquare, Square as SquareEmpty } from "lucide-react";
-import { Task, QueueStatusEvent } from "../lib/types";
+import { Plus, ListTodo, Play, Pause, Trash2, GripVertical, Square, ChevronRight, CheckSquare, Square as SquareEmpty, FolderOpen, X, Terminal } from "lucide-react";
+import { Task, QueueStatusEvent, QueueStartResult, TerminalOption } from "../lib/types";
 import { useToast } from "../contexts/ToastContext";
 import {
   DndContext,
@@ -33,13 +33,22 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [newTaskPrompt, setNewTaskPrompt] = useState("");
+  const [selectedProject, setSelectedProject] = useState<string | null>(null);
+  const [projects, setProjects] = useState<string[]>([]);
+  const [showProjectPicker, setShowProjectPicker] = useState(false);
   const [queueRunning, setQueueRunning] = useState(false);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [selectedTasks, setSelectedTasks] = useState<Set<string>>(new Set());
   const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [overId, setOverId] = useState<string | null>(null);
+  const [isComposing, setIsComposing] = useState(false);
+  const [showTerminalPicker, setShowTerminalPicker] = useState(false);
+  const [terminalOptions, setTerminalOptions] = useState<TerminalOption[]>([]);
+  const [selectedTerminal, setSelectedTerminal] = useState<string>("system");
+  const [rememberChoice, setRememberChoice] = useState(true);
   const inputRef = useRef<HTMLInputElement>(null);
+  const projectPickerRef = useRef<HTMLDivElement>(null);
   const toast = useToast();
 
   const sensors = useSensors(
@@ -65,6 +74,28 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps) {
     }
   };
 
+  const loadProjects = async () => {
+    try {
+      const result = await invoke<string[]>("get_projects", {});
+      setProjects(result);
+    } catch (error) {
+      console.error("Failed to load projects:", error);
+    }
+  };
+
+  const loadTerminalOptions = async () => {
+    try {
+      const result = await invoke<TerminalOption[]>("get_available_terminals", {});
+      setTerminalOptions(result);
+      // Default to system terminal
+      if (result.length > 1) {
+        setSelectedTerminal(result[1].value); // Skip "background", default to system
+      }
+    } catch (error) {
+      console.error("Failed to load terminal options:", error);
+    }
+  };
+
   const loadQueueStatus = async () => {
     try {
       const running = await invoke<boolean>("get_queue_status", {});
@@ -77,6 +108,7 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps) {
   useEffect(() => {
     loadTasks();
     loadQueueStatus();
+    loadProjects();
 
     // Listen for queue status updates
     const unlisten = listen<QueueStatusEvent>("queue-status", (event) => {
@@ -90,17 +122,32 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps) {
     };
   }, []);
 
+  // Close project picker when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (projectPickerRef.current && !projectPickerRef.current.contains(event.target as Node)) {
+        setShowProjectPicker(false);
+      }
+    };
+
+    if (showProjectPicker) {
+      document.addEventListener("mousedown", handleClickOutside);
+      return () => document.removeEventListener("mousedown", handleClickOutside);
+    }
+  }, [showProjectPicker]);
+
   const createTask = async () => {
     if (!newTaskPrompt.trim()) return;
 
     try {
       await invoke("create_task", {
         prompt: newTaskPrompt.trim(),
-        project: null,
+        project: selectedProject,
         priority: "medium",
         notes: null,
       });
       setNewTaskPrompt("");
+      setSelectedProject(null);
       loadTasks();
       toast.success("Task created");
     } catch (error) {
@@ -137,11 +184,44 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps) {
 
   const startQueue = async () => {
     try {
-      await invoke("start_queue", {});
-      setQueueRunning(true);
-      toast.success("Queue started");
+      const result = await invoke<QueueStartResult>("start_queue", {});
+
+      if (result.needs_terminal_choice) {
+        // First time running - show terminal picker
+        await loadTerminalOptions();
+        setShowTerminalPicker(true);
+        return;
+      }
+
+      if (result.started) {
+        setQueueRunning(true);
+        toast.success("Queue started");
+      }
     } catch (error) {
       console.error("Failed to start queue:", error);
+      toast.error("Failed to start queue");
+    }
+  };
+
+  const confirmTerminalChoice = async () => {
+    try {
+      // Save the terminal choice
+      await invoke("update_config", { key: "terminal_app", value: selectedTerminal });
+
+      if (rememberChoice) {
+        await invoke("update_config", { key: "terminal_choice_made", value: true });
+      }
+
+      setShowTerminalPicker(false);
+
+      // Now start the queue
+      const result = await invoke<QueueStartResult>("start_queue", {});
+      if (result.started) {
+        setQueueRunning(true);
+        toast.success("Queue started");
+      }
+    } catch (error) {
+      console.error("Failed to save terminal choice:", error);
       toast.error("Failed to start queue");
     }
   };
@@ -346,30 +426,169 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps) {
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
+      {/* Terminal Selection Modal */}
+      {showTerminalPicker && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="bg-gray-900 border border-white/10 rounded-xl p-5 w-80 shadow-2xl">
+            <div className="flex items-center gap-2 mb-4">
+              <Terminal size={20} className="text-blue-400" />
+              <h3 className="text-base font-semibold text-gray-200">Choose Terminal</h3>
+            </div>
+            <p className="text-xs text-gray-400 mb-4">
+              Select where to run Claude Code tasks. You can watch the execution in a visible terminal.
+            </p>
+
+            <div className="space-y-2 mb-4">
+              {terminalOptions.map((option) => (
+                <button
+                  key={option.value}
+                  onClick={() => setSelectedTerminal(option.value)}
+                  className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors ${
+                    selectedTerminal === option.value
+                      ? "bg-blue-600 text-white"
+                      : "bg-white/5 text-gray-300 hover:bg-white/10"
+                  }`}
+                >
+                  {option.label}
+                  {option.value === "background" && (
+                    <span className="block text-xs opacity-60 mt-0.5">Hidden execution</span>
+                  )}
+                  {option.value !== "background" && option.value !== "custom" && (
+                    <span className="block text-xs opacity-60 mt-0.5">Watch Claude work</span>
+                  )}
+                </button>
+              ))}
+            </div>
+
+            <label className="flex items-center gap-2 mb-4 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={rememberChoice}
+                onChange={(e) => setRememberChoice(e.target.checked)}
+                className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-blue-500 focus:ring-blue-500/50"
+              />
+              <span className="text-xs text-gray-400">Remember my choice</span>
+            </label>
+
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowTerminalPicker(false)}
+                className="flex-1 px-3 py-2 text-sm bg-white/5 hover:bg-white/10 text-gray-300 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmTerminalChoice}
+                className="flex-1 px-3 py-2 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors"
+              >
+                Start Queue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Add task input */}
       <div className="p-3 border-b border-white/5 shrink-0">
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            createTask();
+            if (!isComposing) {
+              createTask();
+            }
           }}
-          className="flex items-center gap-2"
+          className="flex flex-col gap-2"
         >
-          <input
-            ref={inputRef}
-            type="text"
-            value={newTaskPrompt}
-            onChange={(e) => setNewTaskPrompt(e.target.value)}
-            placeholder="Add a task..."
-            className="flex-1 bg-white/5 border border-white/10 rounded-lg py-2 px-3 text-sm text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:bg-white/8 focus:outline-none"
-          />
-          <button
-            type="submit"
-            disabled={!newTaskPrompt.trim()}
-            className="p-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
-          >
-            <Plus size={16} />
-          </button>
+          <div className="flex items-center gap-2">
+            <input
+              ref={inputRef}
+              type="text"
+              value={newTaskPrompt}
+              onChange={(e) => setNewTaskPrompt(e.target.value)}
+              onCompositionStart={() => setIsComposing(true)}
+              onCompositionEnd={() => setIsComposing(false)}
+              placeholder="Add a task..."
+              className="flex-1 bg-white/5 border border-white/10 rounded-lg py-2 px-3 text-sm text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:bg-white/8 focus:outline-none"
+            />
+            <div className="relative" ref={projectPickerRef}>
+              <button
+                type="button"
+                onClick={() => setShowProjectPicker(!showProjectPicker)}
+                className={`p-2 rounded-lg transition-colors ${
+                  selectedProject
+                    ? "bg-blue-600/20 text-blue-400 hover:bg-blue-600/30"
+                    : "bg-white/5 text-gray-400 hover:bg-white/10 hover:text-gray-300"
+                }`}
+                title={selectedProject ? `Project: ${selectedProject.split(/[/\\]/).pop()}` : "Select project (optional)"}
+              >
+                <FolderOpen size={16} />
+              </button>
+              {showProjectPicker && (
+                <div className="absolute right-0 top-full mt-1 w-64 max-h-48 overflow-y-auto bg-gray-900 border border-white/10 rounded-lg shadow-xl z-50">
+                  <div className="p-1.5">
+                    {projects.length === 0 ? (
+                      <div className="px-3 py-2 text-xs text-gray-500">No projects found</div>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedProject(null);
+                            setShowProjectPicker(false);
+                          }}
+                          className={`w-full text-left px-3 py-1.5 text-xs rounded transition-colors ${
+                            !selectedProject
+                              ? "bg-blue-600/20 text-blue-400"
+                              : "text-gray-400 hover:bg-white/5"
+                          }`}
+                        >
+                          No project (auto-detect)
+                        </button>
+                        {projects.map((project) => (
+                          <button
+                            key={project}
+                            type="button"
+                            onClick={() => {
+                              setSelectedProject(project);
+                              setShowProjectPicker(false);
+                            }}
+                            className={`w-full text-left px-3 py-1.5 text-xs rounded transition-colors ${
+                              selectedProject === project
+                                ? "bg-blue-600/20 text-blue-400"
+                                : "text-gray-300 hover:bg-white/5"
+                            }`}
+                            title={project}
+                          >
+                            {project.split(/[/\\]/).pop()}
+                          </button>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+            <button
+              type="submit"
+              disabled={!newTaskPrompt.trim()}
+              className="p-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+            >
+              <Plus size={16} />
+            </button>
+          </div>
+          {selectedProject && (
+            <div className="flex items-center gap-1.5 text-xs text-blue-400">
+              <FolderOpen size={12} />
+              <span className="truncate">{selectedProject.split(/[/\\]/).pop()}</span>
+              <button
+                type="button"
+                onClick={() => setSelectedProject(null)}
+                className="p-0.5 hover:text-blue-300"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          )}
         </form>
       </div>
 
@@ -612,17 +831,27 @@ function SortableTaskItem({ task, isSelected, onToggleSelect, onMoveToQueue, onD
         <GripVertical size={12} />
       </button>
 
-      <div className="flex items-center gap-2 flex-1 min-w-0">
-        <span
-          className={`w-2 h-2 rounded-full shrink-0 ${
-            task.priority === "high"
-              ? "bg-red-500"
-              : task.priority === "low"
-              ? "bg-blue-500"
-              : "bg-yellow-500"
-          }`}
-        />
-        <span className="text-xs text-gray-200 truncate">{task.prompt}</span>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span
+            className={`w-2 h-2 rounded-full shrink-0 ${
+              task.priority === "high"
+                ? "bg-red-500"
+                : task.priority === "low"
+                ? "bg-blue-500"
+                : "bg-yellow-500"
+            }`}
+          />
+          <span className="text-xs text-gray-200 truncate">{task.prompt}</span>
+        </div>
+        {task.project_path && (
+          <div className="flex items-center gap-1 mt-1 ml-4">
+            <FolderOpen size={10} className="text-gray-500" />
+            <span className="text-[10px] text-gray-500 truncate">
+              {task.project_path.split(/[/\\]/).pop()}
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">

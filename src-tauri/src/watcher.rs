@@ -1,5 +1,7 @@
 // File watcher for ~/.claude/ directory
 
+#![allow(dead_code)]
+
 use crate::database;
 use crate::session::{extract_session_metadata, is_session_active, parse_session_file, SessionStatus};
 use crate::tray::{set_tray_state, TrayState};
@@ -144,9 +146,10 @@ fn process_session_file(app: &AppHandle, path: &Path) -> Result<(), Box<dyn std:
     // Extract metadata
     let mut session = extract_session_metadata(&session_id, &project_path, &lines);
 
-    // Check if session is currently active
-    if is_session_active(path) {
-        session.status = crate::session::SessionStatus::Active;
+    // File activity is the primary indicator of session status since stop_reason
+    // is always null in JSONL files. If file was recently modified, session is active.
+    if is_session_active(path) && session.status != SessionStatus::Error {
+        session.status = SessionStatus::Active;
     }
 
     // Store in database
@@ -177,6 +180,38 @@ fn process_session_file(app: &AppHandle, path: &Path) -> Result<(), Box<dyn std:
 /// Decode the encoded project path (delegates to platform module for cross-platform support)
 fn decode_project_path(encoded: &str) -> String {
     crate::platform::decode_project_path(encoded)
+}
+
+/// Force rescan all session files to update token data
+pub fn rescan_all_sessions(app: &AppHandle) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    let claude_dir = get_claude_dir()?;
+    let projects_dir = claude_dir.join("projects");
+
+    if !projects_dir.exists() {
+        return Ok(0);
+    }
+
+    tracing::info!("Force rescanning all sessions in {:?}", projects_dir);
+
+    let mut count: u32 = 0;
+
+    // Walk through all project directories
+    for entry in walkdir::WalkDir::new(&projects_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+            if let Err(e) = process_session_file(app, path) {
+                tracing::warn!("Failed to process session file {:?}: {}", path, e);
+            } else {
+                count += 1;
+            }
+        }
+    }
+
+    tracing::info!("Rescan complete: {} sessions updated", count);
+    Ok(count)
 }
 
 /// Watch for history.jsonl changes

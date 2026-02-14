@@ -31,6 +31,7 @@ export default function SessionCard({ session, compact = false, onLabelChange, o
   const [labelValue, setLabelValue] = useState(session.label || "");
   const [showActions, setShowActions] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [isComposing, setIsComposing] = useState(false);
   const labelInputRef = useRef<HTMLInputElement>(null);
   const actionsRef = useRef<HTMLDivElement>(null);
   const toast = useToast();
@@ -75,7 +76,7 @@ export default function SessionCard({ session, compact = false, onLabelChange, o
   };
 
   const handleLabelKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") {
+    if (e.key === "Enter" && !isComposing) {
       saveLabel();
     } else if (e.key === "Escape") {
       setIsEditingLabel(false);
@@ -285,6 +286,8 @@ export default function SessionCard({ session, compact = false, onLabelChange, o
               onChange={(e) => setLabelValue(e.target.value)}
               onBlur={saveLabel}
               onKeyDown={handleLabelKeyDown}
+              onCompositionStart={() => setIsComposing(true)}
+              onCompositionEnd={() => setIsComposing(false)}
               placeholder="Add label..."
               className="w-32 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 placeholder:text-gray-500 focus:outline-none focus:ring-1 focus:ring-purple-500/50"
             />
@@ -336,6 +339,8 @@ export default function SessionCard({ session, compact = false, onLabelChange, o
               onChange={(e) => setLabelValue(e.target.value)}
               onBlur={saveLabel}
               onKeyDown={handleLabelKeyDown}
+              onCompositionStart={() => setIsComposing(true)}
+              onCompositionEnd={() => setIsComposing(false)}
               placeholder="Add label..."
               className="w-32 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 placeholder:text-gray-500 focus:outline-none focus:ring-1 focus:ring-purple-500/50"
             />

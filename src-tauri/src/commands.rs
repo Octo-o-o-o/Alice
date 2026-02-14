@@ -24,7 +24,7 @@ pub async fn get_sessions(
 }
 
 /// Get detailed information about a specific session
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_session_detail(
     app: AppHandle,
     session_id: String,
@@ -39,7 +39,7 @@ pub async fn get_active_sessions(app: AppHandle) -> Result<Vec<Session>, String>
 }
 
 /// Get usage statistics
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn get_usage_stats(
     app: AppHandle,
     project: Option<String>,
@@ -108,7 +108,7 @@ pub async fn search_sessions(
 }
 
 /// Search sessions with advanced filters
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn search_sessions_filtered(
     app: AppHandle,
     query: Option<String>,
@@ -133,7 +133,7 @@ pub async fn search_sessions_filtered(
 }
 
 /// Resume a session - returns the command to run
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn resume_session(session_id: String) -> Result<String, String> {
     Ok(format!("claude --resume {}", session_id))
 }
@@ -155,10 +155,10 @@ pub async fn get_live_usage() -> Result<crate::usage::LiveUsageStats, String> {
         if let Some(access_token) = creds.access_token {
             match crate::usage::fetch_oauth_usage(&access_token).await {
                 Ok(response) => {
-                    stats.session_percent = response.five_hour.percent_used;
-                    stats.session_reset_at = Some(response.five_hour.reset_at);
-                    stats.weekly_percent = response.seven_day.percent_used;
-                    stats.weekly_reset_at = Some(response.seven_day.reset_at);
+                    stats.session_percent = response.five_hour.utilization;
+                    stats.session_reset_at = Some(response.five_hour.resets_at);
+                    stats.weekly_percent = response.seven_day.utilization;
+                    stats.weekly_reset_at = Some(response.seven_day.resets_at);
 
                     // Load history and calculate burn rate
                     let mut history = crate::usage::load_usage_history();
@@ -195,16 +195,42 @@ pub async fn has_claude_credentials() -> bool {
         .unwrap_or(false)
 }
 
+/// Rescan all session files to update token data
+#[tauri::command]
+pub async fn rescan_sessions(app: AppHandle) -> Result<u32, String> {
+    crate::watcher::rescan_all_sessions(&app)
+        .map_err(|e| e.to_string())
+}
+
+/// Queue start result
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueueStartResult {
+    pub started: bool,
+    pub needs_terminal_choice: bool,
+}
+
 /// Start the task queue
 #[tauri::command]
-pub async fn start_queue(app: AppHandle) -> Result<(), String> {
+pub async fn start_queue(app: AppHandle) -> Result<QueueStartResult, String> {
+    // Check if terminal choice has been made
+    let config = crate::config::load_config();
+    if !config.terminal_choice_made {
+        return Ok(QueueStartResult {
+            started: false,
+            needs_terminal_choice: true,
+        });
+    }
+
     // Spawn queue execution in background
     tauri::async_runtime::spawn(async move {
         if let Err(e) = crate::queue::start_queue(&app).await {
             tracing::error!("Queue execution error: {}", e);
         }
     });
-    Ok(())
+    Ok(QueueStartResult {
+        started: true,
+        needs_terminal_choice: false,
+    })
 }
 
 /// Stop the task queue
@@ -287,13 +313,13 @@ pub async fn get_system_info() -> SystemInfo {
 }
 
 /// Reorder tasks by updating their sort_order
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn reorder_tasks(app: AppHandle, task_ids: Vec<String>) -> Result<(), String> {
     database::reorder_tasks(&app, task_ids).map_err(|e| e.to_string())
 }
 
 /// Update session label
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn update_session_label(
     app: AppHandle,
     session_id: String,
@@ -303,13 +329,13 @@ pub async fn update_session_label(
 }
 
 /// Fork a session - returns the command to run
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn fork_session(session_id: String) -> Result<String, String> {
     Ok(format!("claude --fork-session {}", session_id))
 }
 
 /// Delete a session from the database
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn delete_session(app: AppHandle, session_id: String) -> Result<(), String> {
     database::delete_session(&app, &session_id).map_err(|e| e.to_string())
 }
@@ -339,7 +365,7 @@ pub async fn scan_claude_directory(app: AppHandle) -> Result<ScanResult, String>
 }
 
 /// Export session as JSON or Markdown
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn export_session(
     app: AppHandle,
     session_id: String,
@@ -498,4 +524,197 @@ pub async fn generate_report_ai_summary(date: String) -> Result<crate::report::D
 #[tauri::command]
 pub async fn get_anthropic_status() -> Result<crate::usage::AnthropicStatus, String> {
     crate::usage::fetch_anthropic_status().await
+}
+
+/// Onboarding status for setup wizard
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OnboardingStatus {
+    /// Claude CLI installed
+    pub cli_installed: bool,
+    /// Claude CLI version
+    pub cli_version: Option<String>,
+    /// OAuth credentials found
+    pub credentials_found: bool,
+    /// Account email (if logged in)
+    pub account_email: Option<String>,
+    /// Subscription type (max/pro/free/team/enterprise)
+    pub subscription_type: Option<String>,
+    /// Claude directory exists
+    pub claude_dir_exists: bool,
+    /// Platform (macos/windows/linux)
+    pub platform: String,
+    /// Hooks already installed
+    pub hooks_installed: bool,
+    /// Number of existing sessions found
+    pub existing_sessions_count: usize,
+}
+
+/// Get complete onboarding status for setup wizard
+#[tauri::command]
+pub async fn get_onboarding_status(app: AppHandle) -> OnboardingStatus {
+    let cli_installed = crate::config::is_claude_installed();
+    let cli_version = crate::config::get_claude_version();
+    let credentials = crate::usage::read_claude_credentials();
+    let claude_dir = crate::platform::get_claude_dir();
+    let config = crate::config::load_config();
+
+    // Count existing sessions
+    let existing_sessions_count = database::get_sessions(&app, None, 10000)
+        .map(|sessions| sessions.len())
+        .unwrap_or(0);
+
+    // Determine platform
+    let platform = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    };
+
+    // Extract subscription type from credentials
+    let (credentials_found, account_email, subscription_type) = match credentials {
+        Some(creds) => {
+            let has_token = creds.access_token.is_some();
+            // Parse subscription type from account_email field (which contains "Claude Max" etc.)
+            let sub_type = creds.account_email.as_ref().and_then(|email| {
+                if email.contains("Max") {
+                    Some("max".to_string())
+                } else if email.contains("Pro") {
+                    Some("pro".to_string())
+                } else if email.contains("Free") {
+                    Some("free".to_string())
+                } else if email.contains("Team") {
+                    Some("team".to_string())
+                } else if email.contains("Enterprise") {
+                    Some("enterprise".to_string())
+                } else {
+                    None
+                }
+            });
+            (has_token, creds.account_email, sub_type)
+        }
+        None => (false, None, None),
+    };
+
+    OnboardingStatus {
+        cli_installed,
+        cli_version,
+        credentials_found,
+        account_email,
+        subscription_type,
+        claude_dir_exists: claude_dir.exists(),
+        platform: platform.to_string(),
+        hooks_installed: config.hooks_installed,
+        existing_sessions_count,
+    }
+}
+
+/// Install hooks and verify the installation
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HookVerifyResult {
+    pub success: bool,
+    pub settings_path: String,
+    pub hooks_file: String,
+    pub session_start_installed: bool,
+    pub session_end_installed: bool,
+}
+
+#[tauri::command]
+pub async fn install_and_verify_hooks() -> Result<HookVerifyResult, String> {
+    // First install hooks
+    let install_result = install_hooks().await?;
+
+    // Then verify by reading the settings file
+    let settings_path = crate::platform::get_claude_dir().join("settings.json");
+    let mut session_start_installed = false;
+    let mut session_end_installed = false;
+
+    if settings_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&settings_path) {
+            if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(hooks) = settings.get("hooks") {
+                    session_start_installed = hooks.get("SessionStart").is_some();
+                    session_end_installed = hooks.get("SessionEnd").is_some();
+                }
+            }
+        }
+    }
+
+    Ok(HookVerifyResult {
+        success: install_result.success && session_start_installed && session_end_installed,
+        settings_path: install_result.settings_path,
+        hooks_file: install_result.hooks_file,
+        session_start_installed,
+        session_end_installed,
+    })
+}
+
+/// Terminal option for UI
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TerminalOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// Get list of available terminal applications
+#[tauri::command]
+pub async fn get_available_terminals() -> Vec<TerminalOption> {
+    crate::platform::get_available_terminals()
+        .into_iter()
+        .map(|(value, label)| TerminalOption {
+            value: value.to_string(),
+            label: label.to_string(),
+        })
+        .collect()
+}
+
+// ============================================================================
+// Favorites
+// ============================================================================
+
+/// Get all favorites
+#[tauri::command]
+pub async fn get_favorites(app: AppHandle) -> Result<Vec<database::Favorite>, String> {
+    database::get_favorites(&app).map_err(|e| e.to_string())
+}
+
+/// Create a new favorite
+#[tauri::command(rename_all = "camelCase")]
+pub async fn create_favorite(
+    app: AppHandle,
+    name: String,
+    prompt: String,
+    project_path: Option<String>,
+    tags: Option<String>,
+) -> Result<database::Favorite, String> {
+    database::create_favorite(&app, &name, &prompt, project_path.as_deref(), tags.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+/// Update a favorite
+#[tauri::command(rename_all = "camelCase")]
+pub async fn update_favorite(
+    app: AppHandle,
+    id: String,
+    name: Option<String>,
+    prompt: Option<String>,
+    project_path: Option<Option<String>>,
+    tags: Option<String>,
+) -> Result<database::Favorite, String> {
+    let project_path_ref = project_path.as_ref().map(|pp| pp.as_deref());
+    database::update_favorite(&app, &id, name.as_deref(), prompt.as_deref(), project_path_ref, tags.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a favorite
+#[tauri::command]
+pub async fn delete_favorite(app: AppHandle, id: String) -> Result<(), String> {
+    database::delete_favorite(&app, &id).map_err(|e| e.to_string())
+}
+
+/// Reorder favorites
+#[tauri::command(rename_all = "camelCase")]
+pub async fn reorder_favorites(app: AppHandle, favorite_ids: Vec<String>) -> Result<(), String> {
+    database::reorder_favorites(&app, favorite_ids).map_err(|e| e.to_string())
 }

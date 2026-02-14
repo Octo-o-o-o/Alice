@@ -1,9 +1,10 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Clock, Search, SearchX, Filter, X, ChevronDown } from "lucide-react";
 import { GroupedVirtuoso } from "react-virtuoso";
 import SessionCard from "../components/SessionCard";
 import { Session } from "../lib/types";
+import { getModKey } from "../lib/platform";
 
 interface Filters {
   project: string | null;
@@ -13,7 +14,11 @@ interface Filters {
   dateTo: string | null;
 }
 
-export default function HistoryView() {
+export interface HistoryViewRef {
+  focusSearch: () => void;
+}
+
+const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [projects, setProjects] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
@@ -27,6 +32,14 @@ export default function HistoryView() {
     dateFrom: null,
     dateTo: null,
   });
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  useImperativeHandle(ref, () => ({
+    focusSearch: () => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    },
+  }));
 
   const activeFilterCount = Object.values(filters).filter((v) => v !== null).length;
 
@@ -108,7 +121,7 @@ export default function HistoryView() {
     const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000).toDateString();
 
     sessions.forEach((session) => {
-      const date = new Date(session.last_active_at);
+      const date = new Date(session.last_human_message_at);
       let label: string;
 
       if (date.toDateString() === today) {
@@ -160,16 +173,18 @@ export default function HistoryView() {
       {/* Search and Filter Header */}
       <div className="p-3 border-b border-white/5 shrink-0 space-y-2">
         <div className="flex items-center gap-2">
-          <div className="relative flex-1">
+          <div className="relative flex-1 group">
             <Search
               size={14}
               className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500"
             />
             <input
+              ref={searchInputRef}
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search sessions..."
+              placeholder={`Search: A B, A|B, -A, "A|B" (${getModKey()}K)`}
+              title='space=AND, |=OR, -=NOT, "..."=literal'
               className="w-full bg-white/5 border border-white/10 rounded-lg py-2 pl-9 pr-3 text-sm text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:bg-white/8 focus:outline-none"
             />
           </div>
@@ -354,4 +369,6 @@ export default function HistoryView() {
       </div>
     </div>
   );
-}
+});
+
+export default HistoryView;

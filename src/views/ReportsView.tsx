@@ -9,8 +9,10 @@ import {
   GitCommit,
   Zap,
   Clock,
+  Sparkles,
 } from "lucide-react";
 import { DailyReport } from "../lib/types";
+import { useToast } from "../contexts/ToastContext";
 
 export default function ReportsView() {
   const [reports, setReports] = useState<string[]>([]);
@@ -18,7 +20,9 @@ export default function ReportsView() {
   const [report, setReport] = useState<DailyReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
+  const [generatingAI, setGeneratingAI] = useState(false);
   const [copied, setCopied] = useState(false);
+  const toast = useToast();
 
   const loadReports = async () => {
     try {
@@ -68,6 +72,23 @@ export default function ReportsView() {
       setTimeout(() => setCopied(false), 2000);
     } catch (error) {
       console.error("Failed to copy:", error);
+    }
+  };
+
+  const generateAISummary = async () => {
+    if (!report || !selectedDate) return;
+    setGeneratingAI(true);
+    try {
+      const result = await invoke<DailyReport>("generate_report_ai_summary", {
+        date: selectedDate,
+      });
+      setReport(result);
+      toast.success("AI summary generated");
+    } catch (error) {
+      console.error("Failed to generate AI summary:", error);
+      toast.error("Failed to generate AI summary");
+    } finally {
+      setGeneratingAI(false);
     }
   };
 
@@ -157,6 +178,44 @@ export default function ReportsView() {
           </div>
         ) : (
           <>
+            {/* AI Summary Section */}
+            <div className="bg-gradient-to-r from-purple-500/10 to-blue-500/10 border border-purple-500/20 rounded-lg p-3">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-xs font-semibold text-purple-300 uppercase tracking-wider flex items-center gap-2">
+                  <Sparkles size={12} />
+                  AI Summary
+                </h4>
+                {!report.ai_summary && (
+                  <button
+                    onClick={generateAISummary}
+                    disabled={generatingAI}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-purple-400 hover:text-purple-300 bg-purple-500/10 hover:bg-purple-500/20 rounded transition-colors disabled:opacity-50"
+                  >
+                    {generatingAI ? (
+                      <>
+                        <div className="w-3 h-3 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                        Generating...
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles size={10} />
+                        Generate
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
+              {report.ai_summary ? (
+                <p className="text-sm text-gray-200 leading-relaxed">
+                  {report.ai_summary}
+                </p>
+              ) : (
+                <p className="text-xs text-gray-500 italic">
+                  Click "Generate" to create an AI-powered summary of today's work using Claude Haiku (~$0.01).
+                </p>
+              )}
+            </div>
+
             {/* Sessions Summary */}
             <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3">
               <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">

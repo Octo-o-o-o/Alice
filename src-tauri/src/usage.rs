@@ -1,5 +1,7 @@
 // Usage tracking and OAuth API integration
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -13,13 +15,21 @@ pub struct OAuthUsageResponse {
     #[serde(default)]
     pub seven_day_opus: Option<UsageWindow>,
     #[serde(default)]
+    pub seven_day_oauth_apps: Option<UsageWindow>,
+    #[serde(default)]
+    pub seven_day_cowork: Option<UsageWindow>,
+    #[serde(default)]
     pub extra_usage: Option<ExtraUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageWindow {
-    pub percent_used: f64,
-    pub reset_at: String, // ISO 8601
+    /// Usage percentage (0-100). API returns this as "utilization"
+    #[serde(alias = "percent_used")]
+    pub utilization: f64,
+    /// Reset time in ISO 8601 format. API returns this as "resets_at"
+    #[serde(alias = "reset_at")]
+    pub resets_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,28 +173,46 @@ pub struct ClaudeCredentials {
 
 /// Fetch live usage from Anthropic OAuth API
 pub async fn fetch_oauth_usage(access_token: &str) -> Result<OAuthUsageResponse, String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-    let response = client
-        .get("https://api.anthropic.com/api/oauth/usage")
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch usage: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "API error: {} - {}",
-            response.status(),
-            response.text().await.unwrap_or_default()
-        ));
+    // Retry up to 2 times on connection errors
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        match client
+            .get("https://api.anthropic.com/api/oauth/usage")
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    return Err(format!(
+                        "API error: {} - {}",
+                        response.status(),
+                        response.text().await.unwrap_or_default()
+                    ));
+                }
+                return response
+                    .json::<OAuthUsageResponse>()
+                    .await
+                    .map_err(|e| format!("Failed to parse usage response: {}", e));
+            }
+            Err(e) => {
+                last_error = format!("Failed to fetch usage: {}", e);
+                if attempt < 1 {
+                    // Wait a bit before retry
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
     }
 
-    response
-        .json::<OAuthUsageResponse>()
-        .await
-        .map_err(|e| format!("Failed to parse usage response: {}", e))
+    Err(last_error)
 }
 
 /// Calculate burn rate from historical usage

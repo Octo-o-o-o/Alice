@@ -120,9 +120,14 @@ pub fn init_database(_app: &AppHandle) -> Result<(), DatabaseError> {
             tags TEXT,
             started_at INTEGER NOT NULL,
             last_active_at INTEGER NOT NULL,
+            last_human_message_at INTEGER,
             message_count INTEGER,
             total_tokens INTEGER,
             total_cost_usd REAL,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cache_read_tokens INTEGER DEFAULT 0,
+            cache_write_tokens INTEGER DEFAULT 0,
             model TEXT,
             status TEXT
         );
@@ -215,8 +220,52 @@ pub fn init_database(_app: &AppHandle) -> Result<(), DatabaseError> {
             total_tokens INTEGER DEFAULT 0,
             total_cost_usd REAL DEFAULT 0
         );
+
+        -- Favorite prompts
+        CREATE TABLE IF NOT EXISTS favorites (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            project_path TEXT,
+            tags TEXT,
+            sort_order INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_favorites_sort ON favorites(sort_order);
         "#,
     )?;
+
+    // Migration: Add last_human_message_at column if not exists
+    let _ = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN last_human_message_at INTEGER",
+        [],
+    );
+
+    // Backfill: Set last_human_message_at to last_active_at for existing rows where it's NULL
+    let _ = conn.execute(
+        "UPDATE sessions SET last_human_message_at = last_active_at WHERE last_human_message_at IS NULL",
+        [],
+    );
+
+    // Migration: Add detailed token columns if not exists
+    let _ = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN input_tokens INTEGER DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN output_tokens INTEGER DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN cache_write_tokens INTEGER DEFAULT 0",
+        [],
+    );
 
     DB.set(Mutex::new(conn))
         .map_err(|_| DatabaseError::NotFound("Database already initialized".to_string()))?;
@@ -235,6 +284,144 @@ fn get_db() -> Result<std::sync::MutexGuard<'static, Connection>, DatabaseError>
         })
 }
 
+/// Tokenize search query, preserving quoted strings as single tokens
+/// Example: 'foo "bar|baz" -test' -> ["foo", "\"bar|baz\"", "-test"]
+fn tokenize_search_query(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in query.chars() {
+        match ch {
+            '"' => {
+                if in_quotes {
+                    // End of quoted string - include the quotes in the token
+                    current.push('"');
+                    if !current.is_empty() {
+                        tokens.push(current.clone());
+                        current.clear();
+                    }
+                    in_quotes = false;
+                } else {
+                    // Start of quoted string - save any pending token first
+                    if !current.is_empty() {
+                        tokens.push(current.clone());
+                        current.clear();
+                    }
+                    current.push('"');
+                    in_quotes = true;
+                }
+            }
+            ' ' | '\t' | '\n' if !in_quotes => {
+                // Whitespace outside quotes - token boundary
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+
+    // Don't forget the last token
+    if !current.is_empty() {
+        // If we're still in quotes, add closing quote for robustness
+        if in_quotes && !current.ends_with('"') {
+            current.push('"');
+        }
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+/// Parse search query with advanced syntax support
+/// Syntax:
+/// - AND: "词A 词B" (space-separated terms, all must match)
+/// - OR: "词A|词B" (pipe-separated terms, any can match)
+/// - NOT: "-词A" (exclude matches containing this term)
+/// - LITERAL: '"词A|词B"' (quoted text searches literally, ignoring operators)
+/// - Mixed: '词A "B|C" -词D' (A AND literal "B|C" AND NOT D)
+///
+/// Returns (SQL condition string, parameter values)
+fn parse_search_query(query: &str) -> (String, Vec<String>) {
+    let mut and_conditions: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+
+    // Tokenize with quote awareness
+    let tokens = tokenize_search_query(query);
+
+    for token in tokens {
+        if token.is_empty() {
+            continue;
+        }
+
+        // Check if it's a quoted literal (starts and ends with quotes, or was extracted from quotes)
+        if token.starts_with('"') && token.ends_with('"') && token.len() > 1 {
+            // Literal search - remove quotes and search as-is
+            let literal = &token[1..token.len()-1];
+            if !literal.is_empty() {
+                let pattern = format!("%{}%", literal);
+                and_conditions.push(
+                    "(s.first_prompt LIKE ? OR s.label LIKE ? OR s.project_name LIKE ?)".to_string()
+                );
+                params.push(pattern.clone());
+                params.push(pattern.clone());
+                params.push(pattern);
+            }
+        }
+        // Check for NOT (exclusion) - starts with -
+        else if let Some(term) = token.strip_prefix('-') {
+            if !term.is_empty() {
+                // NOT condition: field NOT LIKE pattern
+                let pattern = format!("%{}%", term);
+                and_conditions.push(
+                    "(s.first_prompt NOT LIKE ? AND s.label NOT LIKE ? AND s.project_name NOT LIKE ?)".to_string()
+                );
+                params.push(pattern.clone());
+                params.push(pattern.clone());
+                params.push(pattern);
+            }
+        }
+        // Check for OR - contains |
+        else if token.contains('|') {
+            let or_terms: Vec<&str> = token.split('|').filter(|t| !t.is_empty()).collect();
+            if !or_terms.is_empty() {
+                let mut or_conditions: Vec<String> = Vec::new();
+                for term in or_terms {
+                    let pattern = format!("%{}%", term);
+                    or_conditions.push(
+                        "(s.first_prompt LIKE ? OR s.label LIKE ? OR s.project_name LIKE ?)".to_string()
+                    );
+                    params.push(pattern.clone());
+                    params.push(pattern.clone());
+                    params.push(pattern);
+                }
+                and_conditions.push(format!("({})", or_conditions.join(" OR ")));
+            }
+        }
+        // Regular AND term
+        else {
+            let pattern = format!("%{}%", token);
+            and_conditions.push(
+                "(s.first_prompt LIKE ? OR s.label LIKE ? OR s.project_name LIKE ?)".to_string()
+            );
+            params.push(pattern.clone());
+            params.push(pattern.clone());
+            params.push(pattern);
+        }
+    }
+
+    if and_conditions.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    let condition = format!("({})", and_conditions.join(" AND "));
+    (condition, params)
+}
+
 /// Get sessions from database
 pub fn get_sessions(
     _app: &AppHandle,
@@ -245,14 +432,16 @@ pub fn get_sessions(
 
     let sql = if project.is_some() {
         "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, message_count, total_tokens, total_cost_usd, model, status
+                started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
          FROM sessions WHERE project_path = ?1
-         ORDER BY last_active_at DESC LIMIT ?2"
+         ORDER BY last_human_message_at DESC LIMIT ?2"
     } else {
         "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, message_count, total_tokens, total_cost_usd, model, status
+                started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
          FROM sessions
-         ORDER BY last_active_at DESC LIMIT ?1"
+         ORDER BY last_human_message_at DESC LIMIT ?1"
     };
 
     let mut stmt = conn.prepare(sql)?;
@@ -269,7 +458,7 @@ pub fn get_sessions(
 
 /// Map a database row to a Session
 fn map_session_row(row: &rusqlite::Row) -> Result<Session, rusqlite::Error> {
-    let status_str: String = row.get(12)?;
+    let status_str: String = row.get(17)?;
     let status = match status_str.as_str() {
         "idle" => SessionStatus::Idle,
         "active" => SessionStatus::Active,
@@ -283,6 +472,10 @@ fn map_session_row(row: &rusqlite::Row) -> Result<Session, rusqlite::Error> {
         .map(|s| serde_json::from_str(&s).unwrap_or_default())
         .unwrap_or_default();
 
+    // Handle NULL last_human_message_at by falling back to last_active_at
+    let last_active_at: i64 = row.get(7)?;
+    let last_human_message_at: i64 = row.get::<_, Option<i64>>(8)?.unwrap_or(last_active_at);
+
     Ok(Session {
         session_id: row.get(0)?,
         project_path: row.get(1)?,
@@ -291,11 +484,16 @@ fn map_session_row(row: &rusqlite::Row) -> Result<Session, rusqlite::Error> {
         label: row.get(4)?,
         tags,
         started_at: row.get(6)?,
-        last_active_at: row.get(7)?,
-        message_count: row.get(8)?,
-        total_tokens: row.get(9)?,
-        total_cost_usd: row.get(10)?,
-        model: row.get(11)?,
+        last_active_at,
+        last_human_message_at,
+        message_count: row.get(9)?,
+        total_tokens: row.get(10)?,
+        total_cost_usd: row.get(11)?,
+        input_tokens: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
+        output_tokens: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+        cache_read_tokens: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
+        cache_write_tokens: row.get::<_, Option<i64>>(15)?.unwrap_or(0),
+        model: row.get(16)?,
         status,
     })
 }
@@ -310,7 +508,8 @@ pub fn get_session_detail(
     // Get session
     let session = conn.query_row(
         "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, message_count, total_tokens, total_cost_usd, model, status
+                started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
          FROM sessions WHERE session_id = ?1",
         params![session_id],
         map_session_row,
@@ -340,26 +539,96 @@ pub fn get_session_detail(
     Ok(SessionDetail { session, messages })
 }
 
-/// Get active sessions
+/// Get active sessions - scans file system to find truly active sessions
+/// This is the source of truth since database status can be stale
 pub fn get_active_sessions(_app: &AppHandle) -> Result<Vec<Session>, DatabaseError> {
     let conn = get_db()?;
+    let claude_dir = crate::platform::get_claude_dir();
+    let projects_dir = claude_dir.join("projects");
 
-    let mut stmt = conn.prepare(
-        "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, message_count, total_tokens, total_cost_usd, model, status
-         FROM sessions WHERE status = 'active'
-         ORDER BY last_active_at DESC"
-    )?;
+    // First, scan file system to find recently modified session files
+    let mut active_session_ids: Vec<String> = Vec::new();
 
-    let sessions: Vec<Session> = stmt
-        .query_map([], map_session_row)?
-        .filter_map(|r| r.ok())
-        .collect();
+    if projects_dir.exists() {
+        if let Ok(project_entries) = std::fs::read_dir(&projects_dir) {
+            for project_entry in project_entries.filter_map(|e| e.ok()) {
+                let project_path = project_entry.path();
+                if project_path.is_dir() {
+                    if let Ok(session_entries) = std::fs::read_dir(&project_path) {
+                        for session_entry in session_entries.filter_map(|e| e.ok()) {
+                            let file_path = session_entry.path();
+                            if file_path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                                // Check if file was modified recently (within 30 seconds)
+                                if is_file_recently_modified(&file_path, 30) {
+                                    if let Some(session_id) = file_path.file_stem().and_then(|s| s.to_str()) {
+                                        active_session_ids.push(session_id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-    Ok(sessions)
+    if active_session_ids.is_empty() {
+        // No active files found - mark all "active" sessions as completed
+        let _ = conn.execute("UPDATE sessions SET status = 'completed' WHERE status = 'active'", []);
+        return Ok(Vec::new());
+    }
+
+    // Update these sessions to active status in database
+    for session_id in &active_session_ids {
+        let _ = conn.execute(
+            "UPDATE sessions SET status = 'active' WHERE session_id = ?",
+            params![session_id]
+        );
+    }
+
+    // Mark other "active" sessions as completed (they're stale)
+    let placeholders: Vec<&str> = active_session_ids.iter().map(|_| "?").collect();
+    let placeholders_str = placeholders.join(",");
+    let query = format!(
+        "UPDATE sessions SET status = 'completed' WHERE status = 'active' AND session_id NOT IN ({})",
+        placeholders_str
+    );
+    let params: Vec<&dyn rusqlite::ToSql> = active_session_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let _ = conn.execute(&query, params.as_slice());
+
+    // Now fetch the active sessions from database
+    let mut result = Vec::new();
+    for session_id in &active_session_ids {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, project_path, project_name, first_prompt, label, tags,
+                    started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
+             FROM sessions WHERE session_id = ?"
+        )?;
+
+        if let Ok(session) = stmt.query_row(params![session_id], map_session_row) {
+            result.push(session);
+        }
+    }
+
+    // Sort by last_human_message_at descending
+    result.sort_by(|a, b| b.last_human_message_at.cmp(&a.last_human_message_at));
+
+    Ok(result)
 }
 
-/// Get usage statistics
+/// Check if file was modified within the last N seconds
+fn is_file_recently_modified(path: &std::path::Path, seconds: u64) -> bool {
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if let Ok(modified) = metadata.modified() {
+            let elapsed = modified.elapsed().unwrap_or_default();
+            return elapsed.as_secs() < seconds;
+        }
+    }
+    false
+}
+
+/// Get usage statistics from sessions table
 pub fn get_usage_stats(
     _app: &AppHandle,
     project: Option<&str>,
@@ -368,7 +637,8 @@ pub fn get_usage_stats(
 ) -> Result<UsageStats, DatabaseError> {
     let conn = get_db()?;
 
-    // Build query conditions
+    // Build query conditions for sessions table
+    // Convert date strings to timestamps (start of day and end of day)
     let mut conditions = Vec::new();
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -377,12 +647,24 @@ pub fn get_usage_stats(
         params_vec.push(Box::new(proj.to_string()));
     }
     if let Some(start) = start_date {
-        conditions.push("date >= ?");
-        params_vec.push(Box::new(start.to_string()));
+        // Convert date string (YYYY-MM-DD) to start of day timestamp in ms
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d") {
+            let start_ts = date.and_hms_opt(0, 0, 0)
+                .map(|dt| dt.and_utc().timestamp_millis())
+                .unwrap_or(0);
+            conditions.push("started_at >= ?");
+            params_vec.push(Box::new(start_ts));
+        }
     }
     if let Some(end) = end_date {
-        conditions.push("date <= ?");
-        params_vec.push(Box::new(end.to_string()));
+        // Convert date string (YYYY-MM-DD) to end of day timestamp in ms
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d") {
+            let end_ts = date.and_hms_opt(23, 59, 59)
+                .map(|dt| dt.and_utc().timestamp_millis())
+                .unwrap_or(i64::MAX);
+            conditions.push("started_at <= ?");
+            params_vec.push(Box::new(end_ts));
+        }
     }
 
     let where_clause = if conditions.is_empty() {
@@ -391,22 +673,22 @@ pub fn get_usage_stats(
         format!("WHERE {}", conditions.join(" AND "))
     };
 
-    // Get totals
+    // Get totals from sessions table (including detailed token breakdown)
     let sql = format!(
-        "SELECT COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens), 0),
-                COALESCE(SUM(estimated_cost_usd), 0),
-                COUNT(DISTINCT session_id),
+        "SELECT COALESCE(SUM(total_tokens), 0),
+                COALESCE(SUM(total_cost_usd), 0),
+                COUNT(session_id),
                 COALESCE(SUM(input_tokens), 0),
                 COALESCE(SUM(output_tokens), 0),
                 COALESCE(SUM(cache_read_tokens), 0),
                 COALESCE(SUM(cache_write_tokens), 0)
-         FROM usage_records {}",
+         FROM sessions {}",
         where_clause
     );
 
     let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
 
-    let (total_tokens, total_cost_usd, session_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) =
+    let (total_tokens, total_cost_usd, session_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens): (i64, f64, i32, i64, i64, i64, i64) =
         conn.query_row(&sql, params_refs.as_slice(), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -419,11 +701,16 @@ pub fn get_usage_stats(
             ))
         })?;
 
-    // Get daily breakdown
+    // Get daily breakdown from sessions table
+    // Group by date extracted from started_at timestamp
     let daily_sql = format!(
-        "SELECT date, SUM(input_tokens + output_tokens + cache_read_tokens),
-                SUM(estimated_cost_usd), COUNT(DISTINCT session_id)
-         FROM usage_records {} GROUP BY date ORDER BY date DESC LIMIT 30",
+        "SELECT DATE(started_at / 1000, 'unixepoch') as date,
+                SUM(total_tokens),
+                SUM(total_cost_usd),
+                COUNT(session_id)
+         FROM sessions {}
+         GROUP BY DATE(started_at / 1000, 'unixepoch')
+         ORDER BY date DESC LIMIT 30",
         where_clause
     );
 
@@ -440,11 +727,15 @@ pub fn get_usage_stats(
         .filter_map(|r| r.ok())
         .collect();
 
-    // Get project breakdown
+    // Get project breakdown from sessions table
     let project_sql = format!(
-        "SELECT project_path, SUM(input_tokens + output_tokens + cache_read_tokens),
-                SUM(estimated_cost_usd), COUNT(DISTINCT session_id)
-         FROM usage_records {} GROUP BY project_path ORDER BY SUM(estimated_cost_usd) DESC LIMIT 20",
+        "SELECT project_path,
+                SUM(total_tokens),
+                SUM(total_cost_usd),
+                COUNT(session_id)
+         FROM sessions {}
+         GROUP BY project_path
+         ORDER BY SUM(total_cost_usd) DESC LIMIT 20",
         where_clause
     );
 
@@ -480,7 +771,8 @@ pub fn get_usage_stats(
     })
 }
 
-/// Search sessions
+/// Search sessions with advanced syntax support
+/// Syntax: "词A 词B" (AND), "词A|词B" (OR), "-词A" (NOT)
 pub fn search_sessions(
     _app: &AppHandle,
     query: &str,
@@ -489,29 +781,50 @@ pub fn search_sessions(
 ) -> Result<Vec<Session>, DatabaseError> {
     let conn = get_db()?;
 
-    let sql = if project.is_some() {
-        "SELECT s.session_id, s.project_path, s.project_name, s.first_prompt, s.label, s.tags,
-                s.started_at, s.last_active_at, s.message_count, s.total_tokens, s.total_cost_usd, s.model, s.status
-         FROM sessions s
-         JOIN sessions_fts fts ON s.rowid = fts.rowid
-         WHERE sessions_fts MATCH ?1 AND s.project_path = ?2
-         ORDER BY s.last_active_at DESC LIMIT ?3"
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (search_condition, search_params) = parse_search_query(trimmed);
+    if search_condition.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build params vector
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    for p in search_params {
+        params.push(Box::new(p));
+    }
+
+    let sql = if let Some(proj) = project {
+        params.push(Box::new(proj.to_string()));
+        params.push(Box::new(limit));
+        format!(
+            "SELECT session_id, project_path, project_name, first_prompt, label, tags,
+                    started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
+             FROM sessions s
+             WHERE {} AND s.project_path = ?
+             ORDER BY last_human_message_at DESC LIMIT ?",
+            search_condition
+        )
     } else {
-        "SELECT s.session_id, s.project_path, s.project_name, s.first_prompt, s.label, s.tags,
-                s.started_at, s.last_active_at, s.message_count, s.total_tokens, s.total_cost_usd, s.model, s.status
-         FROM sessions s
-         JOIN sessions_fts fts ON s.rowid = fts.rowid
-         WHERE sessions_fts MATCH ?1
-         ORDER BY s.last_active_at DESC LIMIT ?2"
+        params.push(Box::new(limit));
+        format!(
+            "SELECT session_id, project_path, project_name, first_prompt, label, tags,
+                    started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
+                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
+             FROM sessions s
+             WHERE {}
+             ORDER BY last_human_message_at DESC LIMIT ?",
+            search_condition
+        )
     };
 
-    let mut stmt = conn.prepare(sql)?;
-
-    let rows = if let Some(proj) = project {
-        stmt.query_map(params![query, proj, limit], map_session_row)?
-    } else {
-        stmt.query_map(params![query, limit], map_session_row)?
-    };
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(param_refs), map_session_row)?;
 
     let sessions: Vec<Session> = rows.filter_map(|r| r.ok()).collect();
     Ok(sessions)
@@ -531,32 +844,42 @@ pub fn search_sessions_filtered(
     let conn = get_db()?;
 
     // Build dynamic WHERE clause
-    let mut conditions = Vec::new();
+    let mut conditions: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-    // FTS query
+    // Advanced text search with support for:
+    // - AND: "词A 词B" (space-separated, all must match)
+    // - OR: "词A|词B" (pipe-separated, any can match)
+    // - NOT: "-词A" (exclude matches)
+    // - Mixed: "词A 词B|词C -词D"
     if let Some(q) = query {
-        if !q.trim().is_empty() {
-            conditions.push("s.rowid IN (SELECT rowid FROM sessions_fts WHERE sessions_fts MATCH ?)");
-            params.push(Box::new(q.to_string()));
+        let trimmed = q.trim();
+        if !trimmed.is_empty() {
+            let (search_condition, search_params) = parse_search_query(trimmed);
+            if !search_condition.is_empty() {
+                conditions.push(search_condition);
+                for p in search_params {
+                    params.push(Box::new(p));
+                }
+            }
         }
     }
 
     // Project filter
     if let Some(p) = project {
-        conditions.push("s.project_path = ?");
+        conditions.push("s.project_path = ?".to_string());
         params.push(Box::new(p.to_string()));
     }
 
     // Status filter
     if let Some(s) = status {
-        conditions.push("s.status = ?");
+        conditions.push("s.status = ?".to_string());
         params.push(Box::new(s.to_string()));
     }
 
     // Model filter
     if let Some(m) = model {
-        conditions.push("s.model LIKE ?");
+        conditions.push("s.model LIKE ?".to_string());
         params.push(Box::new(format!("%{}%", m)));
     }
 
@@ -565,7 +888,7 @@ pub fn search_sessions_filtered(
         // Parse date string and convert to timestamp
         if let Ok(date) = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d") {
             let timestamp = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
-            conditions.push("s.last_active_at >= ?");
+            conditions.push("s.last_active_at >= ?".to_string());
             params.push(Box::new(timestamp));
         }
     }
@@ -573,7 +896,7 @@ pub fn search_sessions_filtered(
     if let Some(to) = date_to {
         if let Ok(date) = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d") {
             let timestamp = date.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp_millis();
-            conditions.push("s.last_active_at <= ?");
+            conditions.push("s.last_active_at <= ?".to_string());
             params.push(Box::new(timestamp));
         }
     }
@@ -587,10 +910,11 @@ pub fn search_sessions_filtered(
 
     let sql = format!(
         "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, message_count, total_tokens, total_cost_usd, model, status
+                started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
          FROM sessions s
          {}
-         ORDER BY last_active_at DESC LIMIT ?",
+         ORDER BY last_human_message_at DESC LIMIT ?",
         where_clause
     );
 
@@ -624,8 +948,9 @@ pub fn upsert_session(session: &Session) -> Result<(), DatabaseError> {
     conn.execute(
         "INSERT OR REPLACE INTO sessions
          (session_id, project_path, project_name, first_prompt, label, tags,
-          started_at, last_active_at, message_count, total_tokens, total_cost_usd, model, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+          started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
+          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             session.session_id,
             session.project_path,
@@ -635,9 +960,14 @@ pub fn upsert_session(session: &Session) -> Result<(), DatabaseError> {
             tags_json,
             session.started_at,
             session.last_active_at,
+            session.last_human_message_at,
             session.message_count,
             session.total_tokens,
             session.total_cost_usd,
+            session.input_tokens,
+            session.output_tokens,
+            session.cache_read_tokens,
+            session.cache_write_tokens,
             session.model,
             status_str,
         ],
@@ -860,10 +1190,11 @@ pub fn get_sessions_by_date(_app: &AppHandle, date: &str) -> Result<Vec<Session>
 
     let mut stmt = conn.prepare(
         "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, message_count, total_tokens, total_cost_usd, model, status
+                started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
          FROM sessions
          WHERE started_at >= ?1 AND started_at <= ?2
-         ORDER BY started_at DESC"
+         ORDER BY last_human_message_at DESC"
     )?;
 
     let sessions: Vec<Session> = stmt
@@ -951,6 +1282,161 @@ pub fn delete_session(
         "DELETE FROM sessions WHERE session_id = ?1",
         params![session_id],
     )?;
+
+    Ok(())
+}
+
+// ============================================================================
+// Favorites
+// ============================================================================
+
+/// Favorite prompt data model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Favorite {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+    pub project_path: Option<String>,
+    pub tags: Option<String>,
+    pub sort_order: i32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn map_favorite_row(row: &rusqlite::Row) -> Result<Favorite, rusqlite::Error> {
+    Ok(Favorite {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        prompt: row.get(2)?,
+        project_path: row.get(3)?,
+        tags: row.get(4)?,
+        sort_order: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+/// Get all favorites
+pub fn get_favorites(_app: &AppHandle) -> Result<Vec<Favorite>, DatabaseError> {
+    let conn = get_db()?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, name, prompt, project_path, tags, sort_order, created_at, updated_at
+         FROM favorites ORDER BY sort_order ASC"
+    )?;
+
+    let favorites: Vec<Favorite> = stmt
+        .query_map([], map_favorite_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(favorites)
+}
+
+/// Create a new favorite
+pub fn create_favorite(
+    _app: &AppHandle,
+    name: &str,
+    prompt: &str,
+    project_path: Option<&str>,
+    tags: Option<&str>,
+) -> Result<Favorite, DatabaseError> {
+    let conn = get_db()?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Get max sort_order
+    let max_order: i32 = conn
+        .query_row("SELECT COALESCE(MAX(sort_order), 0) FROM favorites", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    conn.execute(
+        "INSERT INTO favorites (id, name, prompt, project_path, tags, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id, name, prompt, project_path, tags, max_order + 1, now, now],
+    )?;
+
+    Ok(Favorite {
+        id,
+        name: name.to_string(),
+        prompt: prompt.to_string(),
+        project_path: project_path.map(|s| s.to_string()),
+        tags: tags.map(|s| s.to_string()),
+        sort_order: max_order + 1,
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+/// Update a favorite
+pub fn update_favorite(
+    _app: &AppHandle,
+    id: &str,
+    name: Option<&str>,
+    prompt: Option<&str>,
+    project_path: Option<Option<&str>>,
+    tags: Option<&str>,
+) -> Result<Favorite, DatabaseError> {
+    let conn = get_db()?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    if let Some(n) = name {
+        conn.execute(
+            "UPDATE favorites SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![n, now, id],
+        )?;
+    }
+
+    if let Some(p) = prompt {
+        conn.execute(
+            "UPDATE favorites SET prompt = ?1, updated_at = ?2 WHERE id = ?3",
+            params![p, now, id],
+        )?;
+    }
+
+    if let Some(pp) = project_path {
+        conn.execute(
+            "UPDATE favorites SET project_path = ?1, updated_at = ?2 WHERE id = ?3",
+            params![pp, now, id],
+        )?;
+    }
+
+    if let Some(t) = tags {
+        conn.execute(
+            "UPDATE favorites SET tags = ?1, updated_at = ?2 WHERE id = ?3",
+            params![t, now, id],
+        )?;
+    }
+
+    // Fetch and return updated favorite
+    let favorite = conn.query_row(
+        "SELECT id, name, prompt, project_path, tags, sort_order, created_at, updated_at
+         FROM favorites WHERE id = ?1",
+        params![id],
+        map_favorite_row,
+    )?;
+
+    Ok(favorite)
+}
+
+/// Delete a favorite
+pub fn delete_favorite(_app: &AppHandle, id: &str) -> Result<(), DatabaseError> {
+    let conn = get_db()?;
+    conn.execute("DELETE FROM favorites WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Reorder favorites
+pub fn reorder_favorites(_app: &AppHandle, favorite_ids: Vec<String>) -> Result<(), DatabaseError> {
+    let conn = get_db()?;
+
+    for (index, favorite_id) in favorite_ids.iter().enumerate() {
+        conn.execute(
+            "UPDATE favorites SET sort_order = ?1 WHERE id = ?2",
+            params![index as i32, favorite_id],
+        )?;
+    }
 
     Ok(())
 }

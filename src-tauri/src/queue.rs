@@ -1,5 +1,7 @@
 // Task Queue Engine - Execute tasks via Claude CLI subprocess
 
+#![allow(dead_code)]
+
 use crate::database::{self, Task, TaskStatus};
 use crate::notification;
 use serde::{Deserialize, Serialize};
@@ -233,30 +235,81 @@ impl QueueExecutor {
 
         let start_time = std::time::Instant::now();
 
-        // Build command
-        let mut cmd = Command::new("claude");
-        cmd.arg("-p")
-            .arg(&task.prompt)
-            .arg("--output-format")
-            .arg("json");
+        // Load config to check terminal preference
+        let config = crate::config::load_config();
 
-        // Use task's max_turns if specified, otherwise default to 50
+        // Build command arguments
+        let claude_cmd = crate::platform::get_claude_command();
         let max_turns = task.max_turns.unwrap_or(50);
-        cmd.arg("--max-turns").arg(max_turns.to_string());
+
+        let mut args: Vec<String> = vec![
+            "-p".to_string(),
+            task.prompt.clone(),
+            "--output-format".to_string(),
+            "json".to_string(),
+            "--max-turns".to_string(),
+            max_turns.to_string(),
+        ];
 
         // Add system prompt if specified
         if let Some(ref system_prompt) = task.system_prompt {
-            cmd.arg("--system-prompt").arg(system_prompt);
+            args.push("--system-prompt".to_string());
+            args.push(system_prompt.clone());
         }
 
         // Add allowed tools if specified
         if let Some(ref allowed_tools) = task.allowed_tools {
-            // allowed_tools is stored as JSON array, parse and add each
             if let Ok(tools) = serde_json::from_str::<Vec<String>>(allowed_tools) {
                 for tool in tools {
-                    cmd.arg("--allowedTools").arg(tool);
+                    args.push("--allowedTools".to_string());
+                    args.push(tool);
                 }
             }
+        }
+
+        let working_dir = task.project_path.as_deref();
+
+        // Check if we should use a visible terminal
+        if config.terminal_app != crate::config::TerminalApp::Background {
+            // Execute in visible terminal
+            let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            crate::platform::execute_in_terminal(
+                &config.terminal_app,
+                &config.custom_terminal_command,
+                working_dir,
+                claude_cmd,
+                &args_str,
+            )?;
+
+            // For terminal execution, we can't track the output directly
+            // Mark task as completed immediately (user can see result in terminal)
+            // Note: In the future, we could use a wrapper script to capture results
+
+            // Wait a moment to let terminal open
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            let duration_secs = start_time.elapsed().as_secs();
+
+            // Mark as completed (we assume success since we can't track terminal output)
+            database::update_task(&self.app, &task.id, Some(TaskStatus::Completed), None, None, None)
+                .map_err(|e| e.to_string())?;
+
+            *self.current_task.lock().await = None;
+
+            return Ok(TaskResult {
+                task_id: task.id.clone(),
+                exit_code: 0,
+                output: "Task opened in terminal window".to_string(),
+                tokens_used: 0,
+                cost_usd: 0.0,
+                duration_secs,
+            });
+        }
+
+        // Background execution (original behavior)
+        let mut cmd = Command::new(claude_cmd);
+        for arg in &args {
+            cmd.arg(arg);
         }
 
         // Set working directory if project path is specified

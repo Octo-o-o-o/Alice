@@ -55,13 +55,14 @@ pub fn run() {
             // Set up tray icon
             let app_handle_tray = app.handle().clone();
             let _tray = TrayIconBuilder::with_id("main")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tauri::include_image!("icons/tray-icon.png"))
                 .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("Alice - Claude Code Assistant")
                 .on_tray_icon_event(move |tray, event| {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
+                        position,
                         ..
                     } = event
                     {
@@ -71,19 +72,72 @@ pub fn run() {
                             if window.is_visible().unwrap_or(false) {
                                 let _ = window.hide();
                             } else {
-                                // Position window near tray area
+                                // Position window aligned with tray icon
                                 if let Ok(Some(monitor)) = window.current_monitor() {
-                                    let size = monitor.size();
+                                    let monitor_size = monitor.size();
+                                    let scale_factor = monitor.scale_factor();
                                     let window_size = window.outer_size().unwrap_or_default();
-                                    let x = (size.width as i32 - window_size.width as i32) - 20;
 
-                                    // macOS: tray is at top → position below menu bar
-                                    // Windows: taskbar is at bottom → position above taskbar
-                                    let y = if cfg!(target_os = "windows") {
-                                        (size.height as i32 - window_size.height as i32) - 60
-                                    } else {
-                                        30
+                                    // Tray click position (physical pixels)
+                                    let tray_x = position.x as i32;
+                                    let tray_y = position.y as i32;
+
+                                    // Gap between window and menu bar/taskbar (in logical pixels)
+                                    let gap = (8.0 * scale_factor) as i32;
+
+                                    // macOS: menu bar at top, tray icons on right side of menu bar
+                                    // Window should align left edge with tray icon, below menu bar
+                                    #[cfg(target_os = "macos")]
+                                    let (x, y) = {
+                                        // Use tray click y position + gap to position below menu bar
+                                        // This handles both regular and notched MacBooks correctly
+                                        // Add extra offset to clear the menu bar (tray_y is center of icon)
+                                        let menu_bar_bottom = tray_y + (14.0 * scale_factor) as i32;
+
+                                        // Align window left edge with tray icon position
+                                        // But ensure window doesn't go off screen right edge
+                                        let x = (tray_x).min(
+                                            monitor_size.width as i32 - window_size.width as i32 - gap,
+                                        );
+
+                                        // Position below menu bar with gap
+                                        let y = menu_bar_bottom + gap;
+
+                                        (x, y)
                                     };
+
+                                    // Windows: taskbar typically at bottom, system tray on right
+                                    // Window should appear above taskbar, aligned with tray icon
+                                    #[cfg(target_os = "windows")]
+                                    let (x, y) = {
+                                        // Use tray click y position to determine taskbar top
+                                        // tray_y is center of icon, subtract half icon height (~12px) to get taskbar top
+                                        let taskbar_top = tray_y - (12.0 * scale_factor) as i32;
+
+                                        // Align window left edge with tray icon
+                                        // Ensure window doesn't go off screen right edge
+                                        let x = (tray_x).min(
+                                            monitor_size.width as i32 - window_size.width as i32 - gap,
+                                        );
+
+                                        // Position window bottom above taskbar with gap
+                                        let y = taskbar_top - window_size.height as i32 - gap;
+
+                                        (x, y)
+                                    };
+
+                                    // Fallback for other platforms (Linux, etc.)
+                                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                                    let (x, y) = {
+                                        let x = (tray_x).min(
+                                            monitor_size.width as i32 - window_size.width as i32 - gap,
+                                        );
+                                        let y = gap;
+                                        (x, y)
+                                    };
+
+                                    // Ensure x is not negative
+                                    let x = x.max(gap);
 
                                     let _ = window.set_position(tauri::Position::Physical(
                                         tauri::PhysicalPosition::new(x, y),
@@ -128,6 +182,7 @@ pub fn run() {
             commands::export_session,
             commands::get_live_usage,
             commands::has_claude_credentials,
+            commands::rescan_sessions,
             commands::start_queue,
             commands::stop_queue,
             commands::get_queue_status,
@@ -145,6 +200,14 @@ pub fn run() {
             commands::check_hooks_installed,
             commands::generate_report_ai_summary,
             commands::get_anthropic_status,
+            commands::get_onboarding_status,
+            commands::install_and_verify_hooks,
+            commands::get_available_terminals,
+            commands::get_favorites,
+            commands::create_favorite,
+            commands::update_favorite,
+            commands::delete_favorite,
+            commands::reorder_favorites,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

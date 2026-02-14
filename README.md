@@ -21,7 +21,24 @@
 
 Alice is a macOS menu bar desktop assistant that wraps around [Claude Code](https://docs.anthropic.com/en/docs/claude-code), providing a **visual control plane** for the CLI-first workflow.
 
-Claude Code is powerful but you can't see what's happening across sessions, can't queue work, can't get notified when done, and can't manage multiple projects from one place. Alice solves that.
+### Pain Points Solved
+
+Using Claude Code daily? These might sound familiar:
+
+| # | Problem | Alice Solution |
+|---|---------|----------------|
+| 1 | **No completion notification** — Tab away and miss when CC finishes | Menu bar status indicator + native macOS notifications |
+| 2 | **No task queue** — Can't say "after this, do that" | Task queue with chaining and auto-execution |
+| 3 | **Session search is painful** — `--resume` shows a list but no search, no preview | Full-text search across all sessions with instant preview |
+| 4 | **No per-project usage tracking** — `/cost` only shows current session | Per-project, per-day, per-session usage dashboards |
+| 5 | **Context loss after compact** — CC forgets what it was doing | Persistent task backlog external to CC sessions |
+| 6 | **No multi-project overview** — Each terminal is isolated | Unified cross-project dashboard |
+| 7 | **No daily reporting** — Hard to recall what CC helped with today | Auto-generated daily report from sessions + git commits |
+| 8 | **Todo lists vanish** — CC's TodoWrite is session-scoped | Unified task backlog persisted outside CC sessions |
+| 9 | **Can't find running CC processes** — No way to list all active sessions | Process monitor for all CC instances across projects |
+| 10 | **Session names are useless** — Auto-generated names like `a1b2c3d4` | Custom session labels and tags |
+
+> Sources: [#7069](https://github.com/anthropics/claude-code/issues/7069), [#4707](https://github.com/anthropics/claude-code/issues/4707), [#2954](https://github.com/anthropics/claude-code/issues/2954), [#4689](https://github.com/anthropics/claude-code/issues/4689), [#12455](https://github.com/anthropics/claude-code/issues/12455), and community feedback.
 
 ### Features
 
@@ -135,7 +152,24 @@ Inspired by and built upon ideas from these open-source projects:
 
 Alice 是一个 macOS 菜单栏桌面助手，为 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 提供**可视化控制面板**。
 
-Claude Code 很强大，但你无法一目了然地看到跨会话的状态、无法排队任务、完成时没有通知、也无法在一个地方管理多个项目。Alice 解决了这些问题。
+### 解决的痛点
+
+每天使用 Claude Code？这些问题是不是很熟悉：
+
+| # | 问题 | Alice 解决方案 |
+|---|------|---------------|
+| 1 | **没有完成通知** — 切换标签页后错过 CC 完成 | 菜单栏状态指示 + macOS 原生通知 |
+| 2 | **无法排队任务** — 不能说"做完这个，再做那个" | 任务队列，支持链式自动执行 |
+| 3 | **会话搜索痛苦** — `--resume` 只显示列表，无法搜索和预览 | 全文搜索所有会话，即时预览 |
+| 4 | **无法按项目追踪用量** — `/cost` 只显示当前会话 | 按项目、按天、按会话的用量仪表盘 |
+| 5 | **压缩后上下文丢失** — CC 忘记之前在做什么 | 独立于 CC 会话的持久化任务待办 |
+| 6 | **没有多项目总览** — 每个终端都是孤岛 | 统一的跨项目仪表盘 |
+| 7 | **没有日报** — 很难回忆今天 CC 帮了什么忙 | 自动生成日报（会话 + Git 提交） |
+| 8 | **待办列表消失** — CC 的 TodoWrite 是会话级别的 | 持久化的统一任务待办 |
+| 9 | **找不到运行中的 CC 进程** — 无法列出所有活跃会话 | 跨项目的进程监控器 |
+| 10 | **会话名无意义** — 自动生成的名字如 `a1b2c3d4` | 自定义会话标签和分类 |
+
+> 来源：[#7069](https://github.com/anthropics/claude-code/issues/7069)、[#4707](https://github.com/anthropics/claude-code/issues/4707)、[#2954](https://github.com/anthropics/claude-code/issues/2954)、[#4689](https://github.com/anthropics/claude-code/issues/4689)、[#12455](https://github.com/anthropics/claude-code/issues/12455) 及社区反馈。
 
 ### 功能
 

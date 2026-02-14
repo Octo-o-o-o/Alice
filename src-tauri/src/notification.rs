@@ -1,5 +1,7 @@
 // Notification engine for session events
 
+#![allow(dead_code)]
+
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
@@ -86,12 +88,76 @@ pub fn notify_daily_report(
 
 /// Core notification sending function
 fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
+    // Send visual notification
     app.notification()
         .builder()
         .title(title)
         .body(body)
         .show()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // Check if voice notifications are enabled
+    let config = crate::config::load_config();
+    if config.voice_notifications {
+        speak_notification(title, body);
+    }
+
+    Ok(())
+}
+
+/// Speak notification using platform-native TTS
+fn speak_notification(title: &str, body: &str) {
+    // Clean up the text for speech
+    let clean_title = title
+        .replace("✓", "Completed:")
+        .replace("✗", "Error:")
+        .replace("⚠", "Attention:")
+        .replace("▶", "Started:")
+        .replace("📋", "");
+
+    let text = format!("{} {}", clean_title.trim(), body);
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: use the built-in `say` command
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("say")
+                .args(["-v", "Samantha", "-r", "200", &text])
+                .output();
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: use PowerShell System.Speech.Synthesis
+        // Escape single quotes in text to prevent PowerShell injection
+        let escaped = text.replace('\'', "''");
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "Add-Type -AssemblyName System.Speech; \
+                         $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
+                         $s.Rate = 1; \
+                         $s.Speak('{}')",
+                        escaped
+                    ),
+                ])
+                .output();
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: try espeak if available
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("espeak")
+                .args([&text])
+                .output();
+        });
+    }
 }
 
 /// Format duration in human-readable format

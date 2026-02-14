@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { FolderOpen, Inbox } from "lucide-react";
+import { FolderOpen, Inbox, ChevronDown, Check } from "lucide-react";
 import SessionCard from "../components/SessionCard";
 import { Session } from "../lib/types";
 
@@ -12,7 +12,9 @@ interface ActiveViewProps {
 export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
-  const [selectedProject, setSelectedProject] = useState<string | null>(null);
+  const [selectedProjects, setSelectedProjects] = useState<Set<string>>(new Set()); // empty = all selected
+  const [isDropdownOpen, setIsDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
   const loadSessions = async () => {
     try {
@@ -43,6 +45,18 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
     };
   }, []);
 
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setIsDropdownOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
   // Group sessions by project
   const projectGroups = sessions.reduce((acc, session) => {
     const project = session.project_name;
@@ -53,9 +67,42 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
     return acc;
   }, {} as Record<string, Session[]>);
 
-  const filteredSessions = selectedProject
-    ? sessions.filter((s) => s.project_name === selectedProject)
-    : sessions;
+  const projectList = Object.keys(projectGroups).sort();
+  const isAllSelected = selectedProjects.size === 0;
+
+  const filteredSessions = isAllSelected
+    ? sessions
+    : sessions.filter((s) => selectedProjects.has(s.project_name));
+
+  const toggleProject = (project: string) => {
+    setSelectedProjects((prev) => {
+      const next = new Set(prev);
+      if (next.has(project)) {
+        next.delete(project);
+      } else {
+        next.add(project);
+      }
+      // If all projects are selected, reset to "All" state
+      if (next.size === projectList.length) {
+        return new Set();
+      }
+      return next;
+    });
+  };
+
+  const selectAll = () => {
+    setSelectedProjects(new Set());
+    setIsDropdownOpen(false);
+  };
+
+  const getFilterLabel = () => {
+    if (isAllSelected) return "All Projects";
+    if (selectedProjects.size === 1) {
+      const project = Array.from(selectedProjects)[0];
+      return project;
+    }
+    return `${selectedProjects.size} Projects`;
+  };
 
   if (loading) {
     return (
@@ -79,36 +126,75 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      {/* Project filter */}
-      {Object.keys(projectGroups).length > 1 && (
-        <div className="px-3 py-2 border-b border-white/5 flex items-center gap-2 overflow-x-auto shrink-0">
-          <button
-            onClick={() => setSelectedProject(null)}
-            className={`px-2 py-1 text-xs rounded-full shrink-0 transition-colors ${
-              !selectedProject
-                ? "bg-blue-500/20 text-blue-300 border border-blue-500/30"
-                : "text-gray-400 hover:text-gray-300 hover:bg-white/5"
-            }`}
-          >
-            All Projects
-          </button>
-          {Object.keys(projectGroups).map((project) => (
+      {/* Project filter dropdown */}
+      {projectList.length > 1 && (
+        <div className="px-3 py-2 border-b border-white/5 shrink-0">
+          <div className="relative" ref={dropdownRef}>
             <button
-              key={project}
-              onClick={() => setSelectedProject(project)}
-              className={`px-2 py-1 text-xs rounded-full shrink-0 transition-colors flex items-center gap-1 ${
-                selectedProject === project
-                  ? "bg-blue-500/20 text-blue-300 border border-blue-500/30"
-                  : "text-gray-400 hover:text-gray-300 hover:bg-white/5"
-              }`}
+              onClick={() => setIsDropdownOpen(!isDropdownOpen)}
+              className="flex items-center gap-2 px-2.5 py-1.5 text-xs rounded-lg bg-white/5 border border-white/10 hover:bg-white/8 hover:border-white/20 transition-colors text-gray-300"
             >
-              <FolderOpen size={10} />
-              {project}
-              <span className="text-[10px] opacity-70">
-                ({projectGroups[project].length})
-              </span>
+              <FolderOpen size={12} className="text-gray-400" />
+              <span>{getFilterLabel()}</span>
+              <ChevronDown
+                size={12}
+                className={`text-gray-400 transition-transform ${isDropdownOpen ? "rotate-180" : ""}`}
+              />
             </button>
-          ))}
+
+            {isDropdownOpen && (
+              <div className="absolute top-full left-0 mt-1 w-56 bg-gray-900/95 backdrop-blur-xl border border-white/10 rounded-lg shadow-xl z-50 overflow-hidden">
+                {/* All Projects option */}
+                <button
+                  onClick={selectAll}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-white/5 transition-colors border-b border-white/5"
+                >
+                  <div className={`w-4 h-4 rounded border flex items-center justify-center ${
+                    isAllSelected
+                      ? "bg-blue-500 border-blue-500"
+                      : "border-gray-600"
+                  }`}>
+                    {isAllSelected && <Check size={10} className="text-white" />}
+                  </div>
+                  <span className={isAllSelected ? "text-blue-300" : "text-gray-300"}>
+                    All Projects
+                  </span>
+                  <span className="ml-auto text-[10px] text-gray-500">
+                    {sessions.length}
+                  </span>
+                </button>
+
+                {/* Project list */}
+                <div className="max-h-48 overflow-y-auto">
+                  {projectList.map((project) => {
+                    const isSelected = isAllSelected || selectedProjects.has(project);
+                    return (
+                      <button
+                        key={project}
+                        onClick={() => toggleProject(project)}
+                        className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-white/5 transition-colors"
+                      >
+                        <div className={`w-4 h-4 rounded border flex items-center justify-center ${
+                          isSelected
+                            ? "bg-blue-500 border-blue-500"
+                            : "border-gray-600"
+                        }`}>
+                          {isSelected && <Check size={10} className="text-white" />}
+                        </div>
+                        <FolderOpen size={10} className="text-gray-400" />
+                        <span className={isSelected ? "text-gray-200" : "text-gray-400"}>
+                          {project}
+                        </span>
+                        <span className="ml-auto text-[10px] text-gray-500">
+                          {projectGroups[project].length}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       )}
 

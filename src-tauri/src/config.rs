@@ -3,6 +3,46 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Theme setting
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    System,
+    Light,
+    Dark,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::System
+    }
+}
+
+/// Terminal application setting for task execution
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalApp {
+    /// Run in background (no visible terminal)
+    Background,
+    /// macOS: Terminal.app, Windows: cmd.exe
+    System,
+    /// macOS: iTerm2
+    #[serde(rename = "iterm2")]
+    ITerm2,
+    /// Windows Terminal (wt.exe)
+    WindowsTerminal,
+    /// Warp terminal
+    Warp,
+    /// Custom terminal command
+    Custom,
+}
+
+impl Default for TerminalApp {
+    fn default() -> Self {
+        TerminalApp::System
+    }
+}
+
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -33,6 +73,18 @@ pub struct AppConfig {
     /// Daily report auto-generation time (HH:MM, empty = disabled)
     #[serde(default)]
     pub daily_report_time: String,
+    /// Theme setting (system, light, dark)
+    #[serde(default)]
+    pub theme: Theme,
+    /// Terminal application for task execution
+    #[serde(default)]
+    pub terminal_app: TerminalApp,
+    /// Custom terminal command (used when terminal_app is Custom)
+    #[serde(default)]
+    pub custom_terminal_command: String,
+    /// Whether terminal choice has been made (for first-run prompt)
+    #[serde(default)]
+    pub terminal_choice_made: bool,
 }
 
 fn default_true() -> bool {
@@ -71,6 +123,10 @@ impl Default for AppConfig {
             hooks_installed: false,
             data_retention_days: 0,
             daily_report_time: String::new(),
+            theme: Theme::default(),
+            terminal_app: TerminalApp::default(),
+            custom_terminal_command: String::new(),
+            terminal_choice_made: false,
         }
     }
 }
@@ -168,6 +224,31 @@ pub fn update_config_value(key: &str, value: serde_json::Value) -> Result<AppCon
         "notifications.on_daily_report" => {
             config.notifications.on_daily_report = value.as_bool().unwrap_or(true);
         }
+        "theme" => {
+            let theme_str = value.as_str().unwrap_or("system");
+            config.theme = match theme_str {
+                "light" => Theme::Light,
+                "dark" => Theme::Dark,
+                _ => Theme::System,
+            };
+        }
+        "terminal_app" => {
+            let terminal_str = value.as_str().unwrap_or("system");
+            config.terminal_app = match terminal_str {
+                "background" => TerminalApp::Background,
+                "iterm2" => TerminalApp::ITerm2,
+                "windows_terminal" => TerminalApp::WindowsTerminal,
+                "warp" => TerminalApp::Warp,
+                "custom" => TerminalApp::Custom,
+                _ => TerminalApp::System,
+            };
+        }
+        "custom_terminal_command" => {
+            config.custom_terminal_command = value.as_str().unwrap_or("").to_string();
+        }
+        "terminal_choice_made" => {
+            config.terminal_choice_made = value.as_bool().unwrap_or(false);
+        }
         _ => return Err(format!("Unknown config key: {}", key)),
     }
 
@@ -213,7 +294,7 @@ pub fn is_claude_installed() -> bool {
 
 /// Get Claude Code version
 pub fn get_claude_version() -> Option<String> {
-    std::process::Command::new("claude")
+    std::process::Command::new(crate::platform::get_claude_command())
         .arg("--version")
         .output()
         .ok()

@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { Zap, FileText, Copy, Check, RefreshCw, ChevronRight, GitCommit, ArrowUpDown, ArrowUp, ArrowDown } from "lucide-react";
-import { UsageStats, DailyReport, ProjectUsage } from "../lib/types";
+import { Zap, FileText, Copy, Check, RefreshCw, ChevronRight, GitCommit, ArrowUpDown, ArrowUp, ArrowDown, Activity, AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
+import { UsageStats, DailyReport, ProjectUsage, AnthropicStatus } from "../lib/types";
 import UsageMeter from "../components/UsageMeter";
 import BarChart from "../components/BarChart";
 
@@ -19,6 +19,7 @@ export default function UsageView() {
   const [copied, setCopied] = useState(false);
   const [sortField, setSortField] = useState<SortField>("cost");
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
+  const [apiStatus, setApiStatus] = useState<AnthropicStatus | null>(null);
 
   const loadStats = async () => {
     try {
@@ -78,8 +79,21 @@ export default function UsageView() {
     }
   };
 
+  const loadApiStatus = async () => {
+    try {
+      const result = await invoke<AnthropicStatus>("get_anthropic_status", {});
+      setApiStatus(result);
+    } catch (error) {
+      console.error("Failed to load Anthropic status:", error);
+    }
+  };
+
   useEffect(() => {
     loadStats();
+    loadApiStatus();
+    // Refresh status every 5 minutes
+    const interval = setInterval(loadApiStatus, 5 * 60 * 1000);
+    return () => clearInterval(interval);
   }, [period]);
 
   // Format numbers
@@ -200,6 +214,74 @@ export default function UsageView() {
       </div>
 
       <div className="p-3 space-y-4">
+        {/* Anthropic API Status */}
+        {apiStatus && (
+          <div className={`flex items-center justify-between p-2 rounded-lg border ${
+            apiStatus.status === "none"
+              ? "bg-green-500/5 border-green-500/20"
+              : apiStatus.status === "minor"
+              ? "bg-yellow-500/5 border-yellow-500/20"
+              : "bg-red-500/5 border-red-500/20"
+          }`}>
+            <div className="flex items-center gap-2">
+              {apiStatus.status === "none" ? (
+                <CheckCircle2 size={14} className="text-green-500" />
+              ) : apiStatus.status === "minor" ? (
+                <AlertTriangle size={14} className="text-yellow-500" />
+              ) : (
+                <XCircle size={14} className="text-red-500" />
+              )}
+              <span className={`text-xs ${
+                apiStatus.status === "none"
+                  ? "text-green-400"
+                  : apiStatus.status === "minor"
+                  ? "text-yellow-400"
+                  : "text-red-400"
+              }`}>
+                Anthropic API: {apiStatus.description}
+              </span>
+            </div>
+            <button
+              onClick={loadApiStatus}
+              className="p-1 text-gray-500 hover:text-gray-300 transition-colors"
+              title="Refresh status"
+            >
+              <RefreshCw size={12} />
+            </button>
+          </div>
+        )}
+
+        {/* Active Incidents */}
+        {apiStatus && apiStatus.incidents.length > 0 && (
+          <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-lg p-3">
+            <h4 className="text-xs font-semibold text-yellow-400 uppercase tracking-wider mb-2 flex items-center gap-2">
+              <Activity size={12} />
+              Active Incidents
+            </h4>
+            <div className="space-y-2">
+              {apiStatus.incidents.map((incident, index) => (
+                <div key={index} className="text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-200">{incident.name}</span>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                      incident.impact === "critical"
+                        ? "bg-red-500/20 text-red-400"
+                        : incident.impact === "major"
+                        ? "bg-orange-500/20 text-orange-400"
+                        : "bg-yellow-500/20 text-yellow-400"
+                    }`}>
+                      {incident.impact}
+                    </span>
+                  </div>
+                  <span className="text-[10px] text-gray-500">
+                    Status: {incident.status}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Daily Report (if generated) */}
         {report && showReport && (
           <div className="bg-white/[0.03] border border-white/5 rounded-lg overflow-hidden">

@@ -3,7 +3,7 @@
 > **Version**: 1.2 (Revised)
 > **Platforms**: macOS (primary), Windows (supported with fallbacks)
 > **Framework**: React + TypeScript + Tailwind CSS (Tauri 2.0 shell)
-> **Theme**: Premium Dark Glassmorphism
+> **Theme**: Premium Dark Glassmorphism + Coordinated Light Mode
 > **Font Family**: Inter (UI), JetBrains Mono (Code) - **Bundled locally** for offline reliability.
 
 ---
@@ -19,6 +19,12 @@ Alice uses a **"Visual Control Plane"** aesthetic—dense, data-rich, yet highly
 -   **Dimensions**:
     -   Default Width: `480px` (Increased from 420px to accommodate usage dashboards).
     -   Max Height: Controlled via Tauri window config, not CSS `vh`.
+
+## 1.1 Light Mode Adaptation
+While Dark Mode is primary, Light Mode must feel equally premium, avoiding "washed out" or "muddy" contrast.
+-   **Philosophy**: "Ceramic & Glass". Instead of glowing lights in darkness, think of high-quality white ceramic with translucent frosted glass overlays.
+-   **Contrast**: Text must be significantly darker than simple inversion (Gray-500 in dark != Gray-500 in light).
+-   **Shadows**: Softer, more diffuse shadows (`shadow-lg`, `shadow-xl`) replace the "glow" effects of dark mode.
 
 ---
 
@@ -36,6 +42,16 @@ These tokens must be added to `tailwind.config.js` to ensure consistency.
 | `gray-950` | `#0B0F19` | Deepest background / Modal overlays |
 | `alice-bg` | `rgba(20, 20, 30, 0.75)` | Main window backdrop |
 | `alice-border` | `rgba(255, 255, 255, 0.08)` | 1px border for all glass panels |
+
+### 2.1.1 Light Mode Palette (Overrides)
+| Token | Dark Value | Light Value | Usage |
+| :--- | :--- | :--- | :--- |
+| `bg-primary` | `rgb(20, 20, 30)` | `#FFFFFF` | Main window background |
+| `bg-secondary`| `rgb(11, 15, 25)` | `#F3F4F6` | Sidebar / deeply nested |
+| `text-primary`| `#e5e7eb` (Gray-200) | `#111827` (Gray-900) | Main text |
+| `text-muted`  | `#9ca3af` (Gray-400) | `#6b7280` (Gray-500) | Secondary text |
+| `border-glass`| `white/5` | `black/5` | Dividers |
+| `shadow-glow` | `rgba(color, 0.3)` | `rgba(color, 0.15)` | Status indicators |
 
 ### 2.2 Functional Colors (Status)
 

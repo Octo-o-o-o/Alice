@@ -1,5 +1,7 @@
 // Tray icon management for Alice
 
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicU8, Ordering};
 use tauri::{AppHandle, Emitter};
 

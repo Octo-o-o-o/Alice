@@ -11,13 +11,24 @@ import {
   User,
   RefreshCw,
   HardDrive,
+  Webhook,
+  Download,
+  RotateCcw,
+  Sun,
+  Moon,
+  Monitor,
+  Terminal,
 } from "lucide-react";
+import { useTheme } from "../contexts/ThemeContext";
+import { Theme } from "../lib/types";
+import { useToast } from "../contexts/ToastContext";
 import { getModKey, getClaudeDir, isMacSync } from "../lib/platform";
 
 interface AppConfig {
   launch_at_login: boolean;
   auto_hide_on_blur: boolean;
   notification_sound: boolean;
+  voice_notifications: boolean;
   notifications: {
     on_task_completed: boolean;
     on_task_error: boolean;
@@ -28,6 +39,13 @@ interface AppConfig {
   hooks_installed: boolean;
   data_retention_days: number;
   daily_report_time: string;
+  terminal_app: string;
+  custom_terminal_command: string;
+}
+
+interface TerminalOption {
+  value: string;
+  label: string;
 }
 
 interface SystemInfo {
@@ -76,16 +94,22 @@ function Toggle({ enabled, onChange, label, description }: ToggleProps) {
 export default function ConfigView() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
+  const [terminalOptions, setTerminalOptions] = useState<TerminalOption[]>([]);
   const [loading, setLoading] = useState(true);
+  const [installingHooks, setInstallingHooks] = useState(false);
+  const toast = useToast();
+  const { theme, setTheme } = useTheme();
 
   const loadData = async () => {
     try {
-      const [configResult, sysInfo] = await Promise.all([
+      const [configResult, sysInfo, terminals] = await Promise.all([
         invoke<AppConfig>("get_config", {}),
         invoke<SystemInfo>("get_system_info", {}),
+        invoke<TerminalOption[]>("get_available_terminals", {}),
       ]);
       setConfig(configResult);
       setSystemInfo(sysInfo);
+      setTerminalOptions(terminals);
     } catch (error) {
       console.error("Failed to load config:", error);
     } finally {
@@ -106,6 +130,33 @@ export default function ConfigView() {
       setConfig(result);
     } catch (error) {
       console.error("Failed to update config:", error);
+    }
+  };
+
+  const installHooks = async () => {
+    try {
+      setInstallingHooks(true);
+      const result = await invoke<{ success: boolean; settings_path: string; hooks_file: string }>("install_hooks", {});
+      if (result.success) {
+        toast.success("Hooks installed successfully");
+        loadData(); // Refresh config to show hooks_installed = true
+      }
+    } catch (error) {
+      console.error("Failed to install hooks:", error);
+      toast.error("Failed to install hooks");
+    } finally {
+      setInstallingHooks(false);
+    }
+  };
+
+  const rerunSetupWizard = async () => {
+    try {
+      await invoke("update_config", { key: "onboarding_completed", value: false });
+      // Reload the page to trigger the onboarding wizard
+      window.location.reload();
+    } catch (error) {
+      console.error("Failed to reset onboarding:", error);
+      toast.error("Failed to reset setup wizard");
     }
   };
 
@@ -187,6 +238,132 @@ export default function ConfigView() {
               label="Auto-hide on blur"
               description="Hide panel when clicking outside"
             />
+            <div className="border-t border-white/5 dark:border-white/5 my-2" />
+            <div className="py-2">
+              <p className="text-sm text-gray-200 dark:text-gray-200 mb-1">Theme</p>
+              <p className="text-xs text-gray-500 mb-2">Choose your preferred appearance</p>
+              <div className="flex gap-2">
+                {([
+                  { value: "system", icon: Monitor, label: "System" },
+                  { value: "light", icon: Sun, label: "Light" },
+                  { value: "dark", icon: Moon, label: "Dark" },
+                ] as const).map(({ value, icon: Icon, label }) => (
+                  <button
+                    key={value}
+                    onClick={() => setTheme(value as Theme)}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg transition-colors ${
+                      theme === value
+                        ? "bg-blue-500 text-white"
+                        : "bg-white/10 dark:bg-white/10 text-gray-300 dark:text-gray-300 hover:bg-white/15 dark:hover:bg-white/15"
+                    }`}
+                  >
+                    <Icon size={14} />
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Hooks */}
+        <section>
+          <h3 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2 flex items-center gap-2">
+            <Webhook size={12} />
+            Hooks Integration
+          </h3>
+          <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                {config.hooks_installed ? (
+                  <CheckCircle2 size={14} className="text-green-500" />
+                ) : (
+                  <XCircle size={14} className="text-yellow-500" />
+                )}
+                <span className="text-sm text-gray-200">
+                  {config.hooks_installed ? "Hooks installed" : "Hooks not installed"}
+                </span>
+              </div>
+            </div>
+            <p className="text-xs text-gray-500 mb-3">
+              Hooks provide real-time session event tracking for better status updates and notifications.
+            </p>
+            <button
+              onClick={installHooks}
+              disabled={installingHooks}
+              className="flex items-center gap-1 px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors"
+            >
+              {installingHooks ? (
+                <>
+                  <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Installing...
+                </>
+              ) : (
+                <>
+                  <Download size={12} />
+                  {config.hooks_installed ? "Reinstall Hooks" : "Install Hooks"}
+                </>
+              )}
+            </button>
+          </div>
+        </section>
+
+        {/* Task Execution */}
+        <section>
+          <h3 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2 flex items-center gap-2">
+            <Terminal size={12} />
+            Task Execution
+          </h3>
+          <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3">
+            <div className="py-2">
+              <p className="text-sm text-gray-200 mb-1">Terminal Application</p>
+              <p className="text-xs text-gray-500 mb-2">
+                Choose where to run queued tasks. Select a visible terminal to watch Claude work.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {terminalOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    onClick={() => updateSetting("terminal_app", option.value)}
+                    className={`px-3 py-1.5 text-xs rounded-lg transition-colors ${
+                      config?.terminal_app === option.value
+                        ? "bg-blue-500 text-white"
+                        : "bg-white/10 text-gray-300 hover:bg-white/15"
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {config?.terminal_app === "custom" && (
+              <>
+                <div className="border-t border-white/5 my-2" />
+                <div className="py-2">
+                  <p className="text-sm text-gray-200 mb-1">Custom Terminal Command</p>
+                  <p className="text-xs text-gray-500 mb-2">
+                    Use {"{dir}"} for working directory and {"{cmd}"} for the command
+                  </p>
+                  <input
+                    type="text"
+                    value={config.custom_terminal_command}
+                    onChange={(e) => updateSetting("custom_terminal_command", e.target.value)}
+                    placeholder='e.g., open -a "Alacritty" --args -e sh -c "cd {dir} && {cmd}"'
+                    className="w-full bg-white/5 border border-white/10 rounded-lg py-2 px-3 text-xs text-gray-200 placeholder:text-gray-600 focus:ring-1 focus:ring-blue-500/50 focus:outline-none font-mono"
+                  />
+                </div>
+              </>
+            )}
+            {config?.terminal_app === "background" && (
+              <p className="text-xs text-yellow-500/80 mt-2">
+                ⚠️ Background mode runs tasks invisibly. You won't see Claude's output.
+              </p>
+            )}
+            {config?.terminal_app && config.terminal_app !== "background" && (
+              <p className="text-xs text-green-500/80 mt-2">
+                ✓ Tasks will open in a visible terminal window where you can watch Claude work.
+              </p>
+            )}
           </div>
         </section>
 
@@ -202,6 +379,12 @@ export default function ConfigView() {
               onChange={(v) => updateSetting("notification_sound", v)}
               label="Notification sound"
               description="Play sound on task completion"
+            />
+            <Toggle
+              enabled={config.voice_notifications}
+              onChange={(v) => updateSetting("voice_notifications", v)}
+              label="Voice notifications"
+              description={isMacSync() ? "Speak notifications using macOS TTS" : "Speak notifications using system TTS"}
             />
             <div className="border-t border-white/5 my-2" />
             <Toggle
@@ -263,6 +446,22 @@ export default function ConfigView() {
                 <RefreshCw size={10} />
                 Refresh
               </button>
+              <button
+                onClick={async () => {
+                  try {
+                    const count = await invoke<number>("rescan_sessions");
+                    toast.success(`Rescanned ${count} sessions`);
+                    loadData();
+                  } catch (error) {
+                    console.error("Failed to rescan:", error);
+                    toast.error("Failed to rescan sessions");
+                  }
+                }}
+                className="px-3 py-1 text-xs bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 rounded transition-colors flex items-center gap-1"
+              >
+                <RotateCcw size={10} />
+                Rescan Sessions
+              </button>
             </div>
           </div>
         </section>
@@ -321,6 +520,13 @@ export default function ConfigView() {
                 Claude Code
                 <ExternalLink size={10} />
               </a>
+              <button
+                onClick={rerunSetupWizard}
+                className="px-3 py-1 text-xs bg-white/10 hover:bg-white/15 text-gray-300 rounded transition-colors flex items-center gap-1"
+              >
+                <RotateCcw size={10} />
+                Re-run Setup Wizard
+              </button>
             </div>
           </div>
         </section>

@@ -10,27 +10,23 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
         "title": "Alice",
-        "width": 480,
+        "width": 360,
         "height": 640,
         "maxHeight": 800,
         "decorations": false,
-        "transparent": true,
+        "transparent": false,
         "visible": false,
         "resizable": false,
         "skipTaskbar": true,
         "alwaysOnTop": false
       }
     ],
-    "trayIcon": {
-      "id": "main",
-      "iconPath": "icons/tray-icon.png",
-      "iconAsTemplate": true
-    },
     "security": {
       "csp": null
     }
@@ -47,14 +43,24 @@
     ],
     "macOS": {
       "minimumSystemVersion": "12.0"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
     }
   },
   "plugins": {
-    "notification": {
-      "all": true
-    },
     "shell": {
-      "all": true,
       "open": true
     }
   }
