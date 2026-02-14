@@ -22,3 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Internal docs (local only)
+demo.html
+demo_v2.html
+IMPLEMENTATION_PLAN.md
+PHASE2_IMPLEMENTATION.md
+PROPOSAL.cn.md
+PROPOSAL.md
