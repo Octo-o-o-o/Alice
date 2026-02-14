@@ -20,19 +20,64 @@ pub struct SessionUpdateEvent {
     pub status: String,
 }
 
-/// Start the file watcher for ~/.claude/
-pub fn start_watcher(app: AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let claude_dir = get_claude_dir()?;
+/// Get all Claude directories to watch (based on enabled environments)
+fn get_claude_directories() -> Vec<PathBuf> {
+    let config = crate::config::load_config();
+    let mut dirs = Vec::new();
 
-    if !claude_dir.exists() {
-        tracing::warn!("Claude directory not found: {:?}", claude_dir);
+    for env in &config.claude_environments {
+        if !env.enabled {
+            continue;
+        }
+
+        let dir = if env.config_dir.is_empty() {
+            // Default environment uses ~/.claude/
+            crate::platform::get_claude_dir()
+        } else {
+            // Custom environment uses specified directory
+            let path = PathBuf::from(&env.config_dir);
+            if path.is_absolute() {
+                path
+            } else {
+                // Relative paths are relative to home directory
+                dirs::home_dir()
+                    .map(|h| h.join(&env.config_dir))
+                    .unwrap_or(path)
+            }
+        };
+
+        if dir.exists() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+
+    // Always include the default claude dir if nothing is configured
+    if dirs.is_empty() {
+        let default_dir = crate::platform::get_claude_dir();
+        if default_dir.exists() {
+            dirs.push(default_dir);
+        }
+    }
+
+    dirs
+}
+
+/// Start the file watcher for Claude directories (supports multiple environments)
+pub fn start_watcher(app: AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let claude_dirs = get_claude_directories();
+
+    if claude_dirs.is_empty() {
+        tracing::warn!("No Claude directories found");
         return Ok(());
     }
 
-    tracing::info!("Starting file watcher on {:?}", claude_dir);
+    tracing::info!("Starting file watcher for {} directories", claude_dirs.len());
 
-    // Initial scan
-    initial_scan(&app, &claude_dir)?;
+    // Initial scan for all directories
+    for claude_dir in &claude_dirs {
+        tracing::info!("Scanning directory: {:?}", claude_dir);
+        initial_scan(&app, claude_dir)?;
+    }
 
     // Set up file watcher
     let (tx, rx) = channel();
@@ -46,10 +91,13 @@ pub fn start_watcher(app: AppHandle) -> Result<(), Box<dyn std::error::Error + S
         Config::default().with_poll_interval(Duration::from_millis(500)),
     )?;
 
-    // Watch the projects directory recursively
-    let projects_dir = claude_dir.join("projects");
-    if projects_dir.exists() {
-        watcher.watch(&projects_dir, RecursiveMode::Recursive)?;
+    // Watch all projects directories recursively
+    for claude_dir in &claude_dirs {
+        let projects_dir = claude_dir.join("projects");
+        if projects_dir.exists() {
+            tracing::info!("Watching directory: {:?}", projects_dir);
+            watcher.watch(&projects_dir, RecursiveMode::Recursive)?;
+        }
     }
 
     // Debounce map to avoid processing the same file multiple times
@@ -184,28 +232,35 @@ fn decode_project_path(encoded: &str) -> String {
 
 /// Force rescan all session files to update token data
 pub fn rescan_all_sessions(app: &AppHandle) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    let claude_dir = get_claude_dir()?;
-    let projects_dir = claude_dir.join("projects");
+    let claude_dirs = get_claude_directories();
 
-    if !projects_dir.exists() {
+    if claude_dirs.is_empty() {
         return Ok(0);
     }
 
-    tracing::info!("Force rescanning all sessions in {:?}", projects_dir);
-
     let mut count: u32 = 0;
 
-    // Walk through all project directories
-    for entry in walkdir::WalkDir::new(&projects_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-            if let Err(e) = process_session_file(app, path) {
-                tracing::warn!("Failed to process session file {:?}: {}", path, e);
-            } else {
-                count += 1;
+    for claude_dir in &claude_dirs {
+        let projects_dir = claude_dir.join("projects");
+
+        if !projects_dir.exists() {
+            continue;
+        }
+
+        tracing::info!("Force rescanning all sessions in {:?}", projects_dir);
+
+        // Walk through all project directories
+        for entry in walkdir::WalkDir::new(&projects_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                if let Err(e) = process_session_file(app, path) {
+                    tracing::warn!("Failed to process session file {:?}: {}", path, e);
+                } else {
+                    count += 1;
+                }
             }
         }
     }

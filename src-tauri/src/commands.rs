@@ -718,3 +718,70 @@ pub async fn delete_favorite(app: AppHandle, id: String) -> Result<(), String> {
 pub async fn reorder_favorites(app: AppHandle, favorite_ids: Vec<String>) -> Result<(), String> {
     database::reorder_favorites(&app, favorite_ids).map_err(|e| e.to_string())
 }
+
+// ============================================================================
+// Auto Action
+// ============================================================================
+
+/// Get auto action state
+#[tauri::command]
+pub async fn get_auto_action_state(app: AppHandle) -> crate::auto_action::AutoActionState {
+    crate::auto_action::get_auto_action_state(&app).await
+}
+
+/// Start auto action timer manually
+#[tauri::command]
+pub async fn start_auto_action_timer(app: AppHandle) -> Result<(), String> {
+    crate::auto_action::start_auto_action_timer(&app).await
+}
+
+/// Cancel auto action timer
+#[tauri::command]
+pub async fn cancel_auto_action_timer() -> Result<(), String> {
+    crate::auto_action::cancel_auto_action_timer().await
+}
+
+// ============================================================================
+// Claude Environments
+// ============================================================================
+
+/// Get all Claude environments
+#[tauri::command]
+pub async fn get_claude_environments() -> Vec<crate::config::ClaudeEnvironment> {
+    let config = crate::config::load_config();
+    config.claude_environments
+}
+
+/// Get the active Claude environment
+#[tauri::command]
+pub async fn get_active_environment() -> crate::config::ClaudeEnvironment {
+    crate::config::get_active_environment()
+}
+
+/// Add a new Claude environment
+#[tauri::command]
+pub async fn add_claude_environment(
+    env: crate::config::ClaudeEnvironment,
+) -> Result<crate::config::AppConfig, String> {
+    crate::config::add_environment(env)
+}
+
+/// Update an existing Claude environment
+#[tauri::command]
+pub async fn update_claude_environment(
+    env: crate::config::ClaudeEnvironment,
+) -> Result<crate::config::AppConfig, String> {
+    crate::config::update_environment(env)
+}
+
+/// Delete a Claude environment
+#[tauri::command]
+pub async fn delete_claude_environment(id: String) -> Result<crate::config::AppConfig, String> {
+    crate::config::delete_environment(&id)
+}
+
+/// Set the active Claude environment
+#[tauri::command(rename_all = "camelCase")]
+pub async fn set_active_environment(environment_id: String) -> Result<crate::config::AppConfig, String> {
+    crate::config::set_active_environment(&environment_id)
+}

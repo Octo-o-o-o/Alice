@@ -43,6 +43,7 @@ export default function FavoriteView() {
   const [newTags, setNewTags] = useState("");
   const [projects, setProjects] = useState<string[]>([]);
   const [showRunPicker, setShowRunPicker] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
   const runPickerRef = useRef<HTMLDivElement>(null);
   const toast = useToast();
 
@@ -203,18 +204,40 @@ export default function FavoriteView() {
     );
   }
 
+  // Filter favorites based on search query
+  const filteredFavorites = favorites.filter((fav) => {
+    if (!searchQuery.trim()) return true;
+    const query = searchQuery.toLowerCase();
+    return (
+      fav.name.toLowerCase().includes(query) ||
+      fav.prompt.toLowerCase().includes(query) ||
+      (fav.tags && fav.tags.toLowerCase().includes(query))
+    );
+  });
+
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      {/* Header */}
-      <div className="px-3 py-2 border-b border-white/5 shrink-0 flex items-center justify-between">
-        <h2 className="text-sm font-medium text-gray-300">Favorite Prompts</h2>
-        <button
-          onClick={() => setShowAddForm(true)}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors"
-        >
-          <Plus size={14} />
-          Add
-        </button>
+      {/* Header with search */}
+      <div className="px-3 py-2 border-b border-white/5 shrink-0 space-y-2">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-medium text-gray-300">Favorite Prompts</h2>
+          <button
+            onClick={() => setShowAddForm(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors"
+          >
+            <Plus size={14} />
+            Add
+          </button>
+        </div>
+        {favorites.length > 0 && (
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search favorites..."
+            className="w-full bg-white/5 border border-white/10 rounded-lg py-1.5 px-3 text-xs text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+          />
+        )}
       </div>
 
       {/* Add form */}
@@ -280,15 +303,23 @@ export default function FavoriteView() {
               Save your frequently used prompts here
             </p>
           </div>
+        ) : filteredFavorites.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-3">
+            <Star size={32} className="opacity-50" />
+            <p className="text-sm">No matches found</p>
+            <p className="text-xs text-gray-600">
+              Try a different search term
+            </p>
+          </div>
         ) : (
           <DndContext
             sensors={sensors}
             collisionDetection={closestCenter}
             onDragEnd={handleDragEnd}
           >
-            <SortableContext items={favorites.map((f) => f.id)} strategy={verticalListSortingStrategy}>
+            <SortableContext items={filteredFavorites.map((f) => f.id)} strategy={verticalListSortingStrategy}>
               <div className="space-y-2">
-                {favorites.map((favorite) => (
+                {filteredFavorites.map((favorite) => (
                   <SortableFavoriteItem
                     key={favorite.id}
                     favorite={favorite}
@@ -433,43 +464,23 @@ function SortableFavoriteItem({
     <div
       ref={setNodeRef}
       style={style}
-      className="group p-3 bg-white/[0.03] border border-white/[0.05] rounded-lg hover:bg-white/[0.06] transition-colors"
+      className="group relative p-3 bg-white/[0.03] border border-white/[0.05] rounded-lg hover:bg-white/[0.06] transition-colors"
     >
-      <div className="flex items-start gap-2">
+      {/* Title row with buttons */}
+      <div className="flex items-center gap-2 mb-1">
         <button
           {...attributes}
           {...listeners}
-          className="p-1 text-gray-600 hover:text-gray-400 cursor-grab active:cursor-grabbing touch-none mt-0.5"
+          className="p-1 text-gray-600 hover:text-gray-400 cursor-grab active:cursor-grabbing touch-none shrink-0"
         >
           <GripVertical size={12} />
         </button>
-
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-1">
-            <Star size={12} className="text-yellow-500 shrink-0" />
-            <span className="text-sm font-medium text-gray-200 truncate">
-              {favorite.name}
-            </span>
-          </div>
-          <p className="text-xs text-gray-400 line-clamp-2 ml-5">
-            {favorite.prompt}
-          </p>
-          {tagList.length > 0 && (
-            <div className="flex items-center gap-1.5 mt-1.5 ml-5 flex-wrap">
-              {tagList.map((tag, index) => (
-                <span
-                  key={index}
-                  className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] bg-blue-500/20 text-blue-400 rounded"
-                >
-                  <Tag size={8} />
-                  {tag}
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-
-        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+        <Star size={12} className="text-yellow-500 shrink-0" />
+        <span className="text-sm font-medium text-gray-200 truncate flex-1 min-w-0 group-hover:mr-[120px] transition-all">
+          {favorite.name}
+        </span>
+        {/* Action buttons - positioned absolutely on hover */}
+        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0 absolute right-3">
           <button
             onClick={onCopy}
             className="p-1.5 text-gray-500 hover:text-blue-400 rounded transition-colors"
@@ -531,6 +542,26 @@ function SortableFavoriteItem({
           </button>
         </div>
       </div>
+
+      {/* Prompt */}
+      <p className="text-xs text-gray-400 ml-9 whitespace-pre-wrap break-words">
+        {favorite.prompt}
+      </p>
+
+      {/* Tags */}
+      {tagList.length > 0 && (
+        <div className="flex items-center gap-1.5 mt-1.5 ml-9 flex-wrap">
+          {tagList.map((tag, index) => (
+            <span
+              key={index}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] bg-blue-500/20 text-blue-400 rounded"
+            >
+              <Tag size={8} />
+              {tag}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

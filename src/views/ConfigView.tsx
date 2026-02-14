@@ -18,9 +18,18 @@ import {
   Moon,
   Monitor,
   Terminal,
+  Layers,
+  Plus,
+  Pencil,
+  Trash2,
+  Check,
+  X,
+  FolderOpen,
+  Key,
+  Cpu,
 } from "lucide-react";
 import { useTheme } from "../contexts/ThemeContext";
-import { Theme } from "../lib/types";
+import { Theme, ClaudeEnvironment } from "../lib/types";
 import { useToast } from "../contexts/ToastContext";
 import { getModKey, getClaudeDir, isMacSync } from "../lib/platform";
 
@@ -41,6 +50,8 @@ interface AppConfig {
   daily_report_time: string;
   terminal_app: string;
   custom_terminal_command: string;
+  claude_environments: ClaudeEnvironment[];
+  active_environment_id?: string | null;
 }
 
 interface TerminalOption {
@@ -99,6 +110,11 @@ export default function ConfigView() {
   const [installingHooks, setInstallingHooks] = useState(false);
   const toast = useToast();
   const { theme, setTheme } = useTheme();
+
+  // Environment management state
+  const [editingEnv, setEditingEnv] = useState<ClaudeEnvironment | null>(null);
+  const [isAddingEnv, setIsAddingEnv] = useState(false);
+  const [envForm, setEnvForm] = useState<Partial<ClaudeEnvironment>>({});
 
   const loadData = async () => {
     try {
@@ -170,6 +186,92 @@ export default function ConfigView() {
     return `${bytes} B`;
   };
 
+  // Environment management functions
+  const startAddEnv = () => {
+    setEnvForm({
+      id: "",
+      name: "",
+      config_dir: "",
+      api_key: "",
+      model: "",
+      command: "",
+      enabled: true,
+    });
+    setIsAddingEnv(true);
+    setEditingEnv(null);
+  };
+
+  const startEditEnv = (env: ClaudeEnvironment) => {
+    setEnvForm({ ...env });
+    setEditingEnv(env);
+    setIsAddingEnv(false);
+  };
+
+  const cancelEnvEdit = () => {
+    setEditingEnv(null);
+    setIsAddingEnv(false);
+    setEnvForm({});
+  };
+
+  const saveEnv = async () => {
+    if (!envForm.id || !envForm.name) {
+      toast.error("ID and Name are required");
+      return;
+    }
+
+    try {
+      const envData: ClaudeEnvironment = {
+        id: envForm.id,
+        name: envForm.name,
+        config_dir: envForm.config_dir || "",
+        api_key: envForm.api_key || null,
+        model: envForm.model || null,
+        command: envForm.command || null,
+        enabled: envForm.enabled ?? true,
+      };
+
+      if (isAddingEnv) {
+        await invoke<AppConfig>("add_claude_environment", { env: envData });
+        toast.success("Environment added");
+      } else {
+        await invoke<AppConfig>("update_claude_environment", { env: envData });
+        toast.success("Environment updated");
+      }
+      loadData();
+      cancelEnvEdit();
+    } catch (error) {
+      console.error("Failed to save environment:", error);
+      toast.error(`Failed to save: ${error}`);
+    }
+  };
+
+  const deleteEnv = async (id: string) => {
+    if (id === "default") {
+      toast.error("Cannot delete the default environment");
+      return;
+    }
+
+    try {
+      await invoke<AppConfig>("delete_claude_environment", { id });
+      toast.success("Environment deleted");
+      loadData();
+    } catch (error) {
+      console.error("Failed to delete environment:", error);
+      toast.error(`Failed to delete: ${error}`);
+    }
+  };
+
+  const setActiveEnv = async (id: string) => {
+    try {
+      await invoke<AppConfig>("set_active_environment", { environmentId: id });
+      toast.success("Active environment changed");
+      loadData();
+    } catch (error) {
+      console.error("Failed to set active environment:", error);
+      toast.error(`Failed to set active: ${error}`);
+    }
+  };
+
   if (loading || !config) {
     return (
       <div className="flex items-center justify-center h-full">
@@ -215,6 +317,248 @@ export default function ConfigView() {
                 Claude Code CLI not found. Please install it first.
               </p>
             )}
+          </div>
+        </section>
+
+        {/* Claude Environments */}
+        <section>
+          <h3 className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2 flex items-center gap-2">
+            <Layers size={12} />
+            Claude Environments
+          </h3>
+          <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3">
+            <p className="text-xs text-gray-500 mb-3">
+              Configure multiple Claude Code environments with custom API keys, models, or config directories.
+            </p>
+
+            {/* Environment List */}
+            <div className="space-y-2 mb-3">
+              {config?.claude_environments?.map((env) => (
+                <div
+                  key={env.id}
+                  className={`p-2 rounded-lg border transition-colors ${
+                    config.active_environment_id === env.id || (!config.active_environment_id && env.id === "default")
+                      ? "border-blue-500/50 bg-blue-500/10"
+                      : "border-white/10 bg-white/5"
+                  }`}
+                >
+                  {editingEnv?.id === env.id ? (
+                    // Edit Form
+                    <div className="space-y-2">
+                      <div className="grid grid-cols-2 gap-2">
+                        <input
+                          type="text"
+                          value={envForm.id || ""}
+                          disabled
+                          className="bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-400 cursor-not-allowed"
+                          placeholder="ID"
+                        />
+                        <input
+                          type="text"
+                          value={envForm.name || ""}
+                          onChange={(e) => setEnvForm({ ...envForm, name: e.target.value })}
+                          className="bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                          placeholder="Display Name"
+                        />
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <FolderOpen size={12} className="text-gray-500" />
+                        <input
+                          type="text"
+                          value={envForm.config_dir || ""}
+                          onChange={(e) => setEnvForm({ ...envForm, config_dir: e.target.value })}
+                          className="flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 font-mono focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                          placeholder="Config dir (e.g., ~/.claude-yixiao)"
+                        />
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <Key size={12} className="text-gray-500" />
+                        <input
+                          type="password"
+                          value={envForm.api_key || ""}
+                          onChange={(e) => setEnvForm({ ...envForm, api_key: e.target.value })}
+                          className="flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 font-mono focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                          placeholder="API Key (optional)"
+                        />
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <Cpu size={12} className="text-gray-500" />
+                        <input
+                          type="text"
+                          value={envForm.model || ""}
+                          onChange={(e) => setEnvForm({ ...envForm, model: e.target.value })}
+                          className="flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 font-mono focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                          placeholder="Model (e.g., claude-sonnet-4-5-20250929)"
+                        />
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <Terminal size={12} className="text-gray-500" />
+                        <input
+                          type="text"
+                          value={envForm.command || ""}
+                          onChange={(e) => setEnvForm({ ...envForm, command: e.target.value })}
+                          className="flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 font-mono focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                          placeholder="CLI command (e.g., claude-yixiao)"
+                        />
+                      </div>
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          onClick={cancelEnvEdit}
+                          className="p-1 text-gray-400 hover:text-gray-200"
+                        >
+                          <X size={14} />
+                        </button>
+                        <button
+                          onClick={saveEnv}
+                          className="p-1 text-green-400 hover:text-green-300"
+                        >
+                          <Check size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    // Display Mode
+                    <div className="flex items-center justify-between">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm text-gray-200 font-medium">{env.name}</span>
+                          {(config.active_environment_id === env.id || (!config.active_environment_id && env.id === "default")) && (
+                            <span className="text-[10px] px-1.5 py-0.5 bg-blue-500/20 text-blue-400 rounded">
+                              Active
+                            </span>
+                          )}
+                          {!env.enabled && (
+                            <span className="text-[10px] px-1.5 py-0.5 bg-gray-500/20 text-gray-400 rounded">
+                              Disabled
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-gray-500 truncate mt-0.5">
+                          {env.config_dir || "Default (~/.claude)"}
+                          {env.model && ` • ${env.model}`}
+                          {env.api_key && " • Custom API Key"}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        {env.id !== "default" && config.active_environment_id !== env.id && (
+                          <button
+                            onClick={() => setActiveEnv(env.id)}
+                            className="p-1 text-gray-400 hover:text-blue-400"
+                            title="Set as active"
+                          >
+                            <Check size={14} />
+                          </button>
+                        )}
+                        <button
+                          onClick={() => startEditEnv(env)}
+                          className="p-1 text-gray-400 hover:text-gray-200"
+                          title="Edit"
+                        >
+                          <Pencil size={14} />
+                        </button>
+                        {env.id !== "default" && (
+                          <button
+                            onClick={() => deleteEnv(env.id)}
+                            className="p-1 text-gray-400 hover:text-red-400"
+                            title="Delete"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {/* Add New Environment Form */}
+            {isAddingEnv ? (
+              <div className="p-2 rounded-lg border border-white/10 bg-white/5 space-y-2">
+                <div className="grid grid-cols-2 gap-2">
+                  <input
+                    type="text"
+                    value={envForm.id || ""}
+                    onChange={(e) => setEnvForm({ ...envForm, id: e.target.value.toLowerCase().replace(/\s+/g, "-") })}
+                    className="bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                    placeholder="ID (e.g., yixiao)"
+                  />
+                  <input
+                    type="text"
+                    value={envForm.name || ""}
+                    onChange={(e) => setEnvForm({ ...envForm, name: e.target.value })}
+                    className="bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                    placeholder="Display Name"
+                  />
+                </div>
+                <div className="flex items-center gap-1">
+                  <FolderOpen size={12} className="text-gray-500" />
+                  <input
+                    type="text"
+                    value={envForm.config_dir || ""}
+                    onChange={(e) => setEnvForm({ ...envForm, config_dir: e.target.value })}
+                    className="flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 font-mono focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                    placeholder="Config dir (e.g., ~/.claude-yixiao)"
+                  />
+                </div>
+                <div className="flex items-center gap-1">
+                  <Key size={12} className="text-gray-500" />
+                  <input
+                    type="password"
+                    value={envForm.api_key || ""}
+                    onChange={(e) => setEnvForm({ ...envForm, api_key: e.target.value })}
+                    className="flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 font-mono focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                    placeholder="API Key (optional)"
+                  />
+                </div>
+                <div className="flex items-center gap-1">
+                  <Cpu size={12} className="text-gray-500" />
+                  <input
+                    type="text"
+                    value={envForm.model || ""}
+                    onChange={(e) => setEnvForm({ ...envForm, model: e.target.value })}
+                    className="flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 font-mono focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                    placeholder="Model (e.g., claude-sonnet-4-5-20250929)"
+                  />
+                </div>
+                <div className="flex items-center gap-1">
+                  <Terminal size={12} className="text-gray-500" />
+                  <input
+                    type="text"
+                    value={envForm.command || ""}
+                    onChange={(e) => setEnvForm({ ...envForm, command: e.target.value })}
+                    className="flex-1 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 font-mono focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
+                    placeholder="CLI command (e.g., claude-yixiao)"
+                  />
+                </div>
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    onClick={cancelEnvEdit}
+                    className="p-1 text-gray-400 hover:text-gray-200"
+                  >
+                    <X size={14} />
+                  </button>
+                  <button
+                    onClick={saveEnv}
+                    className="p-1 text-green-400 hover:text-green-300"
+                  >
+                    <Check size={14} />
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={startAddEnv}
+                className="flex items-center gap-1 px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded transition-colors"
+              >
+                <Plus size={12} />
+                Add Environment
+              </button>
+            )}
+
+            <p className="text-[10px] text-gray-600 mt-3">
+              Tip: Use custom config directories to separate different Claude accounts (e.g., work vs personal).
+            </p>
           </div>
         </section>
 

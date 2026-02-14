@@ -18,8 +18,11 @@ import {
   Inbox,
   ChevronDown,
   Check,
+  Moon,
+  Power,
+  Clock,
 } from "lucide-react";
-import { Task, QueueStatusEvent, QueueStartResult, TerminalOption, Session } from "../lib/types";
+import { Task, QueueStatusEvent, QueueStartResult, TerminalOption, Session, AutoActionState, AppConfig, AutoActionType } from "../lib/types";
 import SessionCard from "../components/SessionCard";
 import { useToast } from "../contexts/ToastContext";
 import {
@@ -77,6 +80,14 @@ export default function TaskView({ onTaskCountChange, onActiveSessionCountChange
   const inputRef = useRef<HTMLInputElement>(null);
   const projectPickerRef = useRef<HTMLDivElement>(null);
   const toast = useToast();
+
+  // Auto action state
+  const [autoActionState, setAutoActionState] = useState<AutoActionState | null>(null);
+  const [autoActionEnabled, setAutoActionEnabled] = useState(false);
+  const [autoActionType, setAutoActionType] = useState<AutoActionType>("none");
+  const [autoActionDelay, setAutoActionDelay] = useState(5);
+  const [isAutoActionDropdownOpen, setIsAutoActionDropdownOpen] = useState(false);
+  const autoActionDropdownRef = useRef<HTMLDivElement>(null);
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -139,9 +150,82 @@ export default function TaskView({ onTaskCountChange, onActiveSessionCountChange
     }
   };
 
+  // Load auto action config
+  const loadAutoActionConfig = async () => {
+    try {
+      const config = await invoke<AppConfig>("get_config");
+      setAutoActionEnabled(config.auto_action.enabled);
+      setAutoActionType(config.auto_action.action_type);
+      setAutoActionDelay(config.auto_action.delay_minutes);
+    } catch (error) {
+      console.error("Failed to load auto action config:", error);
+    }
+  };
+
+  // Load auto action state
+  const loadAutoActionState = async () => {
+    try {
+      const state = await invoke<AutoActionState>("get_auto_action_state");
+      setAutoActionState(state);
+    } catch (error) {
+      console.error("Failed to load auto action state:", error);
+    }
+  };
+
+  // Update auto action config
+  const updateAutoActionConfig = async (key: string, value: boolean | string | number) => {
+    try {
+      await invoke("update_config", { key: `auto_action.${key}`, value });
+      await loadAutoActionConfig();
+    } catch (error) {
+      console.error("Failed to update auto action config:", error);
+    }
+  };
+
+  // Cancel auto action timer
+  const cancelAutoAction = async () => {
+    try {
+      await invoke("cancel_auto_action_timer");
+      // Reset settings after cancel (one-time use)
+      await invoke("update_config", { key: "auto_action.enabled", value: false });
+      await invoke("update_config", { key: "auto_action.action_type", value: "none" });
+      setAutoActionState(null);
+      setAutoActionEnabled(false);
+      setAutoActionType("none");
+      toast.info("Auto action cancelled");
+    } catch (error) {
+      console.error("Failed to cancel auto action:", error);
+    }
+  };
+
+  // Format remaining time
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, "0")}`;
+  };
+
+  // Get action label
+  const getActionLabel = (type: AutoActionType | string) => {
+    switch (type) {
+      case "sleep": return "Sleep";
+      case "shutdown": return "Shutdown";
+      default: return "None";
+    }
+  };
+
+  // Get action icon
+  const getActionIcon = (type: AutoActionType | string) => {
+    switch (type) {
+      case "sleep": return <Moon size={12} />;
+      case "shutdown": return <Power size={12} />;
+      default: return <Clock size={12} />;
+    }
+  };
+
   useEffect(() => {
     const loadAll = async () => {
-      await Promise.all([loadTasks(), loadSessions(), loadProjects(), loadQueueStatus()]);
+      await Promise.all([loadTasks(), loadSessions(), loadProjects(), loadQueueStatus(), loadAutoActionConfig(), loadAutoActionState()]);
       setLoading(false);
     };
     loadAll();
@@ -158,17 +242,27 @@ export default function TaskView({ onTaskCountChange, onActiveSessionCountChange
       loadSessions();
     });
 
+    // Listen for auto action state updates
+    const unlistenAutoAction = listen<AutoActionState>("auto-action-state", (event) => {
+      setAutoActionState(event.payload);
+      // If timer finished (not active and was active before), reset settings
+      if (!event.payload.timer_active) {
+        loadAutoActionConfig(); // Reload config as it may have been reset by backend
+      }
+    });
+
     // Poll every 5 seconds for active sessions
     const interval = setInterval(loadSessions, 5000);
 
     return () => {
       unlistenQueue.then(fn => fn());
       unlistenSession.then(fn => fn());
+      unlistenAutoAction.then(fn => fn());
       clearInterval(interval);
     };
   }, []);
 
-  // Close project picker when clicking outside
+  // Close dropdowns when clicking outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (projectPickerRef.current && !projectPickerRef.current.contains(event.target as Node)) {
@@ -176,6 +270,9 @@ export default function TaskView({ onTaskCountChange, onActiveSessionCountChange
       }
       if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
         setIsDropdownOpen(false);
+      }
+      if (autoActionDropdownRef.current && !autoActionDropdownRef.current.contains(event.target as Node)) {
+        setIsAutoActionDropdownOpen(false);
       }
     };
 
@@ -695,7 +792,7 @@ export default function TaskView({ onTaskCountChange, onActiveSessionCountChange
 
           {/* Sessions list */}
           {sessions.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-3">
+            <div className="flex-1 flex flex-col items-center justify-center text-gray-500 gap-3">
               <Inbox size={32} className="opacity-50" />
               <p className="text-sm">No active sessions</p>
               <p className="text-xs text-gray-600">
@@ -709,6 +806,111 @@ export default function TaskView({ onTaskCountChange, onActiveSessionCountChange
               ))}
             </div>
           )}
+
+          {/* Auto Action Panel */}
+          <div className="px-3 py-2 border-t border-white/5 shrink-0">
+            {/* Timer active - show countdown */}
+            {autoActionState?.timer_active ? (
+              <div className="flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
+                <div className="flex items-center gap-2">
+                  {getActionIcon(autoActionState.action_type)}
+                  <span className="text-xs text-amber-300">
+                    {getActionLabel(autoActionState.action_type)} in {formatTime(autoActionState.remaining_seconds)}
+                  </span>
+                </div>
+                <button
+                  onClick={cancelAutoAction}
+                  className="p-1 rounded hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
+                  title="Cancel"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            ) : (
+              /* Timer inactive - show config */
+              <div className="relative" ref={autoActionDropdownRef}>
+                <button
+                  onClick={() => setIsAutoActionDropdownOpen(!isAutoActionDropdownOpen)}
+                  className={`flex items-center gap-2 px-2.5 py-1.5 text-xs rounded-lg border transition-colors w-full justify-between ${
+                    autoActionEnabled && autoActionType !== "none"
+                      ? "bg-blue-500/10 border-blue-500/30 text-blue-300 hover:bg-blue-500/15"
+                      : "bg-white/5 border-white/10 text-gray-400 hover:bg-white/8 hover:border-white/20"
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    {getActionIcon(autoActionType)}
+                    <span>
+                      {autoActionEnabled && autoActionType !== "none"
+                        ? `${getActionLabel(autoActionType)} after ${autoActionDelay}m`
+                        : "Auto action off"}
+                    </span>
+                  </div>
+                  <ChevronDown
+                    size={12}
+                    className={`transition-transform ${isAutoActionDropdownOpen ? "rotate-180" : ""}`}
+                  />
+                </button>
+
+                {isAutoActionDropdownOpen && (
+                  <div className="absolute bottom-full left-0 mb-1 w-full bg-gray-900/95 backdrop-blur-xl border border-white/10 rounded-lg shadow-xl z-50 overflow-hidden">
+                    {/* Action type options */}
+                    <div className="p-2 space-y-1">
+                      <div className="text-[10px] text-gray-500 px-2 py-1">After all tasks complete:</div>
+                      {(["none", "sleep", "shutdown"] as AutoActionType[]).map((type) => (
+                        <button
+                          key={type}
+                          onClick={() => {
+                            updateAutoActionConfig("action_type", type);
+                            updateAutoActionConfig("enabled", type !== "none");
+                            setAutoActionType(type);
+                            setAutoActionEnabled(type !== "none");
+                          }}
+                          className="w-full flex items-center gap-2 px-2 py-1.5 text-xs hover:bg-white/5 rounded transition-colors"
+                        >
+                          <div className={`w-4 h-4 rounded border flex items-center justify-center ${
+                            autoActionType === type
+                              ? "bg-blue-500 border-blue-500"
+                              : "border-gray-600"
+                          }`}>
+                            {autoActionType === type && <Check size={10} className="text-white" />}
+                          </div>
+                          {getActionIcon(type)}
+                          <span className={autoActionType === type ? "text-blue-300" : "text-gray-300"}>
+                            {getActionLabel(type)}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Delay input */}
+                    {autoActionType !== "none" && (
+                      <div className="border-t border-white/5 p-2">
+                        <div className="text-[10px] text-gray-500 px-2 py-1">Delay (minutes):</div>
+                        <div className="flex items-center gap-2 px-2">
+                          {[1, 3, 5, 10, 15, 30].map((mins) => (
+                            <button
+                              key={mins}
+                              onClick={() => {
+                                updateAutoActionConfig("delay_minutes", mins);
+                                setAutoActionDelay(mins);
+                              }}
+                              className={`px-2 py-1 text-xs rounded transition-colors ${
+                                autoActionDelay === mins
+                                  ? "bg-blue-500 text-white"
+                                  : "bg-white/5 text-gray-400 hover:bg-white/10"
+                              }`}
+                            >
+                              {mins}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
 

@@ -60,6 +60,18 @@ impl QueueExecutor {
         self.running.store(false, Ordering::SeqCst);
         self.emit_status().await;
 
+        // Check if we should start auto action timer (all tasks completed)
+        let remaining_tasks = database::get_tasks(&self.app, Some(TaskStatus::Queued), None)
+            .map(|tasks| tasks.len())
+            .unwrap_or(0);
+
+        if remaining_tasks == 0 {
+            // All tasks completed, start auto action timer if enabled
+            if let Err(e) = crate::auto_action::start_auto_action_timer(&self.app).await {
+                tracing::debug!("Auto action timer not started: {}", e);
+            }
+        }
+
         Ok(())
     }
 
@@ -269,16 +281,47 @@ impl QueueExecutor {
 
         let working_dir = task.project_path.as_deref();
 
+        // Get active environment for custom settings
+        let env_config = crate::config::get_active_environment();
+
         // Check if we should use a visible terminal
         if config.terminal_app != crate::config::TerminalApp::Background {
-            // Execute in visible terminal
+            // Build command with environment variables for terminal execution
+            let cmd_name = env_config.command.as_deref().unwrap_or(claude_cmd);
             let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+            // Build env prefix for shell execution
+            let mut env_prefix = String::new();
+            if !env_config.config_dir.is_empty() {
+                env_prefix.push_str(&format!("CLAUDE_CONFIG_DIR='{}' ", env_config.config_dir));
+            }
+            if let Some(ref api_key) = env_config.api_key {
+                if !api_key.is_empty() {
+                    env_prefix.push_str(&format!("ANTHROPIC_API_KEY='{}' ", api_key));
+                }
+            }
+            if let Some(ref model) = env_config.model {
+                if !model.is_empty() {
+                    env_prefix.push_str(&format!("ANTHROPIC_MODEL='{}' ", model));
+                }
+            }
+
+            // If we have env vars and using default command, prepend them
+            let (final_cmd, final_args) = if !env_prefix.is_empty() && env_config.command.is_none() {
+                // For shell execution with env vars, we need to use shell wrapper
+                let full_cmd = format!("{}{} {}", env_prefix, cmd_name, args_str.join(" "));
+                ("sh".to_string(), vec!["-c".to_string(), full_cmd])
+            } else {
+                (cmd_name.to_string(), args.clone())
+            };
+
+            let final_args_str: Vec<&str> = final_args.iter().map(|s| s.as_str()).collect();
             crate::platform::execute_in_terminal(
                 &config.terminal_app,
                 &config.custom_terminal_command,
                 working_dir,
-                claude_cmd,
-                &args_str,
+                &final_cmd,
+                &final_args_str,
             )?;
 
             // For terminal execution, we can't track the output directly
@@ -307,9 +350,27 @@ impl QueueExecutor {
         }
 
         // Background execution (original behavior)
-        let mut cmd = Command::new(claude_cmd);
+        // Use custom command if specified, otherwise use platform default
+        let cmd_name = env_config.command.as_deref().unwrap_or(claude_cmd);
+        let mut cmd = Command::new(cmd_name);
+
         for arg in &args {
             cmd.arg(arg);
+        }
+
+        // Set environment variables based on environment config
+        if !env_config.config_dir.is_empty() {
+            cmd.env("CLAUDE_CONFIG_DIR", &env_config.config_dir);
+        }
+        if let Some(ref api_key) = env_config.api_key {
+            if !api_key.is_empty() {
+                cmd.env("ANTHROPIC_API_KEY", api_key);
+            }
+        }
+        if let Some(ref model) = env_config.model {
+            if !model.is_empty() {
+                cmd.env("ANTHROPIC_MODEL", model);
+            }
         }
 
         // Set working directory if project path is specified

@@ -8,6 +8,35 @@ export type Theme = "system" | "light" | "dark";
 // Terminal app setting
 export type TerminalApp = "background" | "system" | "iterm2" | "windows_terminal" | "warp" | "custom";
 
+// Auto action type
+export type AutoActionType = "none" | "sleep" | "shutdown";
+
+// Claude environment configuration (for multi-environment support)
+export interface ClaudeEnvironment {
+  id: string;
+  name: string;
+  config_dir: string;
+  api_key?: string | null;
+  model?: string | null;
+  command?: string | null;
+  enabled: boolean;
+}
+
+// Auto action configuration
+export interface AutoActionConfig {
+  enabled: boolean;
+  action_type: AutoActionType;
+  delay_minutes: number;
+}
+
+// Auto action state
+export interface AutoActionState {
+  timer_active: boolean;
+  action_type: string;
+  remaining_seconds: number;
+  total_seconds: number;
+}
+
 export interface TerminalOption {
   value: string;
   label: string;
@@ -33,6 +62,9 @@ export interface AppConfig {
   terminal_app: TerminalApp;
   custom_terminal_command: string;
   terminal_choice_made: boolean;
+  auto_action: AutoActionConfig;
+  claude_environments: ClaudeEnvironment[];
+  active_environment_id?: string | null;
 }
 
 export interface QueueStartResult {

@@ -1,6 +1,7 @@
 // Alice - Claude Code Desktop Assistant
 // A lightweight menu bar application for managing Claude Code tasks, sessions, and workflows
 
+mod auto_action;
 mod commands;
 mod config;
 mod database;
@@ -208,6 +209,15 @@ pub fn run() {
             commands::update_favorite,
             commands::delete_favorite,
             commands::reorder_favorites,
+            commands::get_auto_action_state,
+            commands::start_auto_action_timer,
+            commands::cancel_auto_action_timer,
+            commands::get_claude_environments,
+            commands::get_active_environment,
+            commands::add_claude_environment,
+            commands::update_claude_environment,
+            commands::delete_claude_environment,
+            commands::set_active_environment,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
