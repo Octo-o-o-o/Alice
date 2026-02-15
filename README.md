@@ -2,7 +2,9 @@
 
 # Alice
 
-**A lightweight menu bar app for managing Claude Code sessions, tasks, and workflows.**
+**A lightweight menu bar app for managing AI coding assistant sessions, tasks, and workflows.**
+
+**Supports Claude Code, Gemini CLI, and OpenAI Codex CLI.**
 
 [English](#english) | [中文](#中文)
 
@@ -19,7 +21,12 @@
 
 ## What is Alice?
 
-Alice is a macOS menu bar desktop assistant that wraps around [Claude Code](https://docs.anthropic.com/en/docs/claude-code), providing a **visual control plane** for the CLI-first workflow.
+Alice is a macOS menu bar desktop assistant that wraps around AI coding CLI tools, providing a **visual control plane** for the CLI-first workflow.
+
+**Supported Providers:**
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (Anthropic)
+- [Gemini CLI](https://github.com/google-gemini/gemini-cli) (Google)
+- [Codex CLI](https://github.com/openai/codex) (OpenAI)
 
 ### Pain Points Solved
 
@@ -43,13 +50,14 @@ Using Claude Code daily? These might sound familiar:
 
 ### Features
 
-- **Session Monitor** — Real-time status of all active Claude Code sessions across projects
+- **Multi-Provider Support** — Unified interface for Claude Code, Gemini CLI, and Codex CLI
+- **Session Monitor** — Real-time status of all active AI coding sessions across projects and providers
 - **Task Queue** — Queue tasks, chain execution, auto-run next when done
 - **Notifications** — Native macOS alerts on task completion, errors, or input needed
 - **Session Search** — Full-text search across all session history with one-click resume
-- **Usage Dashboard** — Token/cost tracking per project, per session, with OAuth usage meters
+- **Usage Dashboard** — Token/cost tracking per project, per session, per provider
 - **Daily Report** — Auto-generated summary of sessions, git commits, and usage stats
-- **Multi-Environment Support** — Manage multiple Claude accounts/configs (work/personal), custom API keys, models, and config directories
+- **Auto Actions** — Configurable automatic actions on session events
 
 ### Screenshots
 
@@ -94,26 +102,35 @@ npm run tauri build
 ```
 Alice/
 ├── src/                    # Frontend (React + TypeScript)
-│   ├── App.tsx             # Root — 5-tab navigation
-│   ├── views/              # Tab views (Active, Tasks, Usage, History, Config)
+│   ├── App.tsx             # Root — multi-tab navigation
+│   ├── views/              # Tab views (Active, Tasks, Usage, History, Reports, Config)
 │   ├── components/         # Shared UI components
+│   │   ├── SessionCard.tsx       # Session display component
+│   │   ├── ProviderBadge.tsx     # Provider identification badge
+│   │   ├── ProviderConfigCard.tsx # Provider configuration UI
+│   │   └── ProviderUsageCard.tsx # Provider usage display
 │   ├── lib/types.ts        # TypeScript types (synced with Rust structs)
+│   ├── lib/provider-colors.ts # Provider-specific color themes
 │   └── index.css           # Tailwind v4 + design tokens
 ├── src-tauri/              # Backend (Rust + Tauri 2.0)
 │   └── src/
 │       ├── lib.rs          # App setup, plugins, tray, commands
-│       ├── commands.rs     # 25+ IPC command handlers
+│       ├── commands.rs     # 30+ IPC command handlers
 │       ├── database.rs     # SQLite with FTS5
 │       ├── session.rs      # JSONL session parser
-│       ├── watcher.rs      # ~/.claude/ file system watcher
-│       ├── queue.rs        # Task queue engine (spawns claude CLI)
-│       ├── usage.rs        # OAuth usage API integration
+│       ├── watcher.rs      # File system watcher for all providers
+│       ├── providers/      # Multi-provider support module
+│       │   ├── mod.rs      # Provider trait and registry
+│       │   ├── claude.rs   # Claude Code provider
+│       │   ├── gemini.rs   # Gemini CLI provider
+│       │   └── codex.rs    # Codex CLI provider
+│       ├── queue.rs        # Task queue engine
+│       ├── usage.rs        # Usage API integration
 │       ├── report.rs       # Daily report generator
 │       ├── notification.rs # Native notification engine
+│       ├── auto_action.rs  # Automatic action triggers
 │       ├── config.rs       # App config (~/.alice/)
 │       └── tray.rs         # Menu bar tray icon states
-├── PROPOSAL.md             # Detailed design document
-├── CLAUDE.md               # AI coding assistant instructions
 └── package.json
 ```
 
@@ -152,7 +169,12 @@ Inspired by and built upon ideas from these open-source projects:
 
 ## Alice 是什么？
 
-Alice 是一个 macOS 菜单栏桌面助手，为 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 提供**可视化控制面板**。
+Alice 是一个 macOS 菜单栏桌面助手，为 AI 编程 CLI 工具提供**可视化控制面板**。
+
+**支持的 Provider：**
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (Anthropic)
+- [Gemini CLI](https://github.com/google-gemini/gemini-cli) (Google)
+- [Codex CLI](https://github.com/openai/codex) (OpenAI)
 
 ### 解决的痛点
 
@@ -176,13 +198,14 @@ Alice 是一个 macOS 菜单栏桌面助手，为 [Claude Code](https://docs.ant
 
 ### 功能
 
-- **会话监控** — 实时显示所有项目中活跃的 Claude Code 会话状态
+- **多 Provider 支持** — 统一界面管理 Claude Code、Gemini CLI 和 Codex CLI
+- **会话监控** — 实时显示所有项目和 Provider 中活跃的 AI 编程会话状态
 - **任务队列** — 排队任务，链式执行，完成后自动运行下一个
 - **系统通知** — 任务完成、报错或需要输入时发送 macOS 原生通知
 - **会话搜索** — 全文搜索所有历史会话，一键恢复
-- **用量仪表盘** — 按项目、按会话追踪 Token 和费用，支持 OAuth 用量指标
+- **用量仪表盘** — 按项目、按会话、按 Provider 追踪 Token 和费用
 - **日报生成** — 自动汇总当日会话、Git 提交和用量统计
-- **多环境支持** — 管理多个 Claude 账户/配置（工作/个人），自定义 API key、模型和配置目录
+- **自动操作** — 可配置的会话事件自动响应
 
 ### 环境要求
 
