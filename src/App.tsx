@@ -2,27 +2,38 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  FileText,
   ListTodo,
+  Settings,
   Star,
   Zap,
-  Clock,
-  Settings,
 } from "lucide-react";
 
-import TaskView from "./views/TaskView";
+import WorkspaceView from "./views/WorkspaceView";
 import FavoriteView from "./views/FavoriteView";
 import UsageView from "./views/UsageView";
-import HistoryView, { HistoryViewRef } from "./views/HistoryView";
+import ReportView from "./views/ReportView";
 import ConfigView from "./views/ConfigView";
 import OnboardingWizard from "./components/OnboardingWizard";
 import { ToastProvider } from "./contexts/ToastContext";
 import { ThemeProvider } from "./contexts/ThemeContext";
+import type { AppConfig } from "./lib/types";
 
-interface AppConfig {
-  onboarding_completed: boolean;
+type ViewType = "tasks" | "favorites" | "usage" | "report" | "settings";
+
+interface TabDefinition {
+  id: ViewType;
+  icon: React.ComponentType<{ size?: number }>;
+  label: string;
 }
 
-type ViewType = "tasks" | "favorites" | "history" | "usage" | "settings";
+const TABS: TabDefinition[] = [
+  { id: "tasks", icon: ListTodo, label: "Tasks" },
+  { id: "favorites", icon: Star, label: "Favorites" },
+  { id: "usage", icon: Zap, label: "Usage" },
+  { id: "report", icon: FileText, label: "Report" },
+  { id: "settings", icon: Settings, label: "Settings" },
+];
 
 interface TabProps {
   icon: React.ComponentType<{ size?: number }>;
@@ -61,23 +72,17 @@ function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const viewRef = useRef<{ refresh?: () => void }>(null);
-  const historyViewRef = useRef<HistoryViewRef>(null);
 
   // Check if onboarding is needed
   useEffect(() => {
-    const checkOnboarding = async () => {
-      try {
-        const config = await invoke<AppConfig>("get_config", {});
+    invoke<AppConfig>("get_config", {})
+      .then((config) => {
         if (!config.onboarding_completed) {
           setShowOnboarding(true);
         }
-      } catch (error) {
-        console.error("Failed to load config:", error);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-    checkOnboarding();
+      })
+      .catch((error) => console.error("Failed to load config:", error))
+      .finally(() => setIsLoading(false));
   }, []);
 
   // Listen for session updates from Rust backend
@@ -96,58 +101,47 @@ function App() {
 
   // Global keyboard shortcuts
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Cmd+K or Ctrl+K for search - switch to history and focus search
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
-        e.preventDefault();
-        setActiveView("history");
-        setTimeout(() => {
-          historyViewRef.current?.focusSearch();
-        }, 50);
-      }
+    function handleKeyDown(e: KeyboardEvent): void {
+      if (!(e.metaKey || e.ctrlKey)) return;
 
-      // Cmd+N for new task
-      if ((e.metaKey || e.ctrlKey) && e.key === "n") {
-        e.preventDefault();
-        setActiveView("tasks");
-      }
-
-      // Cmd+R for refresh
-      if ((e.metaKey || e.ctrlKey) && e.key === "r") {
-        e.preventDefault();
-        setRefreshKey((k) => k + 1);
-        viewRef.current?.refresh?.();
-      }
-
-      // Cmd+, for settings
-      if ((e.metaKey || e.ctrlKey) && e.key === ",") {
-        e.preventDefault();
-        setActiveView("settings");
-      }
-
-      // Cmd+1-5 for tab switching
-      if ((e.metaKey || e.ctrlKey) && e.key >= "1" && e.key <= "5") {
-        e.preventDefault();
-        const views: ViewType[] = ["tasks", "favorites", "history", "usage", "settings"];
-        const index = parseInt(e.key) - 1;
-        if (index >= 0 && index < views.length) {
-          setActiveView(views[index]);
+      switch (e.key) {
+        case "n":
+          e.preventDefault();
+          setActiveView("tasks");
+          break;
+        case "r":
+          e.preventDefault();
+          setRefreshKey((k) => k + 1);
+          viewRef.current?.refresh?.();
+          break;
+        case ",":
+          e.preventDefault();
+          setActiveView("settings");
+          break;
+        case "1":
+        case "2":
+        case "3":
+        case "4":
+        case "5": {
+          e.preventDefault();
+          const index = parseInt(e.key) - 1;
+          setActiveView(TABS[index].id);
+          break;
         }
       }
-    };
+    }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
-  // Combined badge for Tasks tab (active sessions + pending tasks)
   const tasksBadge = activeSessionCount + taskCount;
 
-  const renderView = () => {
+  function renderView(): React.ReactNode {
     switch (activeView) {
       case "tasks":
         return (
-          <TaskView
+          <WorkspaceView
             key={refreshKey}
             onTaskCountChange={setTaskCount}
             onActiveSessionCountChange={setActiveSessionCount}
@@ -155,14 +149,14 @@ function App() {
         );
       case "favorites":
         return <FavoriteView key={refreshKey} />;
-      case "history":
-        return <HistoryView key={refreshKey} ref={historyViewRef} />;
       case "usage":
         return <UsageView key={refreshKey} />;
+      case "report":
+        return <ReportView key={refreshKey} />;
       case "settings":
         return <ConfigView key={refreshKey} />;
     }
-  };
+  }
 
   if (isLoading) {
     return (
@@ -176,52 +170,30 @@ function App() {
     <ThemeProvider>
       <ToastProvider>
         <div className="h-full flex flex-col glass-panel overflow-hidden">
-        {/* Drag region for window */}
-        <div className="h-3 drag-region shrink-0 bg-gray-950/80" />
+          {/* Drag region for window */}
+          <div className="h-3 drag-region shrink-0 bg-gray-950/80" />
 
-        {/* Main content area */}
-        <main className="flex-1 overflow-hidden">{renderView()}</main>
+          {/* Main content area */}
+          <main className="flex-1 overflow-hidden">{renderView()}</main>
 
-        {/* Bottom navigation */}
-        <nav className="h-12 border-t border-white/5 bg-gray-950/80 backdrop-blur-xl flex items-center justify-center gap-6 px-4 shrink-0">
-          <ViewTab
-            icon={ListTodo}
-            label="Tasks"
-            isActive={activeView === "tasks"}
-            onClick={() => setActiveView("tasks")}
-            badge={tasksBadge}
-          />
-          <ViewTab
-            icon={Star}
-            label="Favorites"
-            isActive={activeView === "favorites"}
-            onClick={() => setActiveView("favorites")}
-          />
-          <ViewTab
-            icon={Clock}
-            label="History"
-            isActive={activeView === "history"}
-            onClick={() => setActiveView("history")}
-          />
-          <ViewTab
-            icon={Zap}
-            label="Usage"
-            isActive={activeView === "usage"}
-            onClick={() => setActiveView("usage")}
-          />
-          <ViewTab
-            icon={Settings}
-            label="Settings"
-            isActive={activeView === "settings"}
-            onClick={() => setActiveView("settings")}
-          />
-        </nav>
+          {/* Bottom navigation */}
+          <nav className="h-12 border-t border-white/5 bg-gray-950/80 backdrop-blur-xl flex items-center justify-center gap-6 px-4 shrink-0">
+            {TABS.map((tab) => (
+              <ViewTab
+                key={tab.id}
+                icon={tab.icon}
+                label={tab.label}
+                isActive={activeView === tab.id}
+                onClick={() => setActiveView(tab.id)}
+                badge={tab.id === "tasks" ? tasksBadge : undefined}
+              />
+            ))}
+          </nav>
 
-        {/* Onboarding wizard */}
-        {showOnboarding && (
-          <OnboardingWizard onComplete={() => setShowOnboarding(false)} />
-        )}
-      </div>
+          {showOnboarding && (
+            <OnboardingWizard onComplete={() => setShowOnboarding(false)} />
+          )}
+        </div>
       </ToastProvider>
     </ThemeProvider>
   );

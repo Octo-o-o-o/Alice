@@ -83,30 +83,65 @@ pub struct Task {
     pub created_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    /// Provider that will execute this task
+    #[serde(default)]
+    pub provider: crate::providers::ProviderId,
 }
 
 /// Global database connection (thread-safe)
 static DB: once_cell::sync::OnceCell<Mutex<Connection>> = once_cell::sync::OnceCell::new();
 
-/// Get the Alice data directory
-fn get_alice_dir() -> PathBuf {
-    crate::platform::get_alice_dir()
+// ============================================================================
+// Shared SQL fragments
+// ============================================================================
+
+/// The canonical SELECT column list for sessions, used by all session queries.
+const SESSION_COLUMNS: &str =
+    "session_id, project_path, project_name, first_prompt, label, tags,
+     started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
+     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status, provider";
+
+// ============================================================================
+// SessionStatus helpers (keeps conversion logic in one place)
+// ============================================================================
+
+fn session_status_to_str(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "idle",
+        SessionStatus::Active => "active",
+        SessionStatus::Completed => "completed",
+        SessionStatus::Error => "error",
+        SessionStatus::NeedsInput => "needs_input",
+    }
 }
+
+fn session_status_from_str(s: &str) -> SessionStatus {
+    match s {
+        "idle" => SessionStatus::Idle,
+        "active" => SessionStatus::Active,
+        "error" => SessionStatus::Error,
+        "needs_input" => SessionStatus::NeedsInput,
+        _ => SessionStatus::Completed,
+    }
+}
+
+// ============================================================================
+// Database initialization
+// ============================================================================
 
 /// Get the database path
 fn get_db_path() -> PathBuf {
-    get_alice_dir().join("alice.db")
+    crate::platform::get_alice_dir().join("alice.db")
 }
 
 /// Initialize the database
 pub fn init_database(_app: &AppHandle) -> Result<(), DatabaseError> {
-    let alice_dir = get_alice_dir();
+    let alice_dir = crate::platform::get_alice_dir();
     std::fs::create_dir_all(&alice_dir)?;
 
     let db_path = get_db_path();
     let conn = Connection::open(&db_path)?;
 
-    // Create tables
     conn.execute_batch(
         r#"
         -- Session index
@@ -237,35 +272,8 @@ pub fn init_database(_app: &AppHandle) -> Result<(), DatabaseError> {
         "#,
     )?;
 
-    // Migration: Add last_human_message_at column if not exists
-    let _ = conn.execute(
-        "ALTER TABLE sessions ADD COLUMN last_human_message_at INTEGER",
-        [],
-    );
-
-    // Backfill: Set last_human_message_at to last_active_at for existing rows where it's NULL
-    let _ = conn.execute(
-        "UPDATE sessions SET last_human_message_at = last_active_at WHERE last_human_message_at IS NULL",
-        [],
-    );
-
-    // Migration: Add detailed token columns if not exists
-    let _ = conn.execute(
-        "ALTER TABLE sessions ADD COLUMN input_tokens INTEGER DEFAULT 0",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sessions ADD COLUMN output_tokens INTEGER DEFAULT 0",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sessions ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sessions ADD COLUMN cache_write_tokens INTEGER DEFAULT 0",
-        [],
-    );
+    // Run migrations (each silently ignores "duplicate column" errors)
+    run_migrations(&conn);
 
     DB.set(Mutex::new(conn))
         .map_err(|_| DatabaseError::NotFound("Database already initialized".to_string()))?;
@@ -274,7 +282,44 @@ pub fn init_database(_app: &AppHandle) -> Result<(), DatabaseError> {
     Ok(())
 }
 
-/// Get the database connection
+/// Run all schema migrations. Each ALTER TABLE silently fails if the column
+/// already exists, so these are safe to run repeatedly.
+fn run_migrations(conn: &Connection) {
+    let alter_statements = [
+        "ALTER TABLE sessions ADD COLUMN last_human_message_at INTEGER",
+        "ALTER TABLE sessions ADD COLUMN input_tokens INTEGER DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN output_tokens INTEGER DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN cache_write_tokens INTEGER DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'",
+        "ALTER TABLE tasks ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'",
+    ];
+
+    for sql in &alter_statements {
+        let _ = conn.execute(sql, []);
+    }
+
+    // Backfill: set last_human_message_at to last_active_at where NULL
+    let _ = conn.execute(
+        "UPDATE sessions SET last_human_message_at = last_active_at WHERE last_human_message_at IS NULL",
+        [],
+    );
+
+    // Create indexes for provider filtering
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_provider ON sessions(provider)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_provider ON tasks(provider)",
+        [],
+    );
+}
+
+// ============================================================================
+// Database connection
+// ============================================================================
+
 fn get_db() -> Result<std::sync::MutexGuard<'static, Connection>, DatabaseError> {
     DB.get()
         .ok_or_else(|| DatabaseError::NotFound("Database not initialized".to_string()))
@@ -284,8 +329,85 @@ fn get_db() -> Result<std::sync::MutexGuard<'static, Connection>, DatabaseError>
         })
 }
 
-/// Tokenize search query, preserving quoted strings as single tokens
-/// Example: 'foo "bar|baz" -test' -> ["foo", "\"bar|baz\"", "-test"]
+// ============================================================================
+// Dynamic WHERE clause builder
+// ============================================================================
+
+/// Builds a dynamic WHERE clause from a list of conditions and boxed parameters.
+/// Keeps the repeated pattern of (conditions Vec, params Vec, final assembly)
+/// in one place.
+struct WhereBuilder {
+    conditions: Vec<String>,
+    params: Vec<Box<dyn rusqlite::ToSql>>,
+}
+
+impl WhereBuilder {
+    fn new() -> Self {
+        Self {
+            conditions: Vec::new(),
+            params: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, condition: &str, param: impl rusqlite::ToSql + 'static) {
+        self.conditions.push(condition.to_string());
+        self.params.push(Box::new(param));
+    }
+
+    fn push_condition(&mut self, condition: String) {
+        self.conditions.push(condition);
+    }
+
+    fn push_param(&mut self, param: impl rusqlite::ToSql + 'static) {
+        self.params.push(Box::new(param));
+    }
+
+    fn to_where_clause(&self) -> String {
+        if self.conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", self.conditions.join(" AND "))
+        }
+    }
+
+    fn param_refs(&self) -> Vec<&dyn rusqlite::ToSql> {
+        self.params.iter().map(|p| p.as_ref()).collect()
+    }
+}
+
+// ============================================================================
+// Search query parsing
+// ============================================================================
+
+/// The set of columns searched against for text queries.
+const SEARCH_FIELDS: [&str; 3] = ["s.first_prompt", "s.label", "s.project_name"];
+
+/// Build a LIKE condition that matches `pattern` against all search fields with OR.
+fn like_any_field(pattern: &str, params: &mut Vec<String>) -> String {
+    let conditions: Vec<String> = SEARCH_FIELDS
+        .iter()
+        .map(|field| {
+            params.push(pattern.to_string());
+            format!("{} LIKE ?", field)
+        })
+        .collect();
+    format!("({})", conditions.join(" OR "))
+}
+
+/// Build a NOT LIKE condition that excludes `pattern` from all search fields.
+fn not_like_any_field(pattern: &str, params: &mut Vec<String>) -> String {
+    let conditions: Vec<String> = SEARCH_FIELDS
+        .iter()
+        .map(|field| {
+            params.push(pattern.to_string());
+            format!("{} NOT LIKE ?", field)
+        })
+        .collect();
+    format!("({})", conditions.join(" AND "))
+}
+
+/// Tokenize search query, preserving quoted strings as single tokens.
+/// Example: `foo "bar|baz" -test` -> `["foo", "\"bar|baz\"", "-test"]`
 fn tokenize_search_query(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -295,7 +417,6 @@ fn tokenize_search_query(query: &str) -> Vec<String> {
         match ch {
             '"' => {
                 if in_quotes {
-                    // End of quoted string - include the quotes in the token
                     current.push('"');
                     if !current.is_empty() {
                         tokens.push(current.clone());
@@ -303,7 +424,6 @@ fn tokenize_search_query(query: &str) -> Vec<String> {
                     }
                     in_quotes = false;
                 } else {
-                    // Start of quoted string - save any pending token first
                     if !current.is_empty() {
                         tokens.push(current.clone());
                         current.clear();
@@ -313,7 +433,6 @@ fn tokenize_search_query(query: &str) -> Vec<String> {
                 }
             }
             ' ' | '\t' | '\n' if !in_quotes => {
-                // Whitespace outside quotes - token boundary
                 if !current.is_empty() {
                     tokens.push(current.clone());
                     current.clear();
@@ -325,9 +444,7 @@ fn tokenize_search_query(query: &str) -> Vec<String> {
         }
     }
 
-    // Don't forget the last token
     if !current.is_empty() {
-        // If we're still in quotes, add closing quote for robustness
         if in_quotes && !current.ends_with('"') {
             current.push('"');
         }
@@ -337,80 +454,54 @@ fn tokenize_search_query(query: &str) -> Vec<String> {
     tokens
 }
 
-/// Parse search query with advanced syntax support
-/// Syntax:
-/// - AND: "词A 词B" (space-separated terms, all must match)
-/// - OR: "词A|词B" (pipe-separated terms, any can match)
-/// - NOT: "-词A" (exclude matches containing this term)
-/// - LITERAL: '"词A|词B"' (quoted text searches literally, ignoring operators)
-/// - Mixed: '词A "B|C" -词D' (A AND literal "B|C" AND NOT D)
+/// Parse search query with advanced syntax support.
 ///
-/// Returns (SQL condition string, parameter values)
+/// Syntax:
+/// - AND: `term1 term2` (space-separated, all must match)
+/// - OR: `term1|term2` (pipe-separated, any can match)
+/// - NOT: `-term` (exclude matches containing this term)
+/// - LITERAL: `"term|with|pipes"` (quoted text, ignoring operators)
+///
+/// Returns (SQL condition string, parameter values).
 fn parse_search_query(query: &str) -> (String, Vec<String>) {
     let mut and_conditions: Vec<String> = Vec::new();
     let mut params: Vec<String> = Vec::new();
 
-    // Tokenize with quote awareness
-    let tokens = tokenize_search_query(query);
-
-    for token in tokens {
+    for token in tokenize_search_query(query) {
         if token.is_empty() {
             continue;
         }
 
-        // Check if it's a quoted literal (starts and ends with quotes, or was extracted from quotes)
         if token.starts_with('"') && token.ends_with('"') && token.len() > 1 {
             // Literal search - remove quotes and search as-is
             let literal = &token[1..token.len()-1];
             if !literal.is_empty() {
                 let pattern = format!("%{}%", literal);
-                and_conditions.push(
-                    "(s.first_prompt LIKE ? OR s.label LIKE ? OR s.project_name LIKE ?)".to_string()
-                );
-                params.push(pattern.clone());
-                params.push(pattern.clone());
-                params.push(pattern);
+                and_conditions.push(like_any_field(&pattern, &mut params));
             }
-        }
-        // Check for NOT (exclusion) - starts with -
-        else if let Some(term) = token.strip_prefix('-') {
+        } else if let Some(term) = token.strip_prefix('-') {
+            // NOT condition
             if !term.is_empty() {
-                // NOT condition: field NOT LIKE pattern
                 let pattern = format!("%{}%", term);
-                and_conditions.push(
-                    "(s.first_prompt NOT LIKE ? AND s.label NOT LIKE ? AND s.project_name NOT LIKE ?)".to_string()
-                );
-                params.push(pattern.clone());
-                params.push(pattern.clone());
-                params.push(pattern);
+                and_conditions.push(not_like_any_field(&pattern, &mut params));
             }
-        }
-        // Check for OR - contains |
-        else if token.contains('|') {
+        } else if token.contains('|') {
+            // OR condition
             let or_terms: Vec<&str> = token.split('|').filter(|t| !t.is_empty()).collect();
             if !or_terms.is_empty() {
-                let mut or_conditions: Vec<String> = Vec::new();
-                for term in or_terms {
-                    let pattern = format!("%{}%", term);
-                    or_conditions.push(
-                        "(s.first_prompt LIKE ? OR s.label LIKE ? OR s.project_name LIKE ?)".to_string()
-                    );
-                    params.push(pattern.clone());
-                    params.push(pattern.clone());
-                    params.push(pattern);
-                }
+                let or_conditions: Vec<String> = or_terms
+                    .iter()
+                    .map(|term| {
+                        let pattern = format!("%{}%", term);
+                        like_any_field(&pattern, &mut params)
+                    })
+                    .collect();
                 and_conditions.push(format!("({})", or_conditions.join(" OR ")));
             }
-        }
-        // Regular AND term
-        else {
+        } else {
+            // Regular AND term
             let pattern = format!("%{}%", token);
-            and_conditions.push(
-                "(s.first_prompt LIKE ? OR s.label LIKE ? OR s.project_name LIKE ?)".to_string()
-            );
-            params.push(pattern.clone());
-            params.push(pattern.clone());
-            params.push(pattern);
+            and_conditions.push(like_any_field(&pattern, &mut params));
         }
     }
 
@@ -422,59 +513,20 @@ fn parse_search_query(query: &str) -> (String, Vec<String>) {
     (condition, params)
 }
 
-/// Get sessions from database
-pub fn get_sessions(
-    _app: &AppHandle,
-    project: Option<&str>,
-    limit: i64,
-) -> Result<Vec<Session>, DatabaseError> {
-    let conn = get_db()?;
+// ============================================================================
+// Row mappers
+// ============================================================================
 
-    let sql = if project.is_some() {
-        "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
-                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
-         FROM sessions WHERE project_path = ?1
-         ORDER BY last_human_message_at DESC LIMIT ?2"
-    } else {
-        "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
-                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
-         FROM sessions
-         ORDER BY last_human_message_at DESC LIMIT ?1"
-    };
-
-    let mut stmt = conn.prepare(sql)?;
-
-    let rows = if let Some(proj) = project {
-        stmt.query_map(params![proj, limit], map_session_row)?
-    } else {
-        stmt.query_map(params![limit], map_session_row)?
-    };
-
-    let sessions: Vec<Session> = rows.filter_map(|r| r.ok()).collect();
-    Ok(sessions)
-}
-
-/// Map a database row to a Session
+/// Map a database row to a Session.
 fn map_session_row(row: &rusqlite::Row) -> Result<Session, rusqlite::Error> {
     let status_str: String = row.get(17)?;
-    let status = match status_str.as_str() {
-        "idle" => SessionStatus::Idle,
-        "active" => SessionStatus::Active,
-        "error" => SessionStatus::Error,
-        "needs_input" => SessionStatus::NeedsInput,
-        _ => SessionStatus::Completed,
-    };
-
     let tags_str: Option<String> = row.get(5)?;
-    let tags: Vec<String> = tags_str
-        .map(|s| serde_json::from_str(&s).unwrap_or_default())
-        .unwrap_or_default();
-
-    // Handle NULL last_human_message_at by falling back to last_active_at
     let last_active_at: i64 = row.get(7)?;
-    let last_human_message_at: i64 = row.get::<_, Option<i64>>(8)?.unwrap_or(last_active_at);
+
+    let provider_str: Option<String> = row.get(18).ok();
+    let provider = provider_str
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(crate::providers::ProviderId::Claude);
 
     Ok(Session {
         session_id: row.get(0)?,
@@ -482,10 +534,12 @@ fn map_session_row(row: &rusqlite::Row) -> Result<Session, rusqlite::Error> {
         project_name: row.get(2)?,
         first_prompt: row.get(3)?,
         label: row.get(4)?,
-        tags,
+        tags: tags_str
+            .map(|s| serde_json::from_str(&s).unwrap_or_default())
+            .unwrap_or_default(),
         started_at: row.get(6)?,
         last_active_at,
-        last_human_message_at,
+        last_human_message_at: row.get::<_, Option<i64>>(8)?.unwrap_or(last_active_at),
         message_count: row.get(9)?,
         total_tokens: row.get(10)?,
         total_cost_usd: row.get(11)?,
@@ -494,8 +548,146 @@ fn map_session_row(row: &rusqlite::Row) -> Result<Session, rusqlite::Error> {
         cache_read_tokens: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
         cache_write_tokens: row.get::<_, Option<i64>>(15)?.unwrap_or(0),
         model: row.get(16)?,
-        status,
+        status: session_status_from_str(&status_str),
+        provider,
     })
+}
+
+fn map_task_row(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
+    let status_str: String = row.get(3)?;
+
+    let provider_str: Option<String> = row.get(22).ok();
+    let provider = provider_str
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(crate::providers::ProviderId::Claude);
+
+    Ok(Task {
+        id: row.get(0)?,
+        prompt: row.get(1)?,
+        project_path: row.get(2)?,
+        status: status_str.parse().unwrap_or(TaskStatus::Backlog),
+        priority: row.get(4)?,
+        execution_mode: row.get(5)?,
+        depends_on: row.get(6)?,
+        session_id: row.get(7)?,
+        system_prompt: row.get(8)?,
+        allowed_tools: row.get(9)?,
+        max_budget_usd: row.get(10)?,
+        max_turns: row.get(11)?,
+        notes: row.get(12)?,
+        tags: row.get(13)?,
+        sort_order: row.get(14)?,
+        result_exit_code: row.get(15)?,
+        result_output: row.get(16)?,
+        result_tokens: row.get(17)?,
+        result_cost_usd: row.get(18)?,
+        created_at: row.get(19)?,
+        started_at: row.get(20)?,
+        completed_at: row.get(21)?,
+        provider,
+    })
+}
+
+fn map_favorite_row(row: &rusqlite::Row) -> Result<Favorite, rusqlite::Error> {
+    Ok(Favorite {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        prompt: row.get(2)?,
+        project_path: row.get(3)?,
+        tags: row.get(4)?,
+        sort_order: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Check if file was modified within the last N seconds.
+fn is_file_recently_modified(path: &std::path::Path, seconds: u64) -> bool {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(|t| t.elapsed().unwrap_or_default().as_secs() < seconds)
+        .unwrap_or(false)
+}
+
+/// Parse a date string (YYYY-MM-DD) into a start-of-day millisecond timestamp.
+fn date_to_start_ms(date_str: &str) -> Option<i64> {
+    chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc().timestamp_millis())
+}
+
+/// Parse a date string (YYYY-MM-DD) into an end-of-day millisecond timestamp.
+fn date_to_end_ms(date_str: &str) -> Option<i64> {
+    chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(23, 59, 59))
+        .map(|dt| dt.and_utc().timestamp_millis())
+}
+
+/// Get the next sort_order value for a table.
+fn next_sort_order(conn: &Connection, table: &str) -> i32 {
+    conn.query_row(
+        &format!("SELECT COALESCE(MAX(sort_order), 0) FROM {}", table),
+        [],
+        |row| row.get::<_, i32>(0),
+    )
+    .unwrap_or(0) + 1
+}
+
+/// Update the FTS index for a session.
+fn update_session_fts(conn: &Connection, session_id: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO sessions_fts (rowid, first_prompt, all_prompts, label, tags)
+         SELECT rowid, first_prompt, first_prompt, label, tags FROM sessions WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+// ============================================================================
+// Sessions
+// ============================================================================
+
+/// Get sessions from database
+pub fn get_sessions(
+    _app: &AppHandle,
+    project: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Session>, DatabaseError> {
+    let conn = get_db()?;
+
+    let (sql, sessions) = if let Some(proj) = project {
+        let sql = format!(
+            "SELECT {} FROM sessions WHERE project_path = ?1 ORDER BY last_human_message_at DESC LIMIT ?2",
+            SESSION_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![proj, limit], map_session_row)?
+            .filter_map(|r| r.ok())
+            .collect();
+        (sql, rows)
+    } else {
+        let sql = format!(
+            "SELECT {} FROM sessions ORDER BY last_human_message_at DESC LIMIT ?1",
+            SESSION_COLUMNS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![limit], map_session_row)?
+            .filter_map(|r| r.ok())
+            .collect();
+        (sql, rows)
+    };
+    drop(sql);
+
+    Ok(sessions)
 }
 
 /// Get session detail
@@ -505,17 +697,12 @@ pub fn get_session_detail(
 ) -> Result<SessionDetail, DatabaseError> {
     let conn = get_db()?;
 
-    // Get session
-    let session = conn.query_row(
-        "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
-                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
-         FROM sessions WHERE session_id = ?1",
-        params![session_id],
-        map_session_row,
-    )?;
+    let sql = format!(
+        "SELECT {} FROM sessions WHERE session_id = ?1",
+        SESSION_COLUMNS
+    );
+    let session = conn.query_row(&sql, params![session_id], map_session_row)?;
 
-    // Get messages
     let mut stmt = conn.prepare(
         "SELECT id, role, content, timestamp, tokens_in, tokens_out, model
          FROM session_messages WHERE session_id = ?1 ORDER BY timestamp ASC"
@@ -531,6 +718,7 @@ pub fn get_session_detail(
                 tokens_in: row.get(4)?,
                 tokens_out: row.get(5)?,
                 model: row.get(6)?,
+                images: vec![], // Images are loaded separately via get_session_images
             })
         })?
         .filter_map(|r| r.ok())
@@ -539,46 +727,21 @@ pub fn get_session_detail(
     Ok(SessionDetail { session, messages })
 }
 
-/// Get active sessions - scans file system to find truly active sessions
-/// This is the source of truth since database status can be stale
+/// Get active sessions - scans file system to find truly active sessions.
+/// This is the source of truth since database status can be stale.
 pub fn get_active_sessions(_app: &AppHandle) -> Result<Vec<Session>, DatabaseError> {
     let conn = get_db()?;
-    let claude_dir = crate::platform::get_claude_dir();
-    let projects_dir = claude_dir.join("projects");
+    let projects_dir = crate::platform::get_claude_dir().join("projects");
 
-    // First, scan file system to find recently modified session files
-    let mut active_session_ids: Vec<String> = Vec::new();
-
-    if projects_dir.exists() {
-        if let Ok(project_entries) = std::fs::read_dir(&projects_dir) {
-            for project_entry in project_entries.filter_map(|e| e.ok()) {
-                let project_path = project_entry.path();
-                if project_path.is_dir() {
-                    if let Ok(session_entries) = std::fs::read_dir(&project_path) {
-                        for session_entry in session_entries.filter_map(|e| e.ok()) {
-                            let file_path = session_entry.path();
-                            if file_path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                                // Check if file was modified recently (within 30 seconds)
-                                if is_file_recently_modified(&file_path, 30) {
-                                    if let Some(session_id) = file_path.file_stem().and_then(|s| s.to_str()) {
-                                        active_session_ids.push(session_id.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Scan file system to find recently modified session files
+    let active_session_ids = find_active_session_ids(&projects_dir);
 
     if active_session_ids.is_empty() {
-        // No active files found - mark all "active" sessions as completed
         let _ = conn.execute("UPDATE sessions SET status = 'completed' WHERE status = 'active'", []);
         return Ok(Vec::new());
     }
 
-    // Update these sessions to active status in database
+    // Update these sessions to active status
     for session_id in &active_session_ids {
         let _ = conn.execute(
             "UPDATE sessions SET status = 'active' WHERE session_id = ?",
@@ -586,95 +749,333 @@ pub fn get_active_sessions(_app: &AppHandle) -> Result<Vec<Session>, DatabaseErr
         );
     }
 
-    // Mark other "active" sessions as completed (they're stale)
-    let placeholders: Vec<&str> = active_session_ids.iter().map(|_| "?").collect();
-    let placeholders_str = placeholders.join(",");
+    // Mark stale "active" sessions as completed
+    let placeholders: String = active_session_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let query = format!(
         "UPDATE sessions SET status = 'completed' WHERE status = 'active' AND session_id NOT IN ({})",
-        placeholders_str
+        placeholders
     );
     let params: Vec<&dyn rusqlite::ToSql> = active_session_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
     let _ = conn.execute(&query, params.as_slice());
 
-    // Now fetch the active sessions from database
-    let mut result = Vec::new();
+    // Fetch the active sessions
+    let sql = format!(
+        "SELECT {} FROM sessions WHERE session_id = ?",
+        SESSION_COLUMNS
+    );
+    let mut result: Vec<Session> = Vec::new();
     for session_id in &active_session_ids {
-        let mut stmt = conn.prepare(
-            "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                    started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
-                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
-             FROM sessions WHERE session_id = ?"
-        )?;
-
+        let mut stmt = conn.prepare(&sql)?;
         if let Ok(session) = stmt.query_row(params![session_id], map_session_row) {
             result.push(session);
         }
     }
 
-    // Sort by last_human_message_at descending
     result.sort_by(|a, b| b.last_human_message_at.cmp(&a.last_human_message_at));
-
     Ok(result)
 }
 
-/// Check if file was modified within the last N seconds
-fn is_file_recently_modified(path: &std::path::Path, seconds: u64) -> bool {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if let Ok(modified) = metadata.modified() {
-            let elapsed = modified.elapsed().unwrap_or_default();
-            return elapsed.as_secs() < seconds;
+/// Scan the projects directory for recently modified .jsonl session files.
+fn find_active_session_ids(projects_dir: &std::path::Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    if !projects_dir.exists() {
+        return ids;
+    }
+
+    let project_entries = match std::fs::read_dir(projects_dir) {
+        Ok(entries) => entries,
+        Err(_) => return ids,
+    };
+
+    for project_entry in project_entries.filter_map(|e| e.ok()) {
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+
+        let session_entries = match std::fs::read_dir(&project_path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for session_entry in session_entries.filter_map(|e| e.ok()) {
+            let file_path = session_entry.path();
+            let is_jsonl = file_path.extension().map(|e| e == "jsonl").unwrap_or(false);
+            if is_jsonl && is_file_recently_modified(&file_path, 30) {
+                if let Some(session_id) = file_path.file_stem().and_then(|s| s.to_str()) {
+                    ids.push(session_id.to_string());
+                }
+            }
         }
     }
-    false
+
+    ids
 }
+
+/// Insert or update a session
+pub fn upsert_session(session: &Session) -> Result<(), DatabaseError> {
+    let conn = get_db()?;
+
+    let tags_json = serde_json::to_string(&session.tags).unwrap_or_default();
+    let provider_str = session.provider.to_string().to_lowercase();
+
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO sessions ({})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            SESSION_COLUMNS
+        ),
+        params![
+            session.session_id,
+            session.project_path,
+            session.project_name,
+            session.first_prompt,
+            session.label,
+            tags_json,
+            session.started_at,
+            session.last_active_at,
+            session.last_human_message_at,
+            session.message_count,
+            session.total_tokens,
+            session.total_cost_usd,
+            session.input_tokens,
+            session.output_tokens,
+            session.cache_read_tokens,
+            session.cache_write_tokens,
+            session.model,
+            session_status_to_str(&session.status),
+            provider_str,
+        ],
+    )?;
+
+    update_session_fts(&conn, &session.session_id)?;
+    Ok(())
+}
+
+/// Update session label
+pub fn update_session_label(
+    _app: &AppHandle,
+    session_id: &str,
+    label: Option<&str>,
+) -> Result<(), DatabaseError> {
+    let conn = get_db()?;
+
+    conn.execute(
+        "UPDATE sessions SET label = ?1 WHERE session_id = ?2",
+        params![label, session_id],
+    )?;
+
+    update_session_fts(&conn, session_id)?;
+    Ok(())
+}
+
+/// Delete a session and its messages
+pub fn delete_session(
+    _app: &AppHandle,
+    session_id: &str,
+) -> Result<(), DatabaseError> {
+    let conn = get_db()?;
+
+    conn.execute(
+        "DELETE FROM sessions_fts WHERE rowid = (SELECT rowid FROM sessions WHERE session_id = ?1)",
+        params![session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM session_messages WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM sessions WHERE session_id = ?1",
+        params![session_id],
+    )?;
+
+    Ok(())
+}
+
+/// Get sessions for a specific date (for daily reports)
+pub fn get_sessions_by_date(_app: &AppHandle, date: &str) -> Result<Vec<Session>, DatabaseError> {
+    let conn = get_db()?;
+
+    let start_ms = date_to_start_ms(date).unwrap_or(0);
+    let end_ms = date_to_end_ms(date).unwrap_or(i64::MAX);
+
+    let sql = format!(
+        "SELECT {} FROM sessions
+         WHERE started_at >= ?1 AND started_at <= ?2
+         ORDER BY last_human_message_at DESC",
+        SESSION_COLUMNS
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let sessions: Vec<Session> = stmt
+        .query_map(params![start_ms, end_ms], map_session_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(sessions)
+}
+
+// ============================================================================
+// Session search
+// ============================================================================
+
+/// Search sessions with advanced syntax support.
+/// Syntax: `term1 term2` (AND), `term1|term2` (OR), `-term` (NOT)
+pub fn search_sessions(
+    _app: &AppHandle,
+    query: &str,
+    project: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Session>, DatabaseError> {
+    let conn = get_db()?;
+
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (search_condition, search_params) = parse_search_query(trimmed);
+    if search_condition.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = search_params
+        .into_iter()
+        .map(|p| Box::new(p) as Box<dyn rusqlite::ToSql>)
+        .collect();
+
+    let where_clause = if let Some(proj) = project {
+        params.push(Box::new(proj.to_string()));
+        format!("{} AND s.project_path = ?", search_condition)
+    } else {
+        search_condition
+    };
+
+    params.push(Box::new(limit));
+
+    let sql = format!(
+        "SELECT {} FROM sessions s WHERE {} ORDER BY last_human_message_at DESC LIMIT ?",
+        SESSION_COLUMNS, where_clause
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let sessions: Vec<Session> = stmt
+        .query_map(rusqlite::params_from_iter(param_refs), map_session_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(sessions)
+}
+
+/// Search sessions with advanced filters
+pub fn search_sessions_filtered(
+    _app: &AppHandle,
+    query: Option<&str>,
+    project: Option<&str>,
+    status: Option<&str>,
+    model: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Session>, DatabaseError> {
+    let conn = get_db()?;
+
+    let mut wb = WhereBuilder::new();
+
+    // Text search with advanced syntax
+    if let Some(q) = query {
+        let trimmed = q.trim();
+        if !trimmed.is_empty() {
+            let (search_condition, search_params) = parse_search_query(trimmed);
+            if !search_condition.is_empty() {
+                wb.push_condition(search_condition);
+                for p in search_params {
+                    wb.push_param(p);
+                }
+            }
+        }
+    }
+
+    if let Some(p) = project {
+        wb.push("s.project_path = ?", p.to_string());
+    }
+
+    if let Some(s) = status {
+        wb.push("s.status = ?", s.to_string());
+    }
+
+    if let Some(m) = model {
+        wb.push("s.model LIKE ?", format!("%{}%", m));
+    }
+
+    if let Some(from) = date_from {
+        if let Some(ts) = date_to_start_ms(from) {
+            wb.push("s.last_active_at >= ?", ts);
+        }
+    }
+
+    if let Some(to) = date_to {
+        if let Some(ts) = date_to_end_ms(to) {
+            wb.push("s.last_active_at <= ?", ts);
+        }
+    }
+
+    let where_clause = wb.to_where_clause();
+    wb.push_param(limit);
+
+    let sql = format!(
+        "SELECT {} FROM sessions s {} ORDER BY last_human_message_at DESC LIMIT ?",
+        SESSION_COLUMNS, where_clause
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let sessions: Vec<Session> = stmt
+        .query_map(rusqlite::params_from_iter(wb.param_refs()), map_session_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(sessions)
+}
+
+// ============================================================================
+// Usage stats
+// ============================================================================
 
 /// Get usage statistics from sessions table
 pub fn get_usage_stats(
     _app: &AppHandle,
     project: Option<&str>,
+    provider: Option<&str>,
     start_date: Option<&str>,
     end_date: Option<&str>,
 ) -> Result<UsageStats, DatabaseError> {
     let conn = get_db()?;
 
-    // Build query conditions for sessions table
-    // Convert date strings to timestamps (start of day and end of day)
-    let mut conditions = Vec::new();
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut wb = WhereBuilder::new();
 
     if let Some(proj) = project {
-        conditions.push("project_path = ?");
-        params_vec.push(Box::new(proj.to_string()));
+        wb.push("project_path = ?", proj.to_string());
+    }
+    if let Some(prov) = provider {
+        wb.push("provider = ?", prov.to_string());
     }
     if let Some(start) = start_date {
-        // Convert date string (YYYY-MM-DD) to start of day timestamp in ms
-        if let Ok(date) = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d") {
-            let start_ts = date.and_hms_opt(0, 0, 0)
-                .map(|dt| dt.and_utc().timestamp_millis())
-                .unwrap_or(0);
-            conditions.push("started_at >= ?");
-            params_vec.push(Box::new(start_ts));
+        if let Some(ts) = date_to_start_ms(start) {
+            wb.push("started_at >= ?", ts);
         }
     }
     if let Some(end) = end_date {
-        // Convert date string (YYYY-MM-DD) to end of day timestamp in ms
-        if let Ok(date) = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d") {
-            let end_ts = date.and_hms_opt(23, 59, 59)
-                .map(|dt| dt.and_utc().timestamp_millis())
-                .unwrap_or(i64::MAX);
-            conditions.push("started_at <= ?");
-            params_vec.push(Box::new(end_ts));
+        if let Some(ts) = date_to_end_ms(end) {
+            wb.push("started_at <= ?", ts);
         }
     }
 
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
+    let where_clause = wb.to_where_clause();
+    let param_refs = wb.param_refs();
 
-    // Get totals from sessions table (including detailed token breakdown)
-    let sql = format!(
+    // Totals
+    let totals_sql = format!(
         "SELECT COALESCE(SUM(total_tokens), 0),
                 COALESCE(SUM(total_cost_usd), 0),
                 COUNT(session_id),
@@ -686,10 +1087,8 @@ pub fn get_usage_stats(
         where_clause
     );
 
-    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
-
-    let (total_tokens, total_cost_usd, session_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens): (i64, f64, i32, i64, i64, i64, i64) =
-        conn.query_row(&sql, params_refs.as_slice(), |row| {
+    let (total_tokens, total_cost_usd, session_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) =
+        conn.query_row(&totals_sql, param_refs.as_slice(), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, f64>(1)?,
@@ -701,8 +1100,7 @@ pub fn get_usage_stats(
             ))
         })?;
 
-    // Get daily breakdown from sessions table
-    // Group by date extracted from started_at timestamp
+    // Daily breakdown
     let daily_sql = format!(
         "SELECT DATE(started_at / 1000, 'unixepoch') as date,
                 SUM(total_tokens),
@@ -714,9 +1112,10 @@ pub fn get_usage_stats(
         where_clause
     );
 
+    let param_refs = wb.param_refs();
     let mut stmt = conn.prepare(&daily_sql)?;
     let daily_usage: Vec<DailyUsage> = stmt
-        .query_map(params_refs.as_slice(), |row| {
+        .query_map(param_refs.as_slice(), |row| {
             Ok(DailyUsage {
                 date: row.get(0)?,
                 tokens: row.get(1)?,
@@ -727,7 +1126,7 @@ pub fn get_usage_stats(
         .filter_map(|r| r.ok())
         .collect();
 
-    // Get project breakdown from sessions table
+    // Project breakdown
     let project_sql = format!(
         "SELECT project_path,
                 SUM(total_tokens),
@@ -739,9 +1138,10 @@ pub fn get_usage_stats(
         where_clause
     );
 
+    let param_refs = wb.param_refs();
     let mut stmt = conn.prepare(&project_sql)?;
     let project_usage: Vec<ProjectUsage> = stmt
-        .query_map(params_refs.as_slice(), |row| {
+        .query_map(param_refs.as_slice(), |row| {
             let path: String = row.get(0)?;
             let name = std::path::Path::new(&path)
                 .file_name()
@@ -771,217 +1171,29 @@ pub fn get_usage_stats(
     })
 }
 
-/// Search sessions with advanced syntax support
-/// Syntax: "词A 词B" (AND), "词A|词B" (OR), "-词A" (NOT)
-pub fn search_sessions(
-    _app: &AppHandle,
-    query: &str,
-    project: Option<&str>,
-    limit: i64,
-) -> Result<Vec<Session>, DatabaseError> {
+// ============================================================================
+// Projects
+// ============================================================================
+
+/// Get list of unique projects from sessions
+pub fn get_projects(_app: &AppHandle) -> Result<Vec<String>, DatabaseError> {
     let conn = get_db()?;
 
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let (search_condition, search_params) = parse_search_query(trimmed);
-    if search_condition.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Build params vector
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    for p in search_params {
-        params.push(Box::new(p));
-    }
-
-    let sql = if let Some(proj) = project {
-        params.push(Box::new(proj.to_string()));
-        params.push(Box::new(limit));
-        format!(
-            "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                    started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
-                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
-             FROM sessions s
-             WHERE {} AND s.project_path = ?
-             ORDER BY last_human_message_at DESC LIMIT ?",
-            search_condition
-        )
-    } else {
-        params.push(Box::new(limit));
-        format!(
-            "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                    started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
-                    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
-             FROM sessions s
-             WHERE {}
-             ORDER BY last_human_message_at DESC LIMIT ?",
-            search_condition
-        )
-    };
-
-    let mut stmt = conn.prepare(&sql)?;
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let rows = stmt.query_map(rusqlite::params_from_iter(param_refs), map_session_row)?;
-
-    let sessions: Vec<Session> = rows.filter_map(|r| r.ok()).collect();
-    Ok(sessions)
-}
-
-/// Search sessions with advanced filters
-pub fn search_sessions_filtered(
-    _app: &AppHandle,
-    query: Option<&str>,
-    project: Option<&str>,
-    status: Option<&str>,
-    model: Option<&str>,
-    date_from: Option<&str>,
-    date_to: Option<&str>,
-    limit: i64,
-) -> Result<Vec<Session>, DatabaseError> {
-    let conn = get_db()?;
-
-    // Build dynamic WHERE clause
-    let mut conditions: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-    // Advanced text search with support for:
-    // - AND: "词A 词B" (space-separated, all must match)
-    // - OR: "词A|词B" (pipe-separated, any can match)
-    // - NOT: "-词A" (exclude matches)
-    // - Mixed: "词A 词B|词C -词D"
-    if let Some(q) = query {
-        let trimmed = q.trim();
-        if !trimmed.is_empty() {
-            let (search_condition, search_params) = parse_search_query(trimmed);
-            if !search_condition.is_empty() {
-                conditions.push(search_condition);
-                for p in search_params {
-                    params.push(Box::new(p));
-                }
-            }
-        }
-    }
-
-    // Project filter
-    if let Some(p) = project {
-        conditions.push("s.project_path = ?".to_string());
-        params.push(Box::new(p.to_string()));
-    }
-
-    // Status filter
-    if let Some(s) = status {
-        conditions.push("s.status = ?".to_string());
-        params.push(Box::new(s.to_string()));
-    }
-
-    // Model filter
-    if let Some(m) = model {
-        conditions.push("s.model LIKE ?".to_string());
-        params.push(Box::new(format!("%{}%", m)));
-    }
-
-    // Date range filters (timestamps are in milliseconds)
-    if let Some(from) = date_from {
-        // Parse date string and convert to timestamp
-        if let Ok(date) = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d") {
-            let timestamp = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
-            conditions.push("s.last_active_at >= ?".to_string());
-            params.push(Box::new(timestamp));
-        }
-    }
-
-    if let Some(to) = date_to {
-        if let Ok(date) = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d") {
-            let timestamp = date.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp_millis();
-            conditions.push("s.last_active_at <= ?".to_string());
-            params.push(Box::new(timestamp));
-        }
-    }
-
-    // Build SQL
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
-    let sql = format!(
-        "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
-                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
-         FROM sessions s
-         {}
-         ORDER BY last_human_message_at DESC LIMIT ?",
-        where_clause
-    );
-
-    params.push(Box::new(limit));
-
-    let mut stmt = conn.prepare(&sql)?;
-
-    // Convert params to references for query_map
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-    let rows = stmt.query_map(rusqlite::params_from_iter(param_refs), map_session_row)?;
-
-    let sessions: Vec<Session> = rows.filter_map(|r| r.ok()).collect();
-    Ok(sessions)
-}
-
-/// Insert or update a session
-pub fn upsert_session(session: &Session) -> Result<(), DatabaseError> {
-    let conn = get_db()?;
-
-    let status_str = match session.status {
-        SessionStatus::Idle => "idle",
-        SessionStatus::Active => "active",
-        SessionStatus::Completed => "completed",
-        SessionStatus::Error => "error",
-        SessionStatus::NeedsInput => "needs_input",
-    };
-
-    let tags_json = serde_json::to_string(&session.tags).unwrap_or_default();
-
-    conn.execute(
-        "INSERT OR REPLACE INTO sessions
-         (session_id, project_path, project_name, first_prompt, label, tags,
-          started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
-          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-        params![
-            session.session_id,
-            session.project_path,
-            session.project_name,
-            session.first_prompt,
-            session.label,
-            tags_json,
-            session.started_at,
-            session.last_active_at,
-            session.last_human_message_at,
-            session.message_count,
-            session.total_tokens,
-            session.total_cost_usd,
-            session.input_tokens,
-            session.output_tokens,
-            session.cache_read_tokens,
-            session.cache_write_tokens,
-            session.model,
-            status_str,
-        ],
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT project_path FROM sessions WHERE project_path IS NOT NULL ORDER BY project_path"
     )?;
 
-    // Update FTS index
-    conn.execute(
-        "INSERT OR REPLACE INTO sessions_fts (rowid, first_prompt, all_prompts, label, tags)
-         SELECT rowid, first_prompt, first_prompt, label, tags FROM sessions WHERE session_id = ?1",
-        params![session.session_id],
-    )?;
+    let projects: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
 
-    Ok(())
+    Ok(projects)
 }
+
+// ============================================================================
+// Tasks
+// ============================================================================
 
 /// Get tasks
 pub fn get_tasks(
@@ -1024,36 +1236,6 @@ pub fn get_tasks(
     Ok(tasks)
 }
 
-fn map_task_row(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
-    let status_str: String = row.get(3)?;
-    let status = status_str.parse().unwrap_or(TaskStatus::Backlog);
-
-    Ok(Task {
-        id: row.get(0)?,
-        prompt: row.get(1)?,
-        project_path: row.get(2)?,
-        status,
-        priority: row.get(4)?,
-        execution_mode: row.get(5)?,
-        depends_on: row.get(6)?,
-        session_id: row.get(7)?,
-        system_prompt: row.get(8)?,
-        allowed_tools: row.get(9)?,
-        max_budget_usd: row.get(10)?,
-        max_turns: row.get(11)?,
-        notes: row.get(12)?,
-        tags: row.get(13)?,
-        sort_order: row.get(14)?,
-        result_exit_code: row.get(15)?,
-        result_output: row.get(16)?,
-        result_tokens: row.get(17)?,
-        result_cost_usd: row.get(18)?,
-        created_at: row.get(19)?,
-        started_at: row.get(20)?,
-        completed_at: row.get(21)?,
-    })
-}
-
 /// Create a new task
 pub fn create_task(
     _app: &AppHandle,
@@ -1067,19 +1249,15 @@ pub fn create_task(
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let priority = priority.unwrap_or("medium");
-
-    // Get max sort_order
-    let max_order: i32 = conn
-        .query_row("SELECT COALESCE(MAX(sort_order), 0) FROM tasks", [], |row| row.get(0))
-        .unwrap_or(0);
+    let sort_order = next_sort_order(&conn, "tasks");
 
     conn.execute(
         "INSERT INTO tasks (id, prompt, project_path, status, priority, execution_mode, sort_order, created_at, notes)
          VALUES (?1, ?2, ?3, 'backlog', ?4, 'new', ?5, ?6, ?7)",
-        params![id, prompt, project, priority, max_order + 1, now, notes],
+        params![id, prompt, project, priority, sort_order, now, notes],
     )?;
 
-    let task = Task {
+    Ok(Task {
         id,
         prompt: prompt.to_string(),
         project_path: project.map(|s| s.to_string()),
@@ -1094,7 +1272,7 @@ pub fn create_task(
         max_turns: None,
         notes: notes.map(|s| s.to_string()),
         tags: None,
-        sort_order: max_order + 1,
+        sort_order,
         result_exit_code: None,
         result_output: None,
         result_tokens: None,
@@ -1102,9 +1280,8 @@ pub fn create_task(
         created_at: now,
         started_at: None,
         completed_at: None,
-    };
-
-    Ok(task)
+        provider: crate::providers::ProviderId::Claude,
+    })
 }
 
 /// Update a task
@@ -1154,7 +1331,6 @@ pub fn update_task(
         conn.execute("UPDATE tasks SET sort_order = ?1 WHERE id = ?2", params![o, id])?;
     }
 
-    // Fetch and return updated task
     let task = conn.query_row(
         "SELECT * FROM tasks WHERE id = ?1",
         params![id],
@@ -1171,56 +1347,6 @@ pub fn delete_task(_app: &AppHandle, id: &str) -> Result<(), DatabaseError> {
     Ok(())
 }
 
-/// Get sessions for a specific date (for daily reports)
-pub fn get_sessions_by_date(_app: &AppHandle, date: &str) -> Result<Vec<Session>, DatabaseError> {
-    let conn = get_db()?;
-
-    // Convert date to timestamp range
-    // date is in format YYYY-MM-DD
-    let start_of_day = format!("{} 00:00:00", date);
-    let end_of_day = format!("{} 23:59:59", date);
-
-    // Parse to milliseconds
-    let start_ms = chrono::NaiveDateTime::parse_from_str(&start_of_day, "%Y-%m-%d %H:%M:%S")
-        .map(|dt| dt.and_utc().timestamp_millis())
-        .unwrap_or(0);
-    let end_ms = chrono::NaiveDateTime::parse_from_str(&end_of_day, "%Y-%m-%d %H:%M:%S")
-        .map(|dt| dt.and_utc().timestamp_millis())
-        .unwrap_or(i64::MAX);
-
-    let mut stmt = conn.prepare(
-        "SELECT session_id, project_path, project_name, first_prompt, label, tags,
-                started_at, last_active_at, last_human_message_at, message_count, total_tokens, total_cost_usd,
-                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, status
-         FROM sessions
-         WHERE started_at >= ?1 AND started_at <= ?2
-         ORDER BY last_human_message_at DESC"
-    )?;
-
-    let sessions: Vec<Session> = stmt
-        .query_map(params![start_ms, end_ms], map_session_row)?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    Ok(sessions)
-}
-
-/// Get list of unique projects from sessions
-pub fn get_projects(_app: &AppHandle) -> Result<Vec<String>, DatabaseError> {
-    let conn = get_db()?;
-
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT project_path FROM sessions WHERE project_path IS NOT NULL ORDER BY project_path"
-    )?;
-
-    let projects: Vec<String> = stmt
-        .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    Ok(projects)
-}
-
 /// Reorder tasks by updating sort_order based on the order of task_ids
 pub fn reorder_tasks(_app: &AppHandle, task_ids: Vec<String>) -> Result<(), DatabaseError> {
     let conn = get_db()?;
@@ -1231,57 +1357,6 @@ pub fn reorder_tasks(_app: &AppHandle, task_ids: Vec<String>) -> Result<(), Data
             params![index as i32, task_id],
         )?;
     }
-
-    Ok(())
-}
-
-/// Update session label
-pub fn update_session_label(
-    _app: &AppHandle,
-    session_id: &str,
-    label: Option<&str>,
-) -> Result<(), DatabaseError> {
-    let conn = get_db()?;
-
-    conn.execute(
-        "UPDATE sessions SET label = ?1 WHERE session_id = ?2",
-        params![label, session_id],
-    )?;
-
-    // Update FTS index
-    conn.execute(
-        "INSERT OR REPLACE INTO sessions_fts (rowid, first_prompt, all_prompts, label, tags)
-         SELECT rowid, first_prompt, first_prompt, label, tags FROM sessions WHERE session_id = ?1",
-        params![session_id],
-    )?;
-
-    Ok(())
-}
-
-/// Delete a session and its messages
-pub fn delete_session(
-    _app: &AppHandle,
-    session_id: &str,
-) -> Result<(), DatabaseError> {
-    let conn = get_db()?;
-
-    // Delete from FTS index first
-    conn.execute(
-        "DELETE FROM sessions_fts WHERE rowid = (SELECT rowid FROM sessions WHERE session_id = ?1)",
-        params![session_id],
-    )?;
-
-    // Delete messages
-    conn.execute(
-        "DELETE FROM session_messages WHERE session_id = ?1",
-        params![session_id],
-    )?;
-
-    // Delete session
-    conn.execute(
-        "DELETE FROM sessions WHERE session_id = ?1",
-        params![session_id],
-    )?;
 
     Ok(())
 }
@@ -1301,19 +1376,6 @@ pub struct Favorite {
     pub sort_order: i32,
     pub created_at: String,
     pub updated_at: String,
-}
-
-fn map_favorite_row(row: &rusqlite::Row) -> Result<Favorite, rusqlite::Error> {
-    Ok(Favorite {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        prompt: row.get(2)?,
-        project_path: row.get(3)?,
-        tags: row.get(4)?,
-        sort_order: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
-    })
 }
 
 /// Get all favorites
@@ -1345,16 +1407,12 @@ pub fn create_favorite(
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
-
-    // Get max sort_order
-    let max_order: i32 = conn
-        .query_row("SELECT COALESCE(MAX(sort_order), 0) FROM favorites", [], |row| row.get(0))
-        .unwrap_or(0);
+    let sort_order = next_sort_order(&conn, "favorites");
 
     conn.execute(
         "INSERT INTO favorites (id, name, prompt, project_path, tags, sort_order, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![id, name, prompt, project_path, tags, max_order + 1, now, now],
+        params![id, name, prompt, project_path, tags, sort_order, now, now],
     )?;
 
     Ok(Favorite {
@@ -1363,13 +1421,13 @@ pub fn create_favorite(
         prompt: prompt.to_string(),
         project_path: project_path.map(|s| s.to_string()),
         tags: tags.map(|s| s.to_string()),
-        sort_order: max_order + 1,
+        sort_order,
         created_at: now.clone(),
         updated_at: now,
     })
 }
 
-/// Update a favorite
+/// Update a favorite using a single dynamic UPDATE query.
 pub fn update_favorite(
     _app: &AppHandle,
     id: &str,
@@ -1381,35 +1439,42 @@ pub fn update_favorite(
     let conn = get_db()?;
     let now = chrono::Utc::now().to_rfc3339();
 
+    let mut set_clauses: Vec<String> = Vec::new();
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
     if let Some(n) = name {
-        conn.execute(
-            "UPDATE favorites SET name = ?1, updated_at = ?2 WHERE id = ?3",
-            params![n, now, id],
-        )?;
+        set_clauses.push("name = ?".to_string());
+        params_vec.push(Box::new(n.to_string()));
     }
 
     if let Some(p) = prompt {
-        conn.execute(
-            "UPDATE favorites SET prompt = ?1, updated_at = ?2 WHERE id = ?3",
-            params![p, now, id],
-        )?;
+        set_clauses.push("prompt = ?".to_string());
+        params_vec.push(Box::new(p.to_string()));
     }
 
     if let Some(pp) = project_path {
-        conn.execute(
-            "UPDATE favorites SET project_path = ?1, updated_at = ?2 WHERE id = ?3",
-            params![pp, now, id],
-        )?;
+        set_clauses.push("project_path = ?".to_string());
+        params_vec.push(Box::new(pp.map(|s| s.to_string())));
     }
 
     if let Some(t) = tags {
-        conn.execute(
-            "UPDATE favorites SET tags = ?1, updated_at = ?2 WHERE id = ?3",
-            params![t, now, id],
-        )?;
+        set_clauses.push("tags = ?".to_string());
+        params_vec.push(Box::new(t.to_string()));
     }
 
-    // Fetch and return updated favorite
+    if !set_clauses.is_empty() {
+        set_clauses.push("updated_at = ?".to_string());
+        params_vec.push(Box::new(now));
+        params_vec.push(Box::new(id.to_string()));
+
+        let sql = format!(
+            "UPDATE favorites SET {} WHERE id = ?",
+            set_clauses.join(", ")
+        );
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        conn.execute(&sql, param_refs.as_slice())?;
+    }
+
     let favorite = conn.query_row(
         "SELECT id, name, prompt, project_path, tags, sort_order, created_at, updated_at
          FROM favorites WHERE id = ?1",
@@ -1439,4 +1504,95 @@ pub fn reorder_favorites(_app: &AppHandle, favorite_ids: Vec<String>) -> Result<
     }
 
     Ok(())
+}
+
+/// Get all images from a session by parsing its JSONL file
+pub fn get_session_images(
+    _app: &AppHandle,
+    session_id: &str,
+) -> Result<Vec<crate::session::ImageContent>, DatabaseError> {
+    let conn = get_db()?;
+
+    // Get project_path for this session
+    let project_path: String = conn.query_row(
+        "SELECT project_path FROM sessions WHERE session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+
+    // Find JSONL file
+    let projects_dir = crate::platform::get_claude_dir().join("projects");
+    let session_file = projects_dir
+        .join(urlencoding::encode(&project_path).into_owned())
+        .join(format!("{}.jsonl", session_id));
+
+    if !session_file.exists() {
+        return Ok(vec![]);
+    }
+
+    // Parse JSONL and extract images
+    let lines = crate::session::parse_session_file(&session_file)?;
+    let mut images = Vec::new();
+
+    for line in lines {
+        // Extract images from message content
+        if let Some(ref msg) = line.message {
+            if let Some(ref content) = msg.content {
+                let extracted = extract_images_from_json(content);
+                images.extend(extracted);
+            }
+        }
+        // Also check line.content for older formats
+        if let Some(ref content) = line.content {
+            let extracted = extract_images_from_json(content);
+            images.extend(extracted);
+        }
+    }
+
+    Ok(images)
+}
+
+/// Helper function to extract images from JSON content
+fn extract_images_from_json(content: &serde_json::Value) -> Vec<crate::session::ImageContent> {
+    let mut images = Vec::new();
+
+    if let serde_json::Value::Array(arr) = content {
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                if obj.get("type").and_then(|t| t.as_str()) == Some("image") {
+                    if let Some(source) = obj.get("source").and_then(|s| s.as_object()) {
+                        let source_type = source
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("base64")
+                            .to_string();
+
+                        let media_type = source
+                            .get("media_type")
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string());
+
+                        let data = source
+                            .get("data")
+                            .and_then(|d| d.as_str())
+                            .map(|s| s.to_string());
+
+                        let path = source
+                            .get("path")
+                            .and_then(|p| p.as_str())
+                            .map(|s| s.to_string());
+
+                        images.push(crate::session::ImageContent {
+                            source_type,
+                            media_type,
+                            data,
+                            path,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    images
 }

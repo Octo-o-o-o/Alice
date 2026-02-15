@@ -1,10 +1,48 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, RefreshCw } from "lucide-react";
-import { LiveUsageStats } from "../lib/types";
+import type { LiveUsageStats } from "../lib/types";
 
 interface UsageMeterProps {
   compact?: boolean;
+}
+
+function getPercentColor(percent: number): string {
+  if (percent > 80) return "bg-red-500";
+  if (percent > 60) return "bg-yellow-500";
+  return "bg-blue-500";
+}
+
+function formatResetTime(resetAt: string | null): string {
+  if (!resetAt) return "Unknown";
+
+  try {
+    const diffMs = new Date(resetAt).getTime() - Date.now();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMins / 60);
+
+    if (diffHours > 0) return `${diffHours}h ${diffMins % 60}m`;
+    if (diffMins > 0) return `${diffMins}m`;
+    return "Soon";
+  } catch {
+    return "Unknown";
+  }
+}
+
+interface ProgressBarProps {
+  percent: number;
+  height?: string;
+}
+
+function ProgressBar({ percent, height = "h-2" }: ProgressBarProps): React.ReactElement {
+  return (
+    <div className={`w-full bg-gray-800 rounded-full ${height} overflow-hidden`}>
+      <div
+        className={`${height} rounded-full transition-all duration-500 ${getPercentColor(percent)}`}
+        style={{ width: `${Math.min(percent, 100)}%` }}
+      />
+    </div>
+  );
 }
 
 export default function UsageMeter({ compact = false }: UsageMeterProps) {
@@ -30,38 +68,9 @@ export default function UsageMeter({ compact = false }: UsageMeterProps) {
 
   useEffect(() => {
     loadUsage();
-    // Refresh every 30 seconds
     const interval = setInterval(loadUsage, 30000);
     return () => clearInterval(interval);
   }, []);
-
-  const formatResetTime = (resetAt: string | null) => {
-    if (!resetAt) return "Unknown";
-
-    try {
-      const resetTime = new Date(resetAt);
-      const now = new Date();
-      const diffMs = resetTime.getTime() - now.getTime();
-      const diffMins = Math.floor(diffMs / 60000);
-      const diffHours = Math.floor(diffMins / 60);
-
-      if (diffHours > 0) {
-        return `${diffHours}h ${diffMins % 60}m`;
-      } else if (diffMins > 0) {
-        return `${diffMins}m`;
-      } else {
-        return "Soon";
-      }
-    } catch {
-      return "Unknown";
-    }
-  };
-
-  const getPercentColor = (percent: number) => {
-    if (percent > 80) return "bg-red-500";
-    if (percent > 60) return "bg-yellow-500";
-    return "bg-blue-500";
-  };
 
   if (loading) {
     return (
@@ -92,80 +101,47 @@ export default function UsageMeter({ compact = false }: UsageMeterProps) {
   }
 
   if (compact) {
-    // Compact two-bar meter for header or menu bar style
     return (
       <div className="flex items-center gap-2">
-        {/* Session meter */}
-        <div className="flex items-center gap-1">
-          <span className="text-[10px] text-gray-500">5h</span>
-          <div className="w-12 bg-gray-800 rounded-full h-1.5 overflow-hidden">
-            <div
-              className={`h-1.5 rounded-full transition-all ${getPercentColor(stats.session_percent)}`}
-              style={{ width: `${Math.min(stats.session_percent, 100)}%` }}
-            />
+        {[
+          { label: "5h", percent: stats.session_percent },
+          { label: "7d", percent: stats.weekly_percent },
+        ].map(({ label, percent }) => (
+          <div key={label} className="flex items-center gap-1">
+            <span className="text-[10px] text-gray-500">{label}</span>
+            <div className="w-12">
+              <ProgressBar percent={percent} height="h-1.5" />
+            </div>
+            <span className="text-[10px] text-gray-400 font-mono w-8">
+              {Math.round(percent)}%
+            </span>
           </div>
-          <span className="text-[10px] text-gray-400 font-mono w-8">
-            {Math.round(stats.session_percent)}%
-          </span>
-        </div>
-
-        {/* Weekly meter */}
-        <div className="flex items-center gap-1">
-          <span className="text-[10px] text-gray-500">7d</span>
-          <div className="w-12 bg-gray-800 rounded-full h-1.5 overflow-hidden">
-            <div
-              className={`h-1.5 rounded-full transition-all ${getPercentColor(stats.weekly_percent)}`}
-              style={{ width: `${Math.min(stats.weekly_percent, 100)}%` }}
-            />
-          </div>
-          <span className="text-[10px] text-gray-400 font-mono w-8">
-            {Math.round(stats.weekly_percent)}%
-          </span>
-        </div>
+        ))}
       </div>
     );
   }
 
-  // Full usage dashboard
+  const meters = [
+    { label: "Session (5h window)", percent: stats.session_percent, resetAt: stats.session_reset_at },
+    { label: "Weekly", percent: stats.weekly_percent, resetAt: stats.weekly_reset_at },
+  ];
+
   return (
     <div className="space-y-4">
-      {/* Session (5h window) */}
-      <div className="space-y-1">
-        <div className="flex justify-between text-[10px]">
-          <span className="text-gray-400 font-medium">Session (5h window)</span>
-          <span className="text-gray-300 font-mono">
-            {Math.round(stats.session_percent)}% used
+      {meters.map(({ label, percent, resetAt }) => (
+        <div key={label} className="space-y-1">
+          <div className="flex justify-between text-[10px]">
+            <span className="text-gray-400 font-medium">{label}</span>
+            <span className="text-gray-300 font-mono">
+              {Math.round(percent)}% used
+            </span>
+          </div>
+          <ProgressBar percent={percent} />
+          <span className="text-[10px] text-gray-500">
+            Resets in {formatResetTime(resetAt)}
           </span>
         </div>
-        <div className="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
-          <div
-            className={`h-2 rounded-full transition-all duration-500 ${getPercentColor(stats.session_percent)}`}
-            style={{ width: `${Math.min(stats.session_percent, 100)}%` }}
-          />
-        </div>
-        <span className="text-[10px] text-gray-500">
-          Resets in {formatResetTime(stats.session_reset_at)}
-        </span>
-      </div>
-
-      {/* Weekly */}
-      <div className="space-y-1">
-        <div className="flex justify-between text-[10px]">
-          <span className="text-gray-400 font-medium">Weekly</span>
-          <span className="text-gray-300 font-mono">
-            {Math.round(stats.weekly_percent)}% used
-          </span>
-        </div>
-        <div className="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
-          <div
-            className={`h-2 rounded-full transition-all duration-500 ${getPercentColor(stats.weekly_percent)}`}
-            style={{ width: `${Math.min(stats.weekly_percent, 100)}%` }}
-          />
-        </div>
-        <span className="text-[10px] text-gray-500">
-          Resets in {formatResetTime(stats.weekly_reset_at)}
-        </span>
-      </div>
+      ))}
 
       {/* Burn rate warning */}
       {stats.burn_rate_per_hour && stats.burn_rate_per_hour > 5 && (

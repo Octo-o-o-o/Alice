@@ -1,9 +1,10 @@
-// File watcher for ~/.claude/ directory
+// File watcher for multi-provider session directories
 
 #![allow(dead_code)]
 
 use crate::database;
-use crate::session::{extract_session_metadata, is_session_active, parse_session_file, SessionStatus};
+use crate::providers::{Provider, ProviderId};
+use crate::session::SessionStatus;
 use crate::tray::{set_tray_state, TrayState};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -20,63 +21,88 @@ pub struct SessionUpdateEvent {
     pub status: String,
 }
 
-/// Get all Claude directories to watch (based on enabled environments)
-fn get_claude_directories() -> Vec<PathBuf> {
-    let config = crate::config::load_config();
-    let mut dirs = Vec::new();
-
-    for env in &config.claude_environments {
-        if !env.enabled {
-            continue;
-        }
-
-        let dir = if env.config_dir.is_empty() {
-            // Default environment uses ~/.claude/
-            crate::platform::get_claude_dir()
-        } else {
-            // Custom environment uses specified directory
-            let path = PathBuf::from(&env.config_dir);
-            if path.is_absolute() {
-                path
-            } else {
-                // Relative paths are relative to home directory
-                dirs::home_dir()
-                    .map(|h| h.join(&env.config_dir))
-                    .unwrap_or(path)
-            }
-        };
-
-        if dir.exists() && !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    }
-
-    // Always include the default claude dir if nothing is configured
-    if dirs.is_empty() {
-        let default_dir = crate::platform::get_claude_dir();
-        if default_dir.exists() {
-            dirs.push(default_dir);
-        }
-    }
-
-    dirs
+/// Check whether a path points to a JSONL file
+fn is_jsonl(path: &Path) -> bool {
+    path.extension().map(|e| e == "jsonl").unwrap_or(false)
 }
 
-/// Start the file watcher for Claude directories (supports multiple environments)
-pub fn start_watcher(app: AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let claude_dirs = get_claude_directories();
+/// Build a mapping from session directories to their provider IDs.
+/// Falls back to the default Claude directory when no providers yield directories.
+fn build_provider_dir_map() -> HashMap<PathBuf, ProviderId> {
+    let mut map = HashMap::new();
 
-    if claude_dirs.is_empty() {
-        tracing::warn!("No Claude directories found");
+    for provider in crate::providers::get_enabled_providers() {
+        let provider_id = provider.id();
+        for dir in provider.get_session_dirs() {
+            if dir.exists() {
+                tracing::info!("Found {} directory: {:?}", provider_id, dir);
+                map.insert(dir, provider_id);
+            }
+        }
+    }
+
+    if map.is_empty() {
+        let default_dir = crate::platform::get_claude_dir().join("projects");
+        if default_dir.exists() {
+            tracing::warn!("No providers enabled, falling back to default Claude directory");
+            map.insert(default_dir, ProviderId::Claude);
+        }
+    }
+
+    map
+}
+
+/// Find which provider a path belongs to by checking watched directory prefixes.
+fn find_provider_for_path(path: &Path, dir_to_provider: &HashMap<PathBuf, ProviderId>) -> Option<ProviderId> {
+    dir_to_provider
+        .iter()
+        .find(|(watched_dir, _)| path.starts_with(watched_dir))
+        .map(|(_, &id)| id)
+}
+
+/// Walk a directory and process every JSONL session file using the given provider.
+/// Returns the number of successfully processed sessions.
+fn scan_provider_sessions(
+    app: &AppHandle,
+    dir: &Path,
+    provider: &dyn Provider,
+) -> u32 {
+    if !dir.exists() {
+        return 0;
+    }
+
+    let mut count: u32 = 0;
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if is_jsonl(path) {
+            match process_session_file(app, path, provider) {
+                Ok(()) => count += 1,
+                Err(e) => tracing::warn!("Failed to process {} session file {:?}: {}", provider.id(), path, e),
+            }
+        }
+    }
+    count
+}
+
+/// Start the file watcher for all enabled provider directories
+pub fn start_watcher(app: AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let dir_to_provider = build_provider_dir_map();
+
+    if dir_to_provider.is_empty() {
+        tracing::warn!("No provider directories found");
         return Ok(());
     }
 
-    tracing::info!("Starting file watcher for {} directories", claude_dirs.len());
+    tracing::info!("Starting file watcher for {} provider directories", dir_to_provider.len());
 
-    // Initial scan for all directories
-    for claude_dir in &claude_dirs {
-        tracing::info!("Scanning directory: {:?}", claude_dir);
-        initial_scan(&app, claude_dir)?;
+    // Initial scan for all provider directories
+    for (dir, provider_id) in &dir_to_provider {
+        tracing::info!("Scanning {} directory: {:?}", provider_id, dir);
+        let provider = crate::providers::get_provider(*provider_id);
+        scan_provider_sessions(&app, dir, provider.as_ref());
     }
 
     // Set up file watcher
@@ -91,13 +117,10 @@ pub fn start_watcher(app: AppHandle) -> Result<(), Box<dyn std::error::Error + S
         Config::default().with_poll_interval(Duration::from_millis(500)),
     )?;
 
-    // Watch all projects directories recursively
-    for claude_dir in &claude_dirs {
-        let projects_dir = claude_dir.join("projects");
-        if projects_dir.exists() {
-            tracing::info!("Watching directory: {:?}", projects_dir);
-            watcher.watch(&projects_dir, RecursiveMode::Recursive)?;
-        }
+    // Watch all provider directories recursively
+    for (dir, provider_id) in &dir_to_provider {
+        tracing::info!("Watching {} directory: {:?}", provider_id, dir);
+        watcher.watch(dir, RecursiveMode::Recursive)?;
     }
 
     // Debounce map to avoid processing the same file multiple times
@@ -107,103 +130,50 @@ pub fn start_watcher(app: AppHandle) -> Result<(), Box<dyn std::error::Error + S
     // Process events
     for event in rx {
         for path in event.paths {
-            // Only process JSONL files
-            if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                // Debounce
-                let now = Instant::now();
-                if let Some(last) = last_processed.get(&path) {
-                    if now.duration_since(*last) < debounce_duration {
-                        continue;
-                    }
-                }
-                last_processed.insert(path.clone(), now);
+            if !is_jsonl(&path) {
+                continue;
+            }
 
-                // Process the file
-                if let Err(e) = process_session_file(&app, &path) {
-                    tracing::error!("Failed to process session file {:?}: {}", path, e);
+            // Debounce: skip files processed too recently
+            let now = Instant::now();
+            if let Some(last) = last_processed.get(&path) {
+                if now.duration_since(*last) < debounce_duration {
+                    continue;
                 }
+            }
+            last_processed.insert(path.clone(), now);
+
+            // Resolve the provider (fall back to Claude for backward compatibility)
+            let provider_id = find_provider_for_path(&path, &dir_to_provider)
+                .unwrap_or(ProviderId::Claude);
+            let provider = crate::providers::get_provider(provider_id);
+
+            if let Err(e) = process_session_file(&app, &path, provider.as_ref()) {
+                tracing::error!("Failed to process {} session file {:?}: {}", provider_id, path, e);
             }
         }
 
         // Clean up old entries from debounce map
-        last_processed.retain(|_, last| now() - *last < Duration::from_secs(60));
+        let now = Instant::now();
+        last_processed.retain(|_, last| now.duration_since(*last) < Duration::from_secs(60));
     }
 
     Ok(())
 }
 
-fn now() -> Instant {
-    Instant::now()
-}
+/// Process a single session JSONL file using the given provider
+fn process_session_file(
+    app: &AppHandle,
+    path: &Path,
+    provider: &dyn Provider,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::debug!("Processing {} session file: {:?}", provider.id(), path);
 
-/// Get the Claude directory path
-fn get_claude_dir() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(crate::platform::get_claude_dir())
-}
+    let session = provider.parse_session(path)
+        .map_err(|e| format!("Provider parse error: {}", e))?;
 
-/// Perform initial scan of existing session files
-fn initial_scan(app: &AppHandle, claude_dir: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let projects_dir = claude_dir.join("projects");
-    if !projects_dir.exists() {
-        return Ok(());
-    }
-
-    tracing::info!("Performing initial scan of {:?}", projects_dir);
-
-    // Walk through all project directories
-    for entry in walkdir::WalkDir::new(&projects_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-            if let Err(e) = process_session_file(app, path) {
-                tracing::warn!("Failed to process session file {:?}: {}", path, e);
-            }
-        }
-    }
-
-    tracing::info!("Initial scan complete");
-    Ok(())
-}
-
-/// Process a session JSONL file
-fn process_session_file(app: &AppHandle, path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Extract session ID and project path from the file path
-    // Path format: ~/.claude/projects/<encoded_project_path>/<session_id>.jsonl
-    let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    if file_name.is_empty() {
-        return Ok(());
-    }
-
-    let session_id = file_name.to_string();
-
-    // Extract project path from parent directory name
-    let parent = path.parent().ok_or("No parent directory")?;
-    let encoded_project = parent.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let project_path = decode_project_path(encoded_project);
-
-    tracing::debug!("Processing session file: {} for project: {}", session_id, project_path);
-
-    // Parse the JSONL file
-    let lines = parse_session_file(path)?;
-    if lines.is_empty() {
-        return Ok(());
-    }
-
-    // Extract metadata
-    let mut session = extract_session_metadata(&session_id, &project_path, &lines);
-
-    // File activity is the primary indicator of session status since stop_reason
-    // is always null in JSONL files. If file was recently modified, session is active.
-    if is_session_active(path) && session.status != SessionStatus::Error {
-        session.status = SessionStatus::Active;
-    }
-
-    // Store in database
     database::upsert_session(&session)?;
 
-    // Update tray state based on session status
     let tray_state = match session.status {
         SessionStatus::Active => TrayState::Active,
         SessionStatus::NeedsInput => TrayState::Warning,
@@ -213,69 +183,44 @@ fn process_session_file(app: &AppHandle, path: &Path) -> Result<(), Box<dyn std:
     };
     set_tray_state(app, tray_state);
 
-    // Emit event to frontend
-    let event = SessionUpdateEvent {
+    app.emit("session-updated", SessionUpdateEvent {
         session_id: session.session_id.clone(),
         project_path: session.project_path.clone(),
         status: format!("{:?}", session.status).to_lowercase(),
-    };
-
-    app.emit("session-updated", event)?;
+    })?;
 
     Ok(())
 }
 
-/// Decode the encoded project path (delegates to platform module for cross-platform support)
-fn decode_project_path(encoded: &str) -> String {
-    crate::platform::decode_project_path(encoded)
-}
-
-/// Force rescan all session files to update token data
+/// Force rescan all session files to update token data (all providers)
 pub fn rescan_all_sessions(app: &AppHandle) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    let claude_dirs = get_claude_directories();
+    let dir_to_provider = build_provider_dir_map();
 
-    if claude_dirs.is_empty() {
-        return Ok(0);
+    tracing::info!("Rescan: Found {} provider directories", dir_to_provider.len());
+    for (dir, provider_id) in &dir_to_provider {
+        tracing::info!("  - {:?}: {:?}", provider_id, dir);
     }
 
     let mut count: u32 = 0;
-
-    for claude_dir in &claude_dirs {
-        let projects_dir = claude_dir.join("projects");
-
-        if !projects_dir.exists() {
-            continue;
-        }
-
-        tracing::info!("Force rescanning all sessions in {:?}", projects_dir);
-
-        // Walk through all project directories
-        for entry in walkdir::WalkDir::new(&projects_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                if let Err(e) = process_session_file(app, path) {
-                    tracing::warn!("Failed to process session file {:?}: {}", path, e);
-                } else {
-                    count += 1;
-                }
-            }
-        }
+    for (dir, provider_id) in &dir_to_provider {
+        tracing::info!("Force rescanning all {} sessions in {:?}", provider_id, dir);
+        let provider = crate::providers::get_provider(*provider_id);
+        let scanned = scan_provider_sessions(app, dir, provider.as_ref());
+        tracing::info!("  Scanned {} {} sessions from {:?}", scanned, provider_id, dir);
+        count += scanned;
     }
 
-    tracing::info!("Rescan complete: {} sessions updated", count);
+    tracing::info!("Rescan complete: {} sessions updated across all providers", count);
     Ok(count)
 }
 
-/// Watch for history.jsonl changes
+/// Watch for history.jsonl changes (Claude-specific, for backward compatibility)
 pub fn watch_history_file(_app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let claude_dir = get_claude_dir()?;
+    let claude_dir = crate::platform::get_claude_dir();
     let history_file = claude_dir.join("history.jsonl");
 
     if !history_file.exists() {
-        tracing::info!("History file not found, skipping watch");
+        tracing::info!("Claude history file not found, skipping watch");
         return Ok(());
     }
 

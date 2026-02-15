@@ -1,10 +1,13 @@
-import { useEffect, useState, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
+import React, { useEffect, useState, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Clock, Search, SearchX, Filter, X, ChevronDown } from "lucide-react";
 import { GroupedVirtuoso } from "react-virtuoso";
 import SessionCard from "../components/SessionCard";
 import { Session } from "../lib/types";
 import { getModKey } from "../lib/platform";
+import { getProviderColor } from "../lib/provider-colors";
+
+// --- Types ---
 
 interface Filters {
   project: string | null;
@@ -18,6 +21,110 @@ export interface HistoryViewRef {
   focusSearch: () => void;
 }
 
+// --- Constants ---
+
+const EMPTY_FILTERS: Filters = {
+  project: null,
+  status: null,
+  model: null,
+  dateFrom: null,
+  dateTo: null,
+};
+
+const STATUS_OPTIONS = [
+  { value: "active", label: "Active" },
+  { value: "completed", label: "Completed" },
+  { value: "error", label: "Error" },
+  { value: "needs_input", label: "Needs Input" },
+];
+
+const MODEL_OPTIONS = [
+  { value: "opus", label: "Opus" },
+  { value: "sonnet", label: "Sonnet" },
+  { value: "haiku", label: "Haiku" },
+];
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+// --- Helpers ---
+
+function getDateGroupLabel(date: Date, now: Date): string {
+  const dateStr = date.toDateString();
+
+  if (dateStr === now.toDateString()) return "Today";
+  if (dateStr === new Date(now.getTime() - MS_PER_DAY).toDateString()) return "Yesterday";
+
+  const daysAgo = Math.floor((now.getTime() - date.getTime()) / MS_PER_DAY);
+  if (daysAgo < 7) return "This Week";
+
+  return date.toLocaleDateString(undefined, { month: "short", year: "numeric" });
+}
+
+function groupSessionsByDate(sessions: Session[]): Record<string, Session[]> {
+  const now = new Date();
+  const groups: Record<string, Session[]> = {};
+
+  for (const session of sessions) {
+    const label = getDateGroupLabel(new Date(session.last_human_message_at), now);
+    (groups[label] ??= []).push(session);
+  }
+
+  return groups;
+}
+
+// --- Reusable filter components ---
+
+interface FilterSelectProps {
+  label: string;
+  value: string | null;
+  onChange: (value: string | null) => void;
+  placeholder: string;
+  options: { value: string; label: string }[];
+}
+
+function FilterSelect({ label, value, onChange, placeholder, options }: FilterSelectProps): React.ReactElement {
+  return (
+    <div className="relative">
+      <label className="text-[10px] text-gray-500 mb-1 block">{label}</label>
+      <select
+        value={value || ""}
+        onChange={(e) => onChange(e.target.value || null)}
+        className="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-xs text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+      >
+        <option value="">{placeholder}</option>
+        {options.map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+      <ChevronDown size={12} className="absolute right-2 top-7 text-gray-500 pointer-events-none" />
+    </div>
+  );
+}
+
+interface FilterDateProps {
+  label: string;
+  value: string | null;
+  onChange: (value: string | null) => void;
+}
+
+function FilterDate({ label, value, onChange }: FilterDateProps): React.ReactElement {
+  return (
+    <div>
+      <label className="text-[10px] text-gray-500 mb-1 block">{label}</label>
+      <input
+        type="date"
+        value={value || ""}
+        onChange={(e) => onChange(e.target.value || null)}
+        className="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-xs text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+      />
+    </div>
+  );
+}
+
+// --- Main component ---
+
 const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [projects, setProjects] = useState<string[]>([]);
@@ -25,13 +132,7 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
   const [searchQuery, setSearchQuery] = useState("");
   const [searching, setSearching] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
-  const [filters, setFilters] = useState<Filters>({
-    project: null,
-    status: null,
-    model: null,
-    dateFrom: null,
-    dateTo: null,
-  });
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   useImperativeHandle(ref, () => ({
@@ -42,17 +143,22 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
   }));
 
   const activeFilterCount = Object.values(filters).filter((v) => v !== null).length;
+  const hasActiveSearch = searchQuery.length > 0 || activeFilterCount > 0;
 
-  const loadProjects = async () => {
+  function updateFilter<K extends keyof Filters>(key: K, value: Filters[K]): void {
+    setFilters((prev) => ({ ...prev, [key]: value }));
+  }
+
+  async function loadProjects(): Promise<void> {
     try {
       const result = await invoke<string[]>("get_projects", {});
       setProjects(result);
     } catch (error) {
       console.error("Failed to load projects:", error);
     }
-  };
+  }
 
-  const loadSessions = async () => {
+  async function loadSessions(): Promise<void> {
     try {
       const result = await invoke<Session[]>("get_sessions", {
         project: null,
@@ -64,9 +170,9 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const searchWithFilters = async () => {
+  async function searchWithFilters(): Promise<void> {
     setSearching(true);
     try {
       const result = await invoke<Session[]>("search_sessions_filtered", {
@@ -84,7 +190,7 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
     } finally {
       setSearching(false);
     }
-  };
+  }
 
   useEffect(() => {
     loadSessions();
@@ -93,7 +199,7 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
 
   useEffect(() => {
     const debounce = setTimeout(() => {
-      if (searchQuery || activeFilterCount > 0) {
+      if (hasActiveSearch) {
         searchWithFilters();
       } else {
         loadSessions();
@@ -103,55 +209,6 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
     return () => clearTimeout(debounce);
   }, [searchQuery, filters]);
 
-  const clearFilters = () => {
-    setFilters({
-      project: null,
-      status: null,
-      model: null,
-      dateFrom: null,
-      dateTo: null,
-    });
-  };
-
-  // Group sessions by date
-  const groupSessionsByDate = (sessions: Session[]) => {
-    const groups: Record<string, Session[]> = {};
-    const now = new Date();
-    const today = now.toDateString();
-    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000).toDateString();
-
-    sessions.forEach((session) => {
-      const date = new Date(session.last_human_message_at);
-      let label: string;
-
-      if (date.toDateString() === today) {
-        label = "Today";
-      } else if (date.toDateString() === yesterday) {
-        label = "Yesterday";
-      } else {
-        const daysAgo = Math.floor(
-          (now.getTime() - date.getTime()) / (24 * 60 * 60 * 1000)
-        );
-        if (daysAgo < 7) {
-          label = "This Week";
-        } else {
-          label = date.toLocaleDateString(undefined, {
-            month: "short",
-            year: "numeric",
-          });
-        }
-      }
-
-      if (!groups[label]) {
-        groups[label] = [];
-      }
-      groups[label].push(session);
-    });
-
-    return groups;
-  };
-
-  // Memoize grouped sessions and prepare data for virtuoso
   const { groupCounts, groupLabels, flatSessions } = useMemo(() => {
     const groups = groupSessionsByDate(sessions);
     const labels = Object.keys(groups);
@@ -159,6 +216,11 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
     const flat = labels.flatMap((label) => groups[label]);
     return { groupCounts: counts, groupLabels: labels, flatSessions: flat };
   }, [sessions]);
+
+  const projectOptions = useMemo(
+    () => projects.map((p) => ({ value: p, label: p.split(/[/\\]/).pop() || p })),
+    [projects],
+  );
 
   if (loading) {
     return (
@@ -212,7 +274,7 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
               <span className="text-xs text-gray-400 font-medium">Filters</span>
               {activeFilterCount > 0 && (
                 <button
-                  onClick={clearFilters}
+                  onClick={() => setFilters(EMPTY_FILTERS)}
                   className="text-[10px] text-gray-500 hover:text-gray-300 flex items-center gap-1"
                 >
                   <X size={10} />
@@ -222,88 +284,37 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
             </div>
 
             <div className="grid grid-cols-2 gap-2">
-              {/* Project Filter */}
-              <div className="relative">
-                <label className="text-[10px] text-gray-500 mb-1 block">Project</label>
-                <select
-                  value={filters.project || ""}
-                  onChange={(e) =>
-                    setFilters({ ...filters, project: e.target.value || null })
-                  }
-                  className="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-xs text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500/50"
-                >
-                  <option value="">All projects</option>
-                  {projects.map((p) => (
-                    <option key={p} value={p}>
-                      {p.split(/[/\\]/).pop()}
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown size={12} className="absolute right-2 top-7 text-gray-500 pointer-events-none" />
-              </div>
-
-              {/* Status Filter */}
-              <div className="relative">
-                <label className="text-[10px] text-gray-500 mb-1 block">Status</label>
-                <select
-                  value={filters.status || ""}
-                  onChange={(e) =>
-                    setFilters({ ...filters, status: e.target.value || null })
-                  }
-                  className="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-xs text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500/50"
-                >
-                  <option value="">All statuses</option>
-                  <option value="active">Active</option>
-                  <option value="completed">Completed</option>
-                  <option value="error">Error</option>
-                  <option value="needs_input">Needs Input</option>
-                </select>
-                <ChevronDown size={12} className="absolute right-2 top-7 text-gray-500 pointer-events-none" />
-              </div>
-
-              {/* Model Filter */}
-              <div className="relative">
-                <label className="text-[10px] text-gray-500 mb-1 block">Model</label>
-                <select
-                  value={filters.model || ""}
-                  onChange={(e) =>
-                    setFilters({ ...filters, model: e.target.value || null })
-                  }
-                  className="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-xs text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500/50"
-                >
-                  <option value="">All models</option>
-                  <option value="opus">Opus</option>
-                  <option value="sonnet">Sonnet</option>
-                  <option value="haiku">Haiku</option>
-                </select>
-                <ChevronDown size={12} className="absolute right-2 top-7 text-gray-500 pointer-events-none" />
-              </div>
-
-              {/* Date From */}
-              <div>
-                <label className="text-[10px] text-gray-500 mb-1 block">From Date</label>
-                <input
-                  type="date"
-                  value={filters.dateFrom || ""}
-                  onChange={(e) =>
-                    setFilters({ ...filters, dateFrom: e.target.value || null })
-                  }
-                  className="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-xs text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
-                />
-              </div>
-
-              {/* Date To */}
-              <div>
-                <label className="text-[10px] text-gray-500 mb-1 block">To Date</label>
-                <input
-                  type="date"
-                  value={filters.dateTo || ""}
-                  onChange={(e) =>
-                    setFilters({ ...filters, dateTo: e.target.value || null })
-                  }
-                  className="w-full bg-white/5 border border-white/10 rounded px-2 py-1.5 text-xs text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
-                />
-              </div>
+              <FilterSelect
+                label="Project"
+                value={filters.project}
+                onChange={(v) => updateFilter("project", v)}
+                placeholder="All projects"
+                options={projectOptions}
+              />
+              <FilterSelect
+                label="Status"
+                value={filters.status}
+                onChange={(v) => updateFilter("status", v)}
+                placeholder="All statuses"
+                options={STATUS_OPTIONS}
+              />
+              <FilterSelect
+                label="Model"
+                value={filters.model}
+                onChange={(v) => updateFilter("model", v)}
+                placeholder="All models"
+                options={MODEL_OPTIONS}
+              />
+              <FilterDate
+                label="From Date"
+                value={filters.dateFrom}
+                onChange={(v) => updateFilter("dateFrom", v)}
+              />
+              <FilterDate
+                label="To Date"
+                value={filters.dateTo}
+                onChange={(v) => updateFilter("dateTo", v)}
+              />
             </div>
           </div>
         )}
@@ -319,7 +330,7 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
 
         {!searching && sessions.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-3">
-            {searchQuery || activeFilterCount > 0 ? (
+            {hasActiveSearch ? (
               <>
                 <SearchX size={32} className="opacity-50" />
                 <p className="text-sm">No matching sessions</p>
@@ -351,16 +362,24 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
             )}
             itemContent={(index) => (
               <div className="px-3 py-1">
-                <SessionCard
-                  key={flatSessions[index].session_id}
-                  session={flatSessions[index]}
-                  compact
-                  onDelete={(sessionId) => {
-                    setSessions((prev) =>
-                      prev.filter((s) => s.session_id !== sessionId)
-                    );
-                  }}
-                />
+                <div className="flex gap-2">
+                  <div
+                    className="w-1 rounded-full shrink-0"
+                    style={{ backgroundColor: getProviderColor(flatSessions[index].provider).primary }}
+                  />
+                  <div className="flex-1 min-w-0">
+                    <SessionCard
+                      key={flatSessions[index].session_id}
+                      session={flatSessions[index]}
+                      compact
+                      onDelete={(sessionId) => {
+                        setSessions((prev) =>
+                          prev.filter((s) => s.session_id !== sessionId)
+                        );
+                      }}
+                    />
+                  </div>
+                </div>
               </div>
             )}
             className="h-full"

@@ -11,8 +11,107 @@ import {
   Clock,
   Sparkles,
 } from "lucide-react";
-import { DailyReport } from "../lib/types";
-import { useToast } from "../contexts/ToastContext";
+import { DailyReport } from "../lib/types.js";
+import { useToast } from "../contexts/ToastContext.js";
+
+// --- Utility functions ---
+
+function formatTokens(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    return `${(tokens / 1_000_000).toFixed(1)}M`;
+  }
+  if (tokens >= 1_000) {
+    return `${(tokens / 1_000).toFixed(1)}K`;
+  }
+  return tokens.toString();
+}
+
+function formatDate(dateStr: string): string {
+  const date = new Date(dateStr);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  if (dateStr === today.toISOString().split("T")[0]) {
+    return "Today";
+  }
+  if (dateStr === yesterday.toISOString().split("T")[0]) {
+    return "Yesterday";
+  }
+
+  return date.toLocaleDateString("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function sessionStatusColor(status: string): string {
+  switch (status) {
+    case "completed":
+      return "text-green-400";
+    case "error":
+      return "text-red-400";
+    default:
+      return "text-gray-400";
+  }
+}
+
+function priorityDotColor(priority: string): string {
+  switch (priority) {
+    case "high":
+      return "bg-red-500";
+    case "low":
+      return "bg-blue-500";
+    default:
+      return "bg-yellow-500";
+  }
+}
+
+// --- Sub-components ---
+
+interface SectionCardProps {
+  children: React.ReactNode;
+}
+
+function SectionCard({ children }: SectionCardProps) {
+  return (
+    <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3">
+      {children}
+    </div>
+  );
+}
+
+interface SectionHeaderProps {
+  icon: React.ReactNode;
+  children: React.ReactNode;
+}
+
+function SectionHeader({ icon, children }: SectionHeaderProps) {
+  return (
+    <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+      {icon}
+      {children}
+    </h4>
+  );
+}
+
+interface StatBoxProps {
+  value: string;
+  label: string;
+  valueColor?: string;
+}
+
+function StatBox({ value, label, valueColor = "text-gray-200" }: StatBoxProps) {
+  return (
+    <div className="text-center p-2 bg-white/[0.02] rounded-lg">
+      <p className={`text-lg font-semibold ${valueColor}`}>{value}</p>
+      <p className="text-[10px] text-gray-500 uppercase">{label}</p>
+    </div>
+  );
+}
+
+// --- Main component ---
 
 export default function ReportsView() {
   const [reports, setReports] = useState<string[]>([]);
@@ -24,7 +123,17 @@ export default function ReportsView() {
   const [copied, setCopied] = useState(false);
   const toast = useToast();
 
-  const loadReports = async () => {
+  useEffect(() => {
+    loadReports();
+  }, []);
+
+  useEffect(() => {
+    if (selectedDate) {
+      loadReport(selectedDate);
+    }
+  }, [selectedDate]);
+
+  async function loadReports(): Promise<void> {
     try {
       const result = await invoke<string[]>("list_reports", {});
       setReports(result);
@@ -36,19 +145,18 @@ export default function ReportsView() {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const loadReport = async (date: string) => {
+  async function loadReport(date: string): Promise<void> {
     try {
       const result = await invoke<DailyReport>("get_daily_report", { date });
       setReport(result);
     } catch {
-      // Report doesn't exist, generate it
       await generateReport(date);
     }
-  };
+  }
 
-  const generateReport = async (date?: string) => {
+  async function generateReport(date?: string): Promise<void> {
     setGenerating(true);
     try {
       const result = await invoke<DailyReport>("generate_daily_report", {
@@ -62,9 +170,9 @@ export default function ReportsView() {
     } finally {
       setGenerating(false);
     }
-  };
+  }
 
-  const copyMarkdown = async () => {
+  async function copyMarkdown(): Promise<void> {
     if (!report) return;
     try {
       await writeText(report.markdown);
@@ -73,9 +181,9 @@ export default function ReportsView() {
     } catch (error) {
       console.error("Failed to copy:", error);
     }
-  };
+  }
 
-  const generateAISummary = async () => {
+  async function generateAISummary(): Promise<void> {
     if (!report || !selectedDate) return;
     setGeneratingAI(true);
     try {
@@ -90,27 +198,7 @@ export default function ReportsView() {
     } finally {
       setGeneratingAI(false);
     }
-  };
-
-  useEffect(() => {
-    loadReports();
-  }, []);
-
-  useEffect(() => {
-    if (selectedDate) {
-      loadReport(selectedDate);
-    }
-  }, [selectedDate]);
-
-  const formatTokens = (tokens: number) => {
-    if (tokens >= 1_000_000) {
-      return `${(tokens / 1_000_000).toFixed(1)}M`;
-    }
-    if (tokens >= 1_000) {
-      return `${(tokens / 1_000).toFixed(1)}K`;
-    }
-    return tokens.toString();
-  };
+  }
 
   if (loading) {
     return (
@@ -119,6 +207,8 @@ export default function ReportsView() {
       </div>
     );
   }
+
+  const ccAssistedCommits = report?.git_commits.filter((c) => c.is_cc_assisted) ?? [];
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
@@ -217,11 +307,10 @@ export default function ReportsView() {
             </div>
 
             {/* Sessions Summary */}
-            <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3">
-              <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                <Clock size={12} />
+            <SectionCard>
+              <SectionHeader icon={<Clock size={12} />}>
                 Sessions ({report.sessions.length})
-              </h4>
+              </SectionHeader>
               {report.sessions.length === 0 ? (
                 <p className="text-xs text-gray-500">No sessions today</p>
               ) : (
@@ -236,15 +325,7 @@ export default function ReportsView() {
                           <span className="text-xs font-medium text-gray-300 bg-gray-800 px-1.5 py-0.5 rounded">
                             {session.project_name}
                           </span>
-                          <span
-                            className={`text-[10px] ${
-                              session.status === "completed"
-                                ? "text-green-400"
-                                : session.status === "error"
-                                ? "text-red-400"
-                                : "text-gray-400"
-                            }`}
-                          >
+                          <span className={`text-[10px] ${sessionStatusColor(session.status)}`}>
                             {session.status}
                           </span>
                         </div>
@@ -264,17 +345,16 @@ export default function ReportsView() {
                   ))}
                 </div>
               )}
-            </div>
+            </SectionCard>
 
             {/* Git Commits */}
-            {report.git_commits.length > 0 && (
-              <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3">
-                <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                  <GitCommit size={12} />
-                  Git Commits (CC-assisted: {report.git_commits.filter(c => c.is_cc_assisted).length})
-                </h4>
+            {ccAssistedCommits.length > 0 && (
+              <SectionCard>
+                <SectionHeader icon={<GitCommit size={12} />}>
+                  Git Commits (CC-assisted: {ccAssistedCommits.length})
+                </SectionHeader>
                 <div className="space-y-2">
-                  {report.git_commits.filter(c => c.is_cc_assisted).map((commit, index) => (
+                  {ccAssistedCommits.map((commit, index) => (
                     <div
                       key={index}
                       className="flex items-start gap-2 p-2 bg-white/[0.02] rounded-lg"
@@ -293,34 +373,28 @@ export default function ReportsView() {
                     </div>
                   ))}
                 </div>
-              </div>
+              </SectionCard>
             )}
 
             {/* Usage Summary */}
-            <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3">
-              <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                <Zap size={12} />
+            <SectionCard>
+              <SectionHeader icon={<Zap size={12} />}>
                 Usage Summary
-              </h4>
+              </SectionHeader>
               <div className="grid grid-cols-3 gap-2 mb-3">
-                <div className="text-center p-2 bg-white/[0.02] rounded-lg">
-                  <p className="text-lg font-semibold text-gray-200">
-                    {report.usage_summary.total_sessions}
-                  </p>
-                  <p className="text-[10px] text-gray-500 uppercase">Sessions</p>
-                </div>
-                <div className="text-center p-2 bg-white/[0.02] rounded-lg">
-                  <p className="text-lg font-semibold text-gray-200">
-                    {formatTokens(report.usage_summary.total_tokens)}
-                  </p>
-                  <p className="text-[10px] text-gray-500 uppercase">Tokens</p>
-                </div>
-                <div className="text-center p-2 bg-white/[0.02] rounded-lg">
-                  <p className="text-lg font-semibold text-green-400">
-                    ${report.usage_summary.total_cost_usd.toFixed(2)}
-                  </p>
-                  <p className="text-[10px] text-gray-500 uppercase">Cost</p>
-                </div>
+                <StatBox
+                  value={String(report.usage_summary.total_sessions)}
+                  label="Sessions"
+                />
+                <StatBox
+                  value={formatTokens(report.usage_summary.total_tokens)}
+                  label="Tokens"
+                />
+                <StatBox
+                  value={`$${report.usage_summary.total_cost_usd.toFixed(2)}`}
+                  label="Cost"
+                  valueColor="text-green-400"
+                />
               </div>
 
               {report.usage_summary.by_project.length > 0 && (
@@ -343,11 +417,11 @@ export default function ReportsView() {
                   ))}
                 </div>
               )}
-            </div>
+            </SectionCard>
 
             {/* Pending Tasks */}
             {report.pending_tasks.length > 0 && (
-              <div className="bg-white/[0.03] border border-white/5 rounded-lg p-3">
+              <SectionCard>
                 <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
                   Pending Tasks ({report.pending_tasks.length})
                 </h4>
@@ -357,15 +431,7 @@ export default function ReportsView() {
                       key={index}
                       className="flex items-center gap-2 text-xs"
                     >
-                      <span
-                        className={`w-2 h-2 rounded-full ${
-                          task.priority === "high"
-                            ? "bg-red-500"
-                            : task.priority === "low"
-                            ? "bg-blue-500"
-                            : "bg-yellow-500"
-                        }`}
-                      />
+                      <span className={`w-2 h-2 rounded-full ${priorityDotColor(task.priority)}`} />
                       <span className="text-gray-300 truncate flex-1">
                         "{task.prompt}"
                       </span>
@@ -382,31 +448,11 @@ export default function ReportsView() {
                     </p>
                   )}
                 </div>
-              </div>
+              </SectionCard>
             )}
           </>
         )}
       </div>
     </div>
   );
-}
-
-function formatDate(dateStr: string): string {
-  const date = new Date(dateStr);
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(yesterday.getDate() - 1);
-
-  if (dateStr === today.toISOString().split("T")[0]) {
-    return "Today";
-  }
-  if (dateStr === yesterday.toISOString().split("T")[0]) {
-    return "Yesterday";
-  }
-
-  return date.toLocaleDateString("en-US", {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-  });
 }

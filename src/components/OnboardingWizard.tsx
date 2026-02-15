@@ -1,9 +1,9 @@
-import { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Sparkles,
-  CheckCircle2,
-  XCircle,
+  Check,
+  X,
   AlertTriangle,
   ArrowRight,
   ArrowLeft,
@@ -12,23 +12,140 @@ import {
   Link2,
   FolderSearch,
   Loader2,
-  Settings,
   Eye,
   EyeOff,
   ChevronDown,
   ChevronUp,
   RefreshCw,
+  Cpu,
+  Command,
+  Zap
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { OnboardingStatus, HookVerifyResult, ScanResult } from "../lib/types";
+
+// --- Props types ---
 
 interface OnboardingWizardProps {
   onComplete: () => void;
 }
 
-type Step = 1 | 2 | 3 | 4;
+interface StepHeaderProps {
+  title: string;
+  subtitle: string;
+  gradient?: string;
+}
 
-export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
-  const [step, setStep] = useState<Step>(1);
+interface StatusItemProps {
+  status: "success" | "warning" | "error";
+  label: string;
+  detail?: string;
+  action?: React.ReactNode;
+}
+
+interface Step1Props {
+  status: OnboardingStatus | null;
+  onRefresh: () => void;
+}
+
+interface Step2Props {
+  status: OnboardingStatus | null;
+  installing: boolean;
+  result: HookVerifyResult | null;
+  showPreview: boolean;
+  onTogglePreview: () => void;
+  onInstall: () => void;
+}
+
+interface Preferences {
+  taskNotifications: boolean;
+  notificationSound: boolean;
+  voiceNotifications: boolean;
+  launchAtLogin: boolean;
+  hideOnBlur: boolean;
+}
+
+interface Step3Props {
+  platform: string;
+  preferences: Preferences;
+  onChange: (prefs: Preferences) => void;
+}
+
+interface Step4Props {
+  scanResult: ScanResult | null;
+  scanning: boolean;
+  scanProgress: number;
+  onStartScan: () => void;
+}
+
+// --- Shared sub-components ---
+
+function StepHeader({ title, subtitle, gradient = "from-blue-400 to-purple-400" }: StepHeaderProps): React.ReactElement {
+  return (
+    <div className="text-center mb-8">
+      <h2 className={`text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r ${gradient} mb-2 tracking-tight`}>
+        {title}
+      </h2>
+      <p className="text-sm text-gray-400 font-medium">{subtitle}</p>
+    </div>
+  );
+}
+
+function StatusItem({ status, label, detail, action }: StatusItemProps): React.ReactElement {
+  const icons = {
+    success: Check,
+    warning: AlertTriangle,
+    error: X,
+  };
+
+  const colors = {
+    success: "bg-emerald-500/20 text-emerald-400",
+    warning: "bg-yellow-500/20 text-yellow-400",
+    error: "bg-red-500/20 text-red-400",
+  };
+
+  const Icon = icons[status];
+
+  return (
+    <div className="flex items-center gap-4 py-3 group">
+      <div className={`w-8 h-8 rounded-full ${colors[status]} flex items-center justify-center shrink-0 transition-transform group-hover:scale-110`}>
+        <Icon size={16} strokeWidth={2.5} />
+      </div>
+      <div className="flex-1 min-w-0 flex flex-col justify-center">
+        <div className="flex items-center justify-between">
+          <p className="text-sm font-medium text-gray-200">{label}</p>
+          {detail && <span className="text-xs text-gray-500 font-mono">{detail}</span>}
+        </div>
+      </div>
+      {action && <div className="ml-2">{action}</div>}
+    </div>
+  );
+}
+
+function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: () => void }): React.ReactElement {
+  return (
+    <button
+      onClick={(e) => {
+        e.preventDefault();
+        onChange();
+      }}
+      className={`relative w-11 h-6 rounded-full transition-all duration-300 ease-in-out border ${checked
+        ? "bg-blue-600 border-blue-500 shadow-[0_0_10px_rgba(37,99,235,0.3)]"
+        : "bg-gray-800 border-gray-700 hover:border-gray-600"
+        }`}
+    >
+      <span
+        className={`absolute top-0.5 left-0.5 w-4.5 h-4.5 bg-white rounded-full shadow-sm transition-transform duration-300 ${checked ? "translate-x-5" : ""
+          }`}
+      />
+    </button>
+  );
+}
+
+// --- Main component ---
+
+export default function OnboardingWizard({ onComplete }: OnboardingWizardProps): React.ReactElement {
+  const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [status, setStatus] = useState<OnboardingStatus | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -38,7 +155,7 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) 
   const [showHookPreview, setShowHookPreview] = useState(false);
 
   // Step 3: Preferences
-  const [preferences, setPreferences] = useState({
+  const [preferences, setPreferences] = useState<Preferences>({
     taskNotifications: true,
     notificationSound: true,
     voiceNotifications: false,
@@ -51,7 +168,6 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) 
   const [scanning, setScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState(0);
 
-  // Load onboarding status
   useEffect(() => {
     loadStatus();
   }, []);
@@ -62,7 +178,6 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) 
       const result = await invoke<OnboardingStatus>("get_onboarding_status", {});
       setStatus(result);
 
-      // If hooks already installed, pre-set the result
       if (result.hooks_installed) {
         setHooksResult({
           success: true,
@@ -114,7 +229,6 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) 
     setScanning(true);
     setScanProgress(0);
 
-    // Simulate progress animation
     const progressInterval = setInterval(() => {
       setScanProgress((prev) => {
         if (prev >= 90) {
@@ -134,12 +248,7 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) 
       console.error("Failed to scan:", e);
       clearInterval(progressInterval);
       setScanProgress(100);
-      setScanResult({
-        session_count: 0,
-        project_count: 0,
-        total_tokens: 0,
-        projects: [],
-      });
+      setScanResult({ session_count: 0, project_count: 0, total_tokens: 0, projects: [] });
     } finally {
       setScanning(false);
     }
@@ -154,22 +263,7 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) 
     }
   };
 
-  const skipAll = async () => {
-    try {
-      await invoke("update_config", { key: "onboarding_completed", value: true });
-      onComplete();
-    } catch (e) {
-      console.error("Failed to skip onboarding:", e);
-    }
-  };
-
-  const canProceed = () => {
-    if (step === 1) {
-      // Must have CLI installed
-      return status?.cli_installed === true;
-    }
-    return true;
-  };
+  const canProceed = step !== 1 || status?.cli_installed === true;
 
   const handleNext = async () => {
     if (step === 3) {
@@ -179,9 +273,7 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) 
     if (step === 4) {
       await completeOnboarding();
     } else {
-      setStep((step + 1) as Step);
-
-      // Auto-start scan when entering step 4
+      setStep((step + 1) as 1 | 2 | 3 | 4);
       if (step === 3) {
         setTimeout(() => startScan(), 300);
       }
@@ -190,41 +282,32 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) 
 
   const handleBack = () => {
     if (step > 1) {
-      setStep((step - 1) as Step);
+      setStep((step - 1) as 1 | 2 | 3 | 4);
     }
   };
 
   if (loading) {
     return (
-      <div className="fixed inset-0 bg-gray-950/95 backdrop-blur-xl flex items-center justify-center z-50">
-        <div className="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+      <div className="fixed inset-0 bg-gray-950/80 backdrop-blur-xl flex items-center justify-center z-50">
+        <Loader2 size={32} className="text-blue-500 animate-spin" />
       </div>
     );
   }
 
   return (
-    <div className="fixed inset-0 bg-gray-950/95 backdrop-blur-xl flex items-center justify-center z-50 p-4">
-      <div className="w-full max-w-md">
-        {/* Progress indicator */}
-        <div className="flex items-center justify-center gap-2 mb-6">
-          {[1, 2, 3, 4].map((s) => (
-            <div
-              key={s}
-              className={`flex items-center justify-center w-8 h-8 rounded-full border-2 transition-all ${
-                s === step
-                  ? "border-blue-500 bg-blue-500/20 text-blue-400"
-                  : s < step
-                  ? "border-blue-500 bg-blue-500 text-white"
-                  : "border-gray-700 text-gray-600"
-              }`}
-            >
-              {s < step ? <CheckCircle2 size={16} /> : s}
-            </div>
-          ))}
-        </div>
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-md flex items-center justify-center z-50 p-6">
+      {/* Background Ambient Glow */}
+      <div className="absolute inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute top-[20%] left-[20%] w-96 h-96 bg-blue-600/10 rounded-full blur-[100px]" />
+        <div className="absolute bottom-[20%] right-[20%] w-96 h-96 bg-purple-600/10 rounded-full blur-[100px]" />
+      </div>
 
-        {/* Step content */}
-        <div className="bg-white/[0.03] border border-white/5 rounded-xl p-6 min-h-[320px]">
+      <div className="relative w-full max-w-lg bg-gray-900/80 backdrop-blur-2xl border border-white/10 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+        {/* Top Glint */}
+        <div className="absolute top-0 inset-x-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
+
+        {/* Content Area */}
+        <div className="p-8 flex-1 overflow-y-auto custom-scrollbar">
           {step === 1 && <Step1Welcome status={status} onRefresh={loadStatus} />}
           {step === 2 && (
             <Step2Hooks
@@ -245,8 +328,6 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) 
           )}
           {step === 4 && (
             <Step4Completion
-              status={status}
-              hooksResult={hooksResult}
               scanResult={scanResult}
               scanning={scanning}
               scanProgress={scanProgress}
@@ -255,459 +336,341 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps) 
           )}
         </div>
 
-        {/* Navigation */}
-        <div className="flex items-center justify-between mt-6">
+        {/* Footer Navigation */}
+        <div className="p-6 bg-white/[0.02] border-t border-white/5 flex items-center justify-between relative mt-auto">
+
+          {/* Progress Indicators (Dots) */}
+          <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex gap-2">
+            {[1, 2, 3, 4].map((s) => (
+              <div
+                key={s}
+                className={`h-1.5 rounded-full transition-all duration-300 ${s === step ? "w-6 bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]" :
+                  s < step ? "w-1.5 bg-blue-500/50" : "w-1.5 bg-gray-700"
+                  }`}
+              />
+            ))}
+          </div>
+
           <button
             onClick={handleBack}
-            className={`flex items-center gap-1 px-4 py-2 text-sm text-gray-400 hover:text-gray-300 transition-colors ${
-              step === 1 ? "invisible" : ""
-            }`}
+            className={`flex items-center gap-2 px-3 py-2 text-sm text-gray-400 hover:text-white transition-colors hover:bg-white/5 rounded-lg ${step === 1 ? "opacity-0 pointer-events-none" : ""
+              }`}
           >
-            <ArrowLeft size={14} />
+            <ArrowLeft size={16} />
             Back
           </button>
 
           <button
             onClick={handleNext}
-            disabled={!canProceed() || (step === 4 && scanning)}
-            className="flex items-center gap-2 px-5 py-2 text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+            disabled={!canProceed || (step === 4 && scanning)}
+            className="group flex items-center gap-2 px-6 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 active:from-blue-700 active:to-indigo-700 text-white text-sm font-medium rounded-lg shadow-lg shadow-blue-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none"
           >
             {step === 4 ? "Get Started" : "Continue"}
-            <ArrowRight size={14} />
+            <ArrowRight size={16} className="group-hover:translate-x-0.5 transition-transform" />
           </button>
         </div>
-
-        {/* Skip option */}
-        <button
-          onClick={skipAll}
-          className="w-full mt-4 text-xs text-gray-600 hover:text-gray-400 transition-colors"
-        >
-          Skip setup (advanced users)
-        </button>
       </div>
+
+      {/* Skip Button - Outside the card for minimalism */}
+      <button
+        onClick={completeOnboarding}
+        className="absolute bottom-6 text-xs text-gray-500 hover:text-gray-300 transition-colors"
+      >
+        Skip setup (advanced users)
+      </button>
     </div>
   );
 }
 
-// Step 1: Welcome & Environment Check
-function Step1Welcome({
-  status,
-  onRefresh,
-}: {
-  status: OnboardingStatus | null;
-  onRefresh: () => void;
-}) {
+// --- Step components ---
+
+function Step1Welcome({ status, onRefresh }: Step1Props): React.ReactElement {
+
+  const cliStatus = status?.cli_installed ? "success" : "error";
+  const loginStatus = status?.credentials_found ? "success" : "warning";
+  const dirStatus = status?.claude_dir_exists ? "success" : "warning";
+
   return (
-    <div className="space-y-5">
-      <div className="text-center">
-        <div className="w-14 h-14 mx-auto bg-gradient-to-br from-blue-500 to-purple-500 rounded-2xl flex items-center justify-center mb-3">
-          <Sparkles size={28} className="text-white" />
+    <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+      <div className="flex justify-center mb-6">
+        <div className="w-20 h-20 bg-gradient-to-tr from-blue-500 to-purple-600 rounded-2xl flex items-center justify-center shadow-lg shadow-blue-500/30">
+          <Sparkles size={40} className="text-white fill-white/20" />
         </div>
-        <h2 className="text-lg font-semibold text-gray-100">Welcome to Alice</h2>
-        <p className="text-sm text-gray-400 mt-1">Claude Code Desktop Assistant</p>
       </div>
 
-      <div className="space-y-2">
-        {/* CLI Status */}
-        <div className="flex items-center gap-3 p-3 bg-white/[0.03] rounded-lg border border-white/5">
-          {status?.cli_installed ? (
-            <CheckCircle2 size={18} className="text-green-500 shrink-0" />
-          ) : (
-            <XCircle size={18} className="text-red-500 shrink-0" />
-          )}
-          <div className="flex-1 min-w-0">
-            <p className="text-sm text-gray-200">Claude Code CLI</p>
-            <p className="text-xs text-gray-500 truncate">
-              {status?.cli_installed
-                ? status.cli_version || "Installed"
-                : "Not installed"}
-            </p>
-          </div>
-        </div>
+      <StepHeader
+        title="Welcome to Alice"
+        subtitle="Your intelligent companion for Claude Code"
+      />
 
-        {/* Login Status */}
-        <div className="flex items-center gap-3 p-3 bg-white/[0.03] rounded-lg border border-white/5">
-          {status?.credentials_found ? (
-            <CheckCircle2 size={18} className="text-green-500 shrink-0" />
-          ) : (
-            <AlertTriangle size={18} className="text-yellow-500 shrink-0" />
+      <div className="space-y-1 mt-8">
+        <StatusItem
+          status={cliStatus}
+          label="Claude Code CLI"
+          detail={status?.cli_installed ? status.cli_version || "Installed" : "Not Found"}
+          action={!status?.cli_installed && (
+            <button
+              onClick={onRefresh}
+              className="p-1.5 text-gray-400 hover:text-white bg-white/5 hover:bg-white/10 rounded-md transition-colors"
+              title="Refresh Status"
+            >
+              <RefreshCw size={14} />
+            </button>
           )}
-          <div className="flex-1 min-w-0">
-            <p className="text-sm text-gray-200">Login Status</p>
-            <p className="text-xs text-gray-500 truncate">
-              {status?.credentials_found
-                ? status.account_email || "Connected"
-                : "Not logged in (optional)"}
-            </p>
-          </div>
-        </div>
+        />
 
-        {/* Claude Directory */}
-        <div className="flex items-center gap-3 p-3 bg-white/[0.03] rounded-lg border border-white/5">
-          {status?.claude_dir_exists ? (
-            <CheckCircle2 size={18} className="text-green-500 shrink-0" />
-          ) : (
-            <XCircle size={18} className="text-red-500 shrink-0" />
-          )}
-          <div className="flex-1 min-w-0">
-            <p className="text-sm text-gray-200">Claude Directory</p>
-            <p className="text-xs text-gray-500">
-              {status?.claude_dir_exists
-                ? status?.platform === "windows"
-                  ? "%USERPROFILE%\\.claude\\ found"
-                  : "~/.claude/ found"
-                : "Not found"}
-            </p>
-          </div>
-        </div>
+        <StatusItem
+          status={loginStatus}
+          label="Authentication"
+          detail={status?.credentials_found ? "Connected" : "Not connected"}
+        />
+
+        <StatusItem
+          status={dirStatus}
+          label="Claude Directory"
+          detail={status?.claude_dir_exists ? "Found" : "Not found"}
+        />
       </div>
 
       {!status?.cli_installed && (
-        <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
-          <p className="text-xs text-red-400">
-            Claude Code CLI is required. Install it with:
-          </p>
-          <code className="text-xs text-red-300 bg-black/30 px-2 py-1 rounded mt-1 block">
+        <div className="mt-6 p-4 bg-red-500/5 border border-red-500/10 rounded-xl">
+          <div className="flex gap-3 mb-2">
+            <Terminal size={16} className="text-red-400 mt-0.5" />
+            <p className="text-sm text-red-300 font-medium">Installation Required</p>
+          </div>
+          <code className="block w-full p-2.5 bg-black/40 rounded-lg text-xs font-mono text-gray-300 select-all border border-white/5">
             npm install -g @anthropic-ai/claude-code
           </code>
-          <button
-            onClick={onRefresh}
-            className="flex items-center gap-1 text-xs text-red-400 hover:text-red-300 mt-2"
-          >
-            <RefreshCw size={12} />
-            Re-check
-          </button>
         </div>
       )}
-
-      {status?.existing_sessions_count ? (
-        <p className="text-xs text-gray-500 text-center">
-          Found {status.existing_sessions_count} existing sessions
-        </p>
-      ) : null}
     </div>
   );
 }
 
-// Step 2: Hooks Installation
-function Step2Hooks({
-  status,
-  installing,
-  result,
-  showPreview,
-  onTogglePreview,
-  onInstall,
-}: {
-  status: OnboardingStatus | null;
-  installing: boolean;
-  result: HookVerifyResult | null;
-  showPreview: boolean;
-  onTogglePreview: () => void;
-  onInstall: () => void;
-}) {
+function Step2Hooks({ status, installing, result, showPreview, onTogglePreview, onInstall }: Step2Props): React.ReactElement {
   const isInstalled = result?.success || status?.hooks_installed;
 
   return (
-    <div className="space-y-4">
-      <div className="text-center">
-        <div className="w-14 h-14 mx-auto bg-gradient-to-br from-green-500 to-emerald-500 rounded-2xl flex items-center justify-center mb-3">
-          <Link2 size={28} className="text-white" />
+    <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+      <StepHeader
+        title="Enable Tracking"
+        subtitle="Connect Alice to your Claude Code sessions"
+        gradient="from-emerald-400 to-cyan-400"
+      />
+
+      <div className="space-y-4">
+        {/* Feature Cards */}
+        <div className="grid grid-cols-1 gap-3">
+          <div className="p-4 bg-white/5 border border-white/5 rounded-xl hover:bg-white/[0.07] transition-colors">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-blue-500/20 rounded-lg">
+                <Zap size={18} className="text-blue-400" />
+              </div>
+              <div>
+                <h3 className="text-sm font-medium text-gray-200">Real-time Activity</h3>
+                <p className="text-xs text-gray-500">Track when sessions start and end</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-4 bg-white/5 border border-white/5 rounded-xl hover:bg-white/[0.07] transition-colors">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-purple-500/20 rounded-lg">
+                <Cpu size={18} className="text-purple-400" />
+              </div>
+              <div>
+                <h3 className="text-sm font-medium text-gray-200">Token Usage</h3>
+                <p className="text-xs text-gray-500">Monitor costs and token consumption</p>
+              </div>
+            </div>
+          </div>
         </div>
-        <h2 className="text-lg font-semibold text-gray-100">Enable Session Tracking</h2>
-        <p className="text-sm text-gray-400 mt-1">
-          Hooks let Alice track Claude Code sessions in real-time
-        </p>
-      </div>
 
-      <div className="p-3 bg-white/[0.03] rounded-lg border border-white/5 space-y-2">
-        <p className="text-xs text-gray-400">
-          Will add to {status?.platform === "windows" ? "%USERPROFILE%\\.claude\\settings.json" : "~/.claude/settings.json"}:
-        </p>
-        <ul className="text-xs text-gray-300 space-y-1">
-          <li className="flex items-center gap-2">
-            <CheckCircle2 size={12} className="text-blue-400" />
-            SessionStart - Track when sessions begin
-          </li>
-          <li className="flex items-center gap-2">
-            <CheckCircle2 size={12} className="text-blue-400" />
-            SessionEnd - Track when sessions complete
-          </li>
-          <li className="flex items-center gap-2">
-            <CheckCircle2 size={12} className="text-blue-400" />
-            Stop - Track when Claude stops
-          </li>
-        </ul>
-      </div>
-
-      {/* Preview toggle */}
-      <button
-        onClick={onTogglePreview}
-        className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-400"
-      >
-        {showPreview ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-        {showPreview ? "Hide" : "Preview"} configuration
-      </button>
-
-      {showPreview && (
-        <pre className="text-[10px] text-gray-400 bg-black/30 p-2 rounded overflow-x-auto max-h-24">
-{status?.platform === "windows"
-  ? `"hooks": {
-  "SessionStart": [{
-    "type": "command",
-    "command": "powershell -Command ..."
-  }]
-}`
-  : `"hooks": {
-  "SessionStart": [{
-    "type": "command",
-    "command": "echo '{...}' >> ~/.alice/hooks-events.jsonl"
-  }]
-}`}
-        </pre>
-      )}
-
-      {/* Install button or status */}
-      {isInstalled ? (
-        <div className="flex items-center gap-2 p-3 bg-green-500/10 border border-green-500/20 rounded-lg">
-          <CheckCircle2 size={18} className="text-green-500" />
-          <span className="text-sm text-green-400">Hooks installed successfully</span>
-        </div>
-      ) : (
-        <button
-          onClick={onInstall}
-          disabled={installing}
-          className="w-full flex items-center justify-center gap-2 py-2.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white text-sm rounded-lg transition-colors"
-        >
-          {installing ? (
-            <>
-              <Loader2 size={16} className="animate-spin" />
-              Installing...
-            </>
+        {/* Action Area */}
+        <div className="mt-8">
+          {isInstalled ? (
+            <div className="flex flex-col items-center justify-center p-6 bg-emerald-500/5 border border-emerald-500/10 rounded-xl">
+              <div className="w-12 h-12 bg-emerald-500/20 rounded-full flex items-center justify-center mb-3">
+                <Check size={24} className="text-emerald-400" />
+              </div>
+              <p className="text-emerald-400 font-medium text-sm">Hooks Installed Successfully</p>
+            </div>
           ) : (
-            <>
-              <Link2 size={16} />
-              Install Hooks
-            </>
+            <button
+              onClick={onInstall}
+              disabled={installing}
+              className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium rounded-xl transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2"
+            >
+              {installing ? (
+                <>
+                  <Loader2 size={18} className="animate-spin" />
+                  <span>Installing Hooks...</span>
+                </>
+              ) : (
+                <>
+                  <Link2 size={18} />
+                  <span>Install Session Hooks</span>
+                </>
+              )}
+            </button>
           )}
-        </button>
-      )}
+        </div>
 
-      <p className="text-xs text-gray-600 text-center">
-        You can skip this step, but real-time tracking won't work
-      </p>
+        <button
+          onClick={onTogglePreview}
+          className="w-full flex items-center justify-center gap-1.5 text-xs text-gray-500 hover:text-gray-300 mt-4 transition-colors"
+        >
+          {showPreview ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+          {showPreview ? "Hide details" : "Show technical details"}
+        </button>
+
+        {showPreview && (
+          <div className="mt-2 p-3 bg-black/40 rounded-lg border border-white/5">
+            <pre className="text-[10px] text-gray-400 font-mono overflow-x-auto whitespace-pre-wrap">
+              {status?.platform === "windows"
+                ? "Checking %USERPROFILE%\\.claude\\settings.json"
+                : "Checking ~/.claude/config.json and hooks setup..."}
+            </pre>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
-// Step 3: Preferences
-function Step3Preferences({
-  platform,
-  preferences,
-  onChange,
-}: {
-  platform: string;
-  preferences: {
-    taskNotifications: boolean;
-    notificationSound: boolean;
-    voiceNotifications: boolean;
-    launchAtLogin: boolean;
-    hideOnBlur: boolean;
-  };
-  onChange: (prefs: typeof preferences) => void;
-}) {
-  const toggle = (key: keyof typeof preferences) => {
+function PreferenceItem({ icon: Icon, label, description, checked, onChange }: { icon: LucideIcon; label: string; description: string; checked: boolean; onChange: () => void }) {
+  return (
+    <div className="flex items-center justify-between p-3 rounded-xl hover:bg-white/5 transition-colors group">
+      <div className="flex items-center gap-3">
+        <div className={`p-2 rounded-lg transition-colors ${checked ? "bg-blue-500/20 text-blue-400" : "bg-gray-800 text-gray-500 group-hover:bg-gray-700"}`}>
+          <Icon size={18} />
+        </div>
+        <div>
+          <p className="text-sm font-medium text-gray-200">{label}</p>
+          <p className="text-xs text-gray-500">{description}</p>
+        </div>
+      </div>
+      <ToggleSwitch checked={checked} onChange={onChange} />
+    </div>
+  );
+}
+
+function Step3Preferences({ platform, preferences, onChange }: Step3Props): React.ReactElement {
+  const toggle = (key: keyof Preferences) => {
     onChange({ ...preferences, [key]: !preferences[key] });
   };
 
   return (
-    <div className="space-y-4">
-      <div className="text-center">
-        <div className="w-14 h-14 mx-auto bg-gradient-to-br from-purple-500 to-pink-500 rounded-2xl flex items-center justify-center mb-3">
-          <Settings size={28} className="text-white" />
-        </div>
-        <h2 className="text-lg font-semibold text-gray-100">Preferences</h2>
-        <p className="text-sm text-gray-400 mt-1">Customize your experience</p>
-      </div>
+    <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+      <StepHeader
+        title="Preferences"
+        subtitle="Customize your experience"
+        gradient="from-pink-400 to-rose-400"
+      />
 
-      {/* Notifications */}
-      <div className="space-y-2">
-        <p className="text-xs text-gray-500 uppercase tracking-wide">Notifications</p>
+      <div className="space-y-1">
+        <PreferenceItem
+          icon={Bell}
+          label="Task Alerts"
+          description="Notify when long-running tasks finish"
+          checked={preferences.taskNotifications}
+          onChange={() => toggle("taskNotifications")}
+        />
 
-        <label className="flex items-center justify-between p-3 bg-white/[0.03] rounded-lg border border-white/5 cursor-pointer">
-          <div className="flex items-center gap-2">
-            <Bell size={16} className="text-gray-400" />
-            <span className="text-sm text-gray-200">Task completion alerts</span>
-          </div>
-          <ToggleSwitch checked={preferences.taskNotifications} onChange={() => toggle("taskNotifications")} />
-        </label>
+        <PreferenceItem
+          icon={Command}
+          label="Launch at Login"
+          description="Start Alice automatically"
+          checked={preferences.launchAtLogin}
+          onChange={() => toggle("launchAtLogin")}
+        />
 
-        <label className="flex items-center justify-between p-3 bg-white/[0.03] rounded-lg border border-white/5 cursor-pointer">
-          <div className="flex items-center gap-2">
-            <Bell size={16} className="text-gray-400" />
-            <span className="text-sm text-gray-200">Notification sound</span>
-          </div>
-          <ToggleSwitch checked={preferences.notificationSound} onChange={() => toggle("notificationSound")} />
-        </label>
+        <PreferenceItem
+          icon={preferences.hideOnBlur ? EyeOff : Eye}
+          label="Auto-Hide"
+          description="Hide window when clicking away"
+          checked={preferences.hideOnBlur}
+          onChange={() => toggle("hideOnBlur")}
+        />
 
         {(platform === "macos" || platform === "windows") && (
-          <label className="flex items-center justify-between p-3 bg-white/[0.03] rounded-lg border border-white/5 cursor-pointer">
-            <div className="flex items-center gap-2">
-              <Bell size={16} className="text-gray-400" />
-              <span className="text-sm text-gray-200">Voice notifications</span>
-            </div>
-            <ToggleSwitch checked={preferences.voiceNotifications} onChange={() => toggle("voiceNotifications")} />
-          </label>
+          <PreferenceItem
+            icon={preferences.voiceNotifications ? Zap : Bell}
+            label="Voice Feedback"
+            description="Spoken notifications for events"
+            checked={preferences.voiceNotifications}
+            onChange={() => toggle("voiceNotifications")}
+          />
         )}
-      </div>
-
-      {/* Behavior */}
-      <div className="space-y-2">
-        <p className="text-xs text-gray-500 uppercase tracking-wide">Behavior</p>
-
-        <label className="flex items-center justify-between p-3 bg-white/[0.03] rounded-lg border border-white/5 cursor-pointer">
-          <div className="flex items-center gap-2">
-            <Terminal size={16} className="text-gray-400" />
-            <span className="text-sm text-gray-200">Launch at startup</span>
-          </div>
-          <ToggleSwitch checked={preferences.launchAtLogin} onChange={() => toggle("launchAtLogin")} />
-        </label>
-
-        <label className="flex items-center justify-between p-3 bg-white/[0.03] rounded-lg border border-white/5 cursor-pointer">
-          <div className="flex items-center gap-2">
-            {preferences.hideOnBlur ? <EyeOff size={16} className="text-gray-400" /> : <Eye size={16} className="text-gray-400" />}
-            <span className="text-sm text-gray-200">Hide when clicking outside</span>
-          </div>
-          <ToggleSwitch checked={preferences.hideOnBlur} onChange={() => toggle("hideOnBlur")} />
-        </label>
       </div>
     </div>
   );
 }
 
-// Step 4: Completion & Scan
-function Step4Completion({
-  status,
-  hooksResult,
-  scanResult,
-  scanning,
-  scanProgress,
-  onStartScan,
-}: {
-  status: OnboardingStatus | null;
-  hooksResult: HookVerifyResult | null;
-  scanResult: ScanResult | null;
-  scanning: boolean;
-  scanProgress: number;
-  onStartScan: () => void;
-}) {
+function Step4Completion({ scanResult, scanning, scanProgress, onStartScan }: Step4Props): React.ReactElement {
+  const scanDone = scanResult != null && !scanning;
+
   return (
-    <div className="space-y-4 text-center">
-      <div className="w-14 h-14 mx-auto bg-gradient-to-br from-emerald-500 to-teal-500 rounded-2xl flex items-center justify-center">
-        {scanning ? (
-          <Loader2 size={28} className="text-white animate-spin" />
-        ) : scanResult ? (
-          <CheckCircle2 size={28} className="text-white" />
-        ) : (
-          <FolderSearch size={28} className="text-white" />
+    <div className="animate-in fade-in slide-in-from-bottom-4 duration-500 text-center">
+      <div className="mb-8 relative inline-flex items-center justify-center">
+        {/* Background pulses */}
+        {scanning && (
+          <>
+            <div className="absolute inset-0 bg-emerald-500/30 rounded-full animate-ping opacity-75" />
+            <div className="absolute inset-0 bg-emerald-500/20 rounded-full animate-pulse" />
+          </>
         )}
+
+        <div className={`w-20 h-20 rounded-2xl flex items-center justify-center shadow-xl transition-all duration-500 ${scanning ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/30" :
+          scanDone ? "bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-emerald-500/40" :
+            "bg-gray-800 text-gray-400"
+          }`}>
+          {scanning ? <Loader2 size={40} className="animate-spin" /> :
+            scanDone ? <Check size={40} className="drop-shadow-md" /> :
+              <FolderSearch size={40} />}
+        </div>
       </div>
 
-      <h2 className="text-lg font-semibold text-gray-100">
-        {scanning ? "Scanning Sessions..." : scanResult ? "All Set!" : "Almost Done"}
+      <h2 className="text-2xl font-bold text-white mb-2">
+        {scanning ? "Scanning Sessions..." : scanDone ? "All Set!" : "Finalizing..."}
       </h2>
 
-      {/* Scan progress */}
+      <p className="text-sm text-gray-400 mb-8 max-w-xs mx-auto">
+        {scanning ? "Indexing your Claude Code history in the background." :
+          scanDone ? "Alice is ready to help you manage your coding sessions." :
+            "One last step to index your data."}
+      </p>
+
       {scanning && (
-        <div className="space-y-2">
-          <div className="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
-            <div
-              className="h-2 bg-emerald-500 rounded-full transition-all duration-300"
-              style={{ width: `${scanProgress}%` }}
-            />
+        <div className="max-w-xs mx-auto mb-8">
+          <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+            <div className="h-full bg-emerald-500 transition-all duration-300 ease-out" style={{ width: `${scanProgress}%` }} />
           </div>
-          <p className="text-xs text-gray-500">
-            Looking for sessions in {status?.platform === "windows" ? "%USERPROFILE%\\.claude\\" : "~/.claude/"}
-          </p>
+          <p className="text-xs text-gray-600 mt-2 font-mono">{scanProgress}% completed</p>
         </div>
       )}
 
-      {/* Scan results */}
-      {scanResult && !scanning && (
-        <div className="grid grid-cols-2 gap-3">
-          <div className="p-3 bg-white/[0.03] rounded-lg border border-white/5">
-            <p className="text-2xl font-bold text-emerald-400">{scanResult.session_count}</p>
-            <p className="text-xs text-gray-500">Sessions</p>
+      {scanDone && scanResult && (
+        <div className="grid grid-cols-2 gap-4 animate-in fade-in zoom-in-50 duration-500">
+          <div className="p-4 bg-white/[0.03] border border-white/5 rounded-2xl">
+            <p className="text-3xl font-bold text-emerald-400 tracking-tight">{scanResult.session_count}</p>
+            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mt-1">Sessions</p>
           </div>
-          <div className="p-3 bg-white/[0.03] rounded-lg border border-white/5">
-            <p className="text-2xl font-bold text-blue-400">{scanResult.project_count}</p>
-            <p className="text-xs text-gray-500">Projects</p>
+          <div className="p-4 bg-white/[0.03] border border-white/5 rounded-2xl">
+            <p className="text-3xl font-bold text-blue-400 tracking-tight">{scanResult.project_count}</p>
+            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mt-1">Projects</p>
           </div>
         </div>
       )}
 
-      {/* Configuration summary */}
-      {scanResult && !scanning && (
-        <div className="space-y-1 pt-2">
-          <p className="text-xs text-gray-500 uppercase tracking-wide mb-2">Setup Summary</p>
-          <div className="flex items-center justify-center gap-4 text-xs">
-            <span className="flex items-center gap-1 text-gray-400">
-              <CheckCircle2 size={12} className="text-green-500" />
-              CLI
-            </span>
-            <span className="flex items-center gap-1 text-gray-400">
-              {hooksResult?.success || status?.hooks_installed ? (
-                <CheckCircle2 size={12} className="text-green-500" />
-              ) : (
-                <XCircle size={12} className="text-yellow-500" />
-              )}
-              Hooks
-            </span>
-            <span className="flex items-center gap-1 text-gray-400">
-              {status?.credentials_found ? (
-                <CheckCircle2 size={12} className="text-green-500" />
-              ) : (
-                <AlertTriangle size={12} className="text-yellow-500" />
-              )}
-              Login
-            </span>
-          </div>
-        </div>
-      )}
-
-      {/* Manual scan trigger if not auto-started */}
-      {!scanning && !scanResult && (
+      {!scanning && !scanDone && (
         <button
           onClick={onStartScan}
-          className="px-4 py-2 text-sm bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors"
+          className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded-xl transition-all shadow-lg shadow-emerald-500/20"
         >
-          Scan Sessions
+          Start Session Scan
         </button>
       )}
-
-      <p className="text-xs text-gray-600">
-        You can re-run this wizard anytime from Settings
-      </p>
     </div>
-  );
-}
-
-// Toggle switch component
-function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: () => void }) {
-  return (
-    <button
-      onClick={(e) => {
-        e.preventDefault();
-        onChange();
-      }}
-      className={`relative w-10 h-6 rounded-full transition-colors ${
-        checked ? "bg-blue-600" : "bg-gray-700"
-      }`}
-    >
-      <span
-        className={`absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform ${
-          checked ? "translate-x-4" : ""
-        }`}
-      />
-    </button>
   );
 }

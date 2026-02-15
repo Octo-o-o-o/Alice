@@ -6,12 +6,16 @@ use crate::database::{self, TaskStatus};
 use crate::session::Session;
 use chrono::{Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use tauri::AppHandle;
 
-/// Daily report structure
+// ---------------------------------------------------------------------------
+// Public data structures
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyReport {
     pub date: String,
@@ -23,6 +27,10 @@ pub struct DailyReport {
     pub markdown: String,
     #[serde(default)]
     pub ai_summary: Option<String>,
+    #[serde(default)]
+    pub work_value_score: Option<i32>,
+    #[serde(default)]
+    pub workload_score: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,49 +76,32 @@ pub struct TaskSummary {
     pub priority: String,
 }
 
+// ---------------------------------------------------------------------------
+// Report generation
+// ---------------------------------------------------------------------------
+
 /// Generate daily report for a specific date
 pub fn generate_report(app: &AppHandle, date: &str) -> Result<DailyReport, String> {
     let parsed_date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map_err(|e| format!("Invalid date format: {}", e))?;
 
-    // Get sessions for the date
-    let sessions = get_sessions_for_date(app, date)?;
-    let session_summaries: Vec<SessionSummary> = sessions
-        .iter()
-        .map(|s| SessionSummary {
-            project_name: s.project_name.clone(),
-            prompt: s.first_prompt.clone().unwrap_or_default(),
-            status: format!("{:?}", s.status).to_lowercase(),
-            tokens: s.total_tokens,
-            cost_usd: s.total_cost_usd,
-            duration_minutes: (s.last_active_at - s.started_at) / 60_000,
-        })
-        .collect();
+    let sessions = database::get_sessions_by_date(app, date)
+        .map_err(|e| e.to_string())?;
 
-    // Get unique project paths for git commits
+    let session_summaries = build_session_summaries(&sessions);
+
     let project_paths: Vec<String> = sessions
         .iter()
-        .filter_map(|s| {
-            if s.project_path.is_empty() {
-                None
-            } else {
-                Some(s.project_path.clone())
-            }
-        })
-        .collect::<std::collections::HashSet<_>>()
+        .filter(|s| !s.project_path.is_empty())
+        .map(|s| s.project_path.clone())
+        .collect::<HashSet<_>>()
         .into_iter()
         .collect();
 
-    // Get git commits for the date
     let git_commits = get_git_commits_for_date(&project_paths, &parsed_date);
-
-    // Calculate usage summary
     let usage_summary = calculate_usage_summary(&sessions);
-
-    // Get pending tasks
     let pending_tasks = get_pending_tasks(app)?;
 
-    // Generate markdown
     let markdown = generate_markdown(
         date,
         &session_summaries,
@@ -128,32 +119,126 @@ pub fn generate_report(app: &AppHandle, date: &str) -> Result<DailyReport, Strin
         generated_at: Utc::now().timestamp_millis(),
         markdown,
         ai_summary: None,
+        work_value_score: None,
+        workload_score: None,
     };
 
-    // Save report to disk
     save_report(&report)?;
 
     Ok(report)
 }
 
-/// Get sessions for a specific date
-fn get_sessions_for_date(app: &AppHandle, date: &str) -> Result<Vec<Session>, String> {
-    database::get_sessions_by_date(app, date).map_err(|e| e.to_string())
+/// Generate today's report
+pub fn generate_today_report(app: &AppHandle) -> Result<DailyReport, String> {
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    generate_report(app, &today)
 }
 
-/// Get git commits for a date from project directories
-fn get_git_commits_for_date(project_paths: &[String], date: &NaiveDate) -> Vec<GitCommit> {
-    let mut commits = Vec::new();
-    let date_str = date.format("%Y-%m-%d").to_string();
+/// Generate report with AI analysis
+pub async fn generate_report_with_ai(app: &AppHandle, date: &str) -> Result<DailyReport, String> {
+    let mut report = generate_report(app, date)?;
 
-    // Check if git is available on this platform
+    let config = crate::config::load_config();
+    match generate_ai_analysis(&report, &config.report_language).await {
+        Ok(analysis) => {
+            report.ai_summary = Some(analysis.summary);
+            report.work_value_score = Some(analysis.work_value_score);
+            report.workload_score = Some(analysis.workload_score);
+            report.markdown = analysis.markdown_content;
+            save_report(&report)?;
+            Ok(report)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to generate AI analysis: {}", e);
+            Ok(report)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Report persistence
+// ---------------------------------------------------------------------------
+
+/// Load report from disk
+pub fn load_report(date: &str) -> Result<DailyReport, String> {
+    let json_path = reports_dir().join(format!("{}.json", date));
+    let content = std::fs::read_to_string(&json_path)
+        .map_err(|e| format!("Failed to read report: {}", e))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse report: {}", e))
+}
+
+/// List available reports (newest first)
+pub fn list_reports() -> Result<Vec<String>, String> {
+    let dir = reports_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut dates: Vec<String> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("Failed to read reports directory: {}", e))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.strip_suffix(".json").map(|s| s.to_string())
+        })
+        .collect();
+
+    dates.sort_by(|a, b| b.cmp(a));
+    Ok(dates)
+}
+
+fn save_report(report: &DailyReport) -> Result<(), String> {
+    let dir = reports_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create reports directory: {}", e))?;
+
+    let report_path = dir.join(format!("{}.md", report.date));
+    std::fs::write(&report_path, &report.markdown)
+        .map_err(|e| format!("Failed to write report: {}", e))?;
+
+    let json_path = dir.join(format!("{}.json", report.date));
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|e| format!("Failed to serialize report: {}", e))?;
+    std::fs::write(&json_path, json)
+        .map_err(|e| format!("Failed to write report JSON: {}", e))?;
+
+    Ok(())
+}
+
+fn reports_dir() -> PathBuf {
+    crate::platform::get_alice_dir().join("reports")
+}
+
+// ---------------------------------------------------------------------------
+// Data collection helpers
+// ---------------------------------------------------------------------------
+
+fn build_session_summaries(sessions: &[Session]) -> Vec<SessionSummary> {
+    sessions
+        .iter()
+        .map(|s| SessionSummary {
+            project_name: s.project_name.clone(),
+            prompt: s.first_prompt.clone().unwrap_or_default(),
+            status: format!("{:?}", s.status).to_lowercase(),
+            tokens: s.total_tokens,
+            cost_usd: s.total_cost_usd,
+            duration_minutes: (s.last_active_at - s.started_at) / 60_000,
+        })
+        .collect()
+}
+
+fn get_git_commits_for_date(project_paths: &[String], date: &NaiveDate) -> Vec<GitCommit> {
     let git_cmd = match crate::platform::get_git_command() {
         Some(cmd) => cmd,
         None => {
             tracing::warn!("Git not found on PATH, skipping commit collection");
-            return commits;
+            return Vec::new();
         }
     };
+
+    let date_str = date.format("%Y-%m-%d").to_string();
+    let mut commits = Vec::new();
 
     for project_path in project_paths {
         let path = PathBuf::from(project_path);
@@ -161,14 +246,8 @@ fn get_git_commits_for_date(project_paths: &[String], date: &NaiveDate) -> Vec<G
             continue;
         }
 
-        // Extract project name from path
-        let project_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let project_name = project_name_from_path(&path);
 
-        // Run git log
         let output = Command::new(git_cmd)
             .current_dir(&path)
             .args([
@@ -179,33 +258,34 @@ fn get_git_commits_for_date(project_paths: &[String], date: &NaiveDate) -> Vec<G
             ])
             .output();
 
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let parts: Vec<&str> = line.split('|').collect();
-                if parts.len() >= 4 {
-                    let message = parts[1].to_string();
-                    let is_cc_assisted = message.contains("Co-Authored-By: Claude")
-                        || message.contains("🤖")
-                        || message.to_lowercase().contains("claude");
+        let Ok(output) = output else { continue };
 
-                    commits.push(GitCommit {
-                        project_name: project_name.clone(),
-                        hash: parts[0][..7].to_string(), // Short hash
-                        message,
-                        author: parts[2].to_string(),
-                        timestamp: parts[3].to_string(),
-                        is_cc_assisted,
-                    });
-                }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split('|').collect();
+            if parts.len() < 4 {
+                continue;
             }
+
+            let message = parts[1].to_string();
+            let is_cc_assisted = message.contains("Co-Authored-By: Claude")
+                || message.contains("🤖")
+                || message.to_lowercase().contains("claude");
+
+            commits.push(GitCommit {
+                project_name: project_name.clone(),
+                hash: parts[0][..7].to_string(),
+                message,
+                author: parts[2].to_string(),
+                timestamp: parts[3].to_string(),
+                is_cc_assisted,
+            });
         }
     }
 
     commits
 }
 
-/// Calculate usage summary from sessions
 fn calculate_usage_summary(sessions: &[Session]) -> UsageSummary {
     let mut by_project: HashMap<String, (i32, i64, f64)> = HashMap::new();
 
@@ -236,24 +316,18 @@ fn calculate_usage_summary(sessions: &[Session]) -> UsageSummary {
     }
 }
 
-/// Get pending tasks
 fn get_pending_tasks(app: &AppHandle) -> Result<Vec<TaskSummary>, String> {
     let backlog = database::get_tasks(app, Some(TaskStatus::Backlog), None)
         .map_err(|e| e.to_string())?;
     let queued = database::get_tasks(app, Some(TaskStatus::Queued), None)
         .map_err(|e| e.to_string())?;
 
-    let tasks: Vec<TaskSummary> = backlog
+    let tasks = backlog
         .into_iter()
-        .chain(queued.into_iter())
+        .chain(queued)
         .map(|t| TaskSummary {
             prompt: t.prompt,
-            project_name: t.project_path.and_then(|p| {
-                PathBuf::from(&p)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-            }),
+            project_name: t.project_path.as_deref().map(|p| project_name_from_path(&PathBuf::from(p))),
             priority: format!("{:?}", t.priority).to_lowercase(),
         })
         .collect();
@@ -261,7 +335,10 @@ fn get_pending_tasks(app: &AppHandle) -> Result<Vec<TaskSummary>, String> {
     Ok(tasks)
 }
 
-/// Generate markdown report
+// ---------------------------------------------------------------------------
+// Markdown report generation
+// ---------------------------------------------------------------------------
+
 fn generate_markdown(
     date: &str,
     sessions: &[SessionSummary],
@@ -271,187 +348,88 @@ fn generate_markdown(
 ) -> String {
     let mut md = String::new();
 
-    // Header
-    md.push_str(&format!("# Daily Report — {}\n\n", date));
+    writeln!(md, "# Daily Report \u{2014} {}\n", date).unwrap();
 
-    // Sessions
-    md.push_str(&format!("## Sessions ({})\n\n", sessions.len()));
+    // Sessions section
+    writeln!(md, "## Sessions ({})\n", sessions.len()).unwrap();
     for s in sessions {
-        let tokens_str = format_tokens(s.tokens);
-        md.push_str(&format!(
-            "- **{}**: \"{}\" — {}, {} tokens, ${:.2}\n",
+        writeln!(
+            md,
+            "- **{}**: \"{}\" \u{2014} {}, {} tokens, ${:.2}",
             s.project_name,
             truncate(&s.prompt, 50),
             s.status,
-            tokens_str,
+            format_tokens(s.tokens),
             s.cost_usd
-        ));
+        )
+        .unwrap();
     }
     md.push('\n');
 
-    // Git Commits
+    // CC-assisted git commits section
     let cc_commits: Vec<_> = commits.iter().filter(|c| c.is_cc_assisted).collect();
     if !cc_commits.is_empty() {
-        md.push_str(&format!("## Git Commits (CC-assisted: {})\n\n", cc_commits.len()));
-        for c in cc_commits {
-            md.push_str(&format!(
-                "- {}: `{}` — {}\n",
-                c.project_name, c.hash, c.message
-            ));
+        writeln!(md, "## Git Commits (CC-assisted: {})\n", cc_commits.len()).unwrap();
+        for c in &cc_commits {
+            writeln!(md, "- {}: `{}` \u{2014} {}", c.project_name, c.hash, c.message).unwrap();
         }
         md.push('\n');
     }
 
-    // Usage Summary
-    md.push_str("## Usage Summary\n\n");
-    md.push_str("| Project | Sessions | Tokens | Cost |\n");
-    md.push_str("|---------|----------|--------|------|\n");
+    // Usage summary table
+    writeln!(md, "## Usage Summary\n").unwrap();
+    writeln!(md, "| Project | Sessions | Tokens | Cost |").unwrap();
+    writeln!(md, "|---------|----------|--------|------|").unwrap();
     for p in &usage.by_project {
-        md.push_str(&format!(
-            "| {} | {} | {} | ${:.2} |\n",
+        writeln!(
+            md,
+            "| {} | {} | {} | ${:.2} |",
             p.project_name,
             p.sessions,
             format_tokens(p.tokens),
             p.cost_usd
-        ));
+        )
+        .unwrap();
     }
-    md.push_str(&format!(
-        "| **Total** | **{}** | **{}** | **${:.2}** |\n\n",
+    writeln!(
+        md,
+        "| **Total** | **{}** | **{}** | **${:.2}** |\n",
         usage.total_sessions,
         format_tokens(usage.total_tokens),
         usage.total_cost_usd
-    ));
+    )
+    .unwrap();
 
-    // Pending Tasks
+    // Pending tasks section
     if !tasks.is_empty() {
-        md.push_str(&format!("## Queued Tasks ({} pending)\n\n", tasks.len()));
+        writeln!(md, "## Queued Tasks ({} pending)\n", tasks.len()).unwrap();
         for t in tasks.iter().take(5) {
             let project = t.project_name.as_deref().unwrap_or("No project");
-            md.push_str(&format!("- \"{}\" ({})\n", truncate(&t.prompt, 50), project));
+            writeln!(md, "- \"{}\" ({})", truncate(&t.prompt, 50), project).unwrap();
         }
         if tasks.len() > 5 {
-            md.push_str(&format!("- ...and {} more\n", tasks.len() - 5));
+            writeln!(md, "- ...and {} more", tasks.len() - 5).unwrap();
         }
     }
 
     md
 }
 
-/// Format token count
-fn format_tokens(tokens: i64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.1}K", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
-    }
+// ---------------------------------------------------------------------------
+// AI analysis
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AiAnalysis {
+    summary: String,
+    work_value_score: i32,
+    workload_score: i32,
+    markdown_content: String,
 }
 
-/// Truncate string
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len - 3])
-    }
-}
+async fn generate_ai_analysis(report: &DailyReport, language: &str) -> Result<AiAnalysis, String> {
+    let prompt = build_ai_prompt(report, language);
 
-/// Save report to disk
-fn save_report(report: &DailyReport) -> Result<(), String> {
-    let reports_dir = crate::platform::get_alice_dir().join("reports");
-
-    std::fs::create_dir_all(&reports_dir)
-        .map_err(|e| format!("Failed to create reports directory: {}", e))?;
-
-    let report_path = reports_dir.join(format!("{}.md", report.date));
-    std::fs::write(&report_path, &report.markdown)
-        .map_err(|e| format!("Failed to write report: {}", e))?;
-
-    // Also save JSON version for structured access
-    let json_path = reports_dir.join(format!("{}.json", report.date));
-    let json = serde_json::to_string_pretty(report)
-        .map_err(|e| format!("Failed to serialize report: {}", e))?;
-    std::fs::write(&json_path, json)
-        .map_err(|e| format!("Failed to write report JSON: {}", e))?;
-
-    Ok(())
-}
-
-/// Load report from disk
-pub fn load_report(date: &str) -> Result<DailyReport, String> {
-    let json_path = crate::platform::get_alice_dir().join("reports").join(format!("{}.json", date));
-
-    let content = std::fs::read_to_string(&json_path)
-        .map_err(|e| format!("Failed to read report: {}", e))?;
-
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse report: {}", e))
-}
-
-/// List available reports
-pub fn list_reports() -> Result<Vec<String>, String> {
-    let reports_dir = crate::platform::get_alice_dir().join("reports");
-
-    if !reports_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut dates: Vec<String> = std::fs::read_dir(&reports_dir)
-        .map_err(|e| format!("Failed to read reports directory: {}", e))?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".json") {
-                Some(name.trim_end_matches(".json").to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    dates.sort_by(|a, b| b.cmp(a)); // Newest first
-    Ok(dates)
-}
-
-/// Generate today's report
-pub fn generate_today_report(app: &AppHandle) -> Result<DailyReport, String> {
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    generate_report(app, &today)
-}
-
-/// Generate AI summary for a report using Claude Haiku
-pub async fn generate_ai_summary(report: &DailyReport) -> Result<String, String> {
-    // Build a prompt with the report data
-    let mut prompt = String::new();
-    prompt.push_str("Based on the following daily coding activity, write a concise 2-3 sentence summary highlighting the key accomplishments and work done. Be specific about what was achieved.\n\n");
-
-    prompt.push_str(&format!("Date: {}\n", report.date));
-    prompt.push_str(&format!("Sessions: {}\n", report.usage_summary.total_sessions));
-    prompt.push_str(&format!("Total tokens used: {}\n", report.usage_summary.total_tokens));
-    prompt.push_str(&format!("Total cost: ${:.2}\n\n", report.usage_summary.total_cost_usd));
-
-    if !report.sessions.is_empty() {
-        prompt.push_str("Session topics:\n");
-        for s in report.sessions.iter().take(10) {
-            prompt.push_str(&format!("- {}: {}\n", s.project_name, truncate(&s.prompt, 100)));
-        }
-        prompt.push('\n');
-    }
-
-    if !report.git_commits.is_empty() {
-        let cc_commits: Vec<_> = report.git_commits.iter().filter(|c| c.is_cc_assisted).collect();
-        if !cc_commits.is_empty() {
-            prompt.push_str("CC-assisted commits:\n");
-            for c in cc_commits.iter().take(5) {
-                prompt.push_str(&format!("- {}: {}\n", c.project_name, c.message));
-            }
-        }
-    }
-
-    prompt.push_str("\nWrite only the summary, no explanations or extra text.");
-
-    // Call claude CLI with haiku model (use platform-appropriate executable name)
     let output = tokio::process::Command::new(crate::platform::get_claude_command())
         .args([
             "-p", &prompt,
@@ -468,40 +446,192 @@ pub async fn generate_ai_summary(report: &DailyReport) -> Result<String, String>
         return Err(format!("Claude failed: {}", stderr));
     }
 
-    let summary = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    // Clean up any markdown formatting from the response
-    let summary = summary
+    let json_str = response
+        .trim_start_matches("```json")
         .trim_start_matches("```")
         .trim_end_matches("```")
-        .trim()
-        .to_string();
+        .trim();
 
-    Ok(summary)
+    let analysis: AiAnalysis = serde_json::from_str(json_str)
+        .map_err(|e| format!("Failed to parse AI response as JSON: {}. Response was: {}", e, json_str))?;
+
+    if !(1..=10).contains(&analysis.work_value_score) {
+        return Err(format!("Invalid work_value_score: {}", analysis.work_value_score));
+    }
+    if !(1..=10).contains(&analysis.workload_score) {
+        return Err(format!("Invalid workload_score: {}", analysis.workload_score));
+    }
+
+    Ok(analysis)
 }
 
-/// Update report with AI summary
-pub fn update_report_with_summary(date: &str, summary: &str) -> Result<DailyReport, String> {
-    let mut report = load_report(date)?;
-    report.ai_summary = Some(summary.to_string());
+fn build_ai_prompt(report: &DailyReport, language: &str) -> String {
+    let mut p = String::new();
 
-    // Regenerate markdown with AI summary at the top
-    let mut new_markdown = String::new();
-    new_markdown.push_str(&format!("# Daily Report — {}\n\n", report.date));
-    new_markdown.push_str(&format!("> **AI Summary**: {}\n\n", summary));
+    writeln!(p, "You are analyzing a developer's daily work activity. Generate a comprehensive daily report.\n").unwrap();
 
-    // Add the rest of the markdown (skip the original header)
-    let original_content = report.markdown
-        .lines()
-        .skip(2) // Skip "# Daily Report — ..." and empty line
-        .collect::<Vec<_>>()
-        .join("\n");
-    new_markdown.push_str(&original_content);
+    // Language instruction
+    if language != "auto" {
+        let instructions: &[(&str, &str)] = &[
+            ("en", "IMPORTANT: Generate the report in English."),
+            ("zh", "重要提示：请使用中文生成报告。"),
+            ("ja", "重要：レポートは日本語で生成してください。"),
+            ("es", "IMPORTANTE: Genere el informe en español."),
+            ("fr", "IMPORTANT : Générez le rapport en français."),
+            ("de", "WICHTIG: Erstellen Sie den Bericht auf Deutsch."),
+            ("ko", "중요: 보고서를 한국어로 생성하세요."),
+        ];
+        let instruction = instructions
+            .iter()
+            .find(|(code, _)| *code == language)
+            .map(|(_, text)| *text)
+            .unwrap_or("IMPORTANT: Generate the report in the specified language.");
+        writeln!(p, "{}\n", instruction).unwrap();
+    }
 
-    report.markdown = new_markdown;
+    // Input data header
+    writeln!(p, "# Input Data\n").unwrap();
+    writeln!(p, "**Date:** {}\n", report.date).unwrap();
 
-    // Save updated report
-    save_report(&report)?;
+    // Sessions grouped by project
+    if !report.sessions.is_empty() {
+        writeln!(p, "## Work Sessions by Project\n").unwrap();
 
-    Ok(report)
+        let project_sessions = group_by(&report.sessions, |s| &s.project_name);
+        for (project, sessions) in &project_sessions {
+            let total_tokens: i64 = sessions.iter().map(|s| s.tokens).sum();
+            let total_cost: f64 = sessions.iter().map(|s| s.cost_usd).sum();
+            let total_duration: i64 = sessions.iter().map(|s| s.duration_minutes).sum();
+
+            writeln!(p, "### {}", project).unwrap();
+            writeln!(p, "- Sessions: {}", sessions.len()).unwrap();
+            writeln!(p, "- Duration: {} minutes", total_duration).unwrap();
+            writeln!(p, "- Tokens: {} ({} tokens)", format_tokens(total_tokens), total_tokens).unwrap();
+            writeln!(p, "- Cost: ${:.2}\n", total_cost).unwrap();
+
+            writeln!(p, "**Session prompts:**").unwrap();
+            for s in sessions {
+                writeln!(p, "- \"{}\"", s.prompt).unwrap();
+            }
+            p.push('\n');
+        }
+    }
+
+    // CC-assisted git commits grouped by project
+    let cc_commits: Vec<_> = report.git_commits.iter().filter(|c| c.is_cc_assisted).collect();
+    if !cc_commits.is_empty() {
+        writeln!(p, "## Claude Code Assisted Git Commits\n").unwrap();
+
+        let commit_groups = group_by(&cc_commits, |c| &c.project_name);
+        for (project, commits) in &commit_groups {
+            writeln!(p, "### {}", project).unwrap();
+            for c in commits {
+                writeln!(p, "- `{}` {}", c.hash, c.message).unwrap();
+            }
+            p.push('\n');
+        }
+    }
+
+    // Summary statistics
+    writeln!(p, "## Summary Statistics\n").unwrap();
+    writeln!(p, "- Total sessions: {}", report.usage_summary.total_sessions).unwrap();
+    writeln!(p, "- Total tokens: {} ({})", format_tokens(report.usage_summary.total_tokens), report.usage_summary.total_tokens).unwrap();
+    writeln!(p, "- Total cost: ${:.2}", report.usage_summary.total_cost_usd).unwrap();
+    writeln!(
+        p,
+        "- Git commits: {} ({} CC-assisted)\n",
+        report.git_commits.len(),
+        cc_commits.len()
+    )
+    .unwrap();
+
+    // Task instructions
+    write!(p, "{}", AI_TASK_INSTRUCTIONS).unwrap();
+
+    p
+}
+
+const AI_TASK_INSTRUCTIONS: &str = "\
+# Task
+
+Generate a professional daily work report in the following JSON format:
+
+```json
+{
+  \"summary\": \"A concise 2-3 sentence executive summary of the day's work\",
+  \"work_value_score\": 7,
+  \"workload_score\": 8,
+  \"markdown_content\": \"## Daily Report\\n\\nDetailed markdown report...\"
+}
+```
+
+**Scoring Guidelines:**
+- `work_value_score` (1-10): Business/technical value created (new features, critical fixes, architecture improvements)
+- `workload_score` (1-10): Amount of work done (sessions, commits, time spent, complexity)
+
+**Markdown Content Requirements:**
+- Group all work by project
+- Highlight key accomplishments and outcomes
+- Include specific details from prompts and commits
+- Use clear headings, bullet points, and formatting
+- Be professional but concise
+- Focus on WHAT was achieved, not just metrics
+
+Return ONLY the JSON object, no other text.";
+
+// ---------------------------------------------------------------------------
+// Shared utilities
+// ---------------------------------------------------------------------------
+
+fn format_tokens(tokens: i64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Truncate string (UTF-8 safe -- works correctly with multibyte characters)
+fn truncate(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
+    }
+}
+
+/// Extract the project name from a filesystem path
+fn project_name_from_path(path: &PathBuf) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Group a slice of items by a key extracted from each item.
+/// Preserves insertion order of first-seen keys via Vec of pairs.
+fn group_by<'a, T, K>(items: &'a [T], key_fn: impl Fn(&'a T) -> &'a K) -> Vec<(&'a K, Vec<&'a T>)>
+where
+    K: Eq + std::hash::Hash,
+{
+    let mut map: HashMap<&'a K, Vec<&'a T>> = HashMap::new();
+    let mut order: Vec<&'a K> = Vec::new();
+
+    for item in items {
+        let k = key_fn(item);
+        if !map.contains_key(k) {
+            order.push(k);
+        }
+        map.entry(k).or_default().push(item);
+    }
+
+    order
+        .into_iter()
+        .filter_map(|k| map.remove(k).map(|v| (k, v)))
+        .collect()
 }

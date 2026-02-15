@@ -37,6 +37,7 @@ Using Claude Code daily? These might sound familiar:
 | 8 | **Todo lists vanish** — CC's TodoWrite is session-scoped | Unified task backlog persisted outside CC sessions |
 | 9 | **Can't find running CC processes** — No way to list all active sessions | Process monitor for all CC instances across projects |
 | 10 | **Session names are useless** — Auto-generated names like `a1b2c3d4` | Custom session labels and tags |
+| 11 | **No multi-account support** — Switching between work/personal API keys or accounts requires manual env var juggling | Multi-environment manager with custom API keys, models, and config directories |
 
 > Sources: [#7069](https://github.com/anthropics/claude-code/issues/7069), [#4707](https://github.com/anthropics/claude-code/issues/4707), [#2954](https://github.com/anthropics/claude-code/issues/2954), [#4689](https://github.com/anthropics/claude-code/issues/4689), [#12455](https://github.com/anthropics/claude-code/issues/12455), and community feedback.
 
@@ -48,6 +49,7 @@ Using Claude Code daily? These might sound familiar:
 - **Session Search** — Full-text search across all session history with one-click resume
 - **Usage Dashboard** — Token/cost tracking per project, per session, with OAuth usage meters
 - **Daily Report** — Auto-generated summary of sessions, git commits, and usage stats
+- **Multi-Environment Support** — Manage multiple Claude accounts/configs (work/personal), custom API keys, models, and config directories
 
 ### Screenshots
 
@@ -168,6 +170,7 @@ Alice 是一个 macOS 菜单栏桌面助手，为 [Claude Code](https://docs.ant
 | 8 | **待办列表消失** — CC 的 TodoWrite 是会话级别的 | 持久化的统一任务待办 |
 | 9 | **找不到运行中的 CC 进程** — 无法列出所有活跃会话 | 跨项目的进程监控器 |
 | 10 | **会话名无意义** — 自动生成的名字如 `a1b2c3d4` | 自定义会话标签和分类 |
+| 11 | **不支持多账户** — 切换工作/个人 API key 或账户需要手动设置环境变量 | 多环境管理器，支持自定义 API key、模型和配置目录 |
 
 > 来源：[#7069](https://github.com/anthropics/claude-code/issues/7069)、[#4707](https://github.com/anthropics/claude-code/issues/4707)、[#2954](https://github.com/anthropics/claude-code/issues/2954)、[#4689](https://github.com/anthropics/claude-code/issues/4689)、[#12455](https://github.com/anthropics/claude-code/issues/12455) 及社区反馈。
 
@@ -179,6 +182,7 @@ Alice 是一个 macOS 菜单栏桌面助手，为 [Claude Code](https://docs.ant
 - **会话搜索** — 全文搜索所有历史会话，一键恢复
 - **用量仪表盘** — 按项目、按会话追踪 Token 和费用，支持 OAuth 用量指标
 - **日报生成** — 自动汇总当日会话、Git 提交和用量统计
+- **多环境支持** — 管理多个 Claude 账户/配置（工作/个人），自定义 API key、模型和配置目录
 
 ### 环境要求
 

@@ -1,9 +1,6 @@
 // Usage tracking and OAuth API integration
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// OAuth usage response from Anthropic API
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,27 +107,25 @@ fn read_credentials_from_keychain() -> Option<ClaudeCredentials> {
     // Parse the JSON credentials
     let creds: KeychainCredentials = serde_json::from_str(json_str).ok()?;
 
-    // Extract OAuth token from claudeAiOauth
-    if let Some(oauth) = creds.claude_ai_oauth {
-        // Format subscription type as display name (e.g., "max" -> "Claude Max")
-        let account_info = oauth.subscription_type.map(|s| {
-            match s.to_lowercase().as_str() {
-                "max" => "Claude Max".to_string(),
-                "pro" => "Claude Pro".to_string(),
-                "free" => "Claude Free".to_string(),
-                "team" => "Claude Team".to_string(),
-                "enterprise" => "Claude Enterprise".to_string(),
-                other => format!("Claude {}", other),
-            }
-        });
+    let oauth = creds.claude_ai_oauth?;
 
-        return Some(ClaudeCredentials {
-            access_token: Some(oauth.access_token),
-            account_email: account_info,
-        });
-    }
+    // Format subscription type as display name (e.g., "max" -> "Claude Max")
+    let plan_display = oauth.subscription_type.map(|s| {
+        let label = match s.to_lowercase().as_str() {
+            "max" => "Max",
+            "pro" => "Pro",
+            "free" => "Free",
+            "team" => "Team",
+            "enterprise" => "Enterprise",
+            _ => return format!("Claude {}", s),
+        };
+        format!("Claude {}", label)
+    });
 
-    None
+    Some(ClaudeCredentials {
+        access_token: Some(oauth.access_token),
+        account_email: plan_display,
+    })
 }
 
 /// Keychain credentials structure (matches Claude Code storage format)
@@ -148,8 +143,10 @@ struct KeychainCredentials {
 struct ClaudeAiOAuth {
     access_token: String,
     #[serde(default)]
+    #[allow(dead_code)]
     refresh_token: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     expires_at: Option<i64>,
     #[serde(default)]
     subscription_type: Option<String>,
@@ -162,6 +159,7 @@ struct ClaudeCredentialsFile {
     #[serde(default)]
     account_email: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     refresh_token: Option<String>,
 }
 
@@ -173,15 +171,17 @@ pub struct ClaudeCredentials {
 
 /// Fetch live usage from Anthropic OAuth API
 pub async fn fetch_oauth_usage(access_token: &str) -> Result<OAuthUsageResponse, String> {
+    const MAX_ATTEMPTS: u32 = 2;
+    const RETRY_DELAY_MS: u64 = 500;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-    // Retry up to 2 times on connection errors
     let mut last_error = String::new();
-    for attempt in 0..2 {
+    for attempt in 1..=MAX_ATTEMPTS {
         match client
             .get("https://api.anthropic.com/api/oauth/usage")
             .header("Authorization", format!("Bearer {}", access_token))
@@ -204,9 +204,8 @@ pub async fn fetch_oauth_usage(access_token: &str) -> Result<OAuthUsageResponse,
             }
             Err(e) => {
                 last_error = format!("Failed to fetch usage: {}", e);
-                if attempt < 1 {
-                    // Wait a bit before retry
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
                 }
             }
         }
@@ -267,23 +266,22 @@ pub fn estimate_time_to_limit(
 }
 
 /// Parse reset time to countdown string
+#[allow(dead_code)]
 pub fn format_reset_countdown(reset_at: &str) -> String {
-    if let Ok(reset_time) = chrono::DateTime::parse_from_rfc3339(reset_at) {
-        let now = chrono::Utc::now();
-        let duration = reset_time.signed_duration_since(now);
+    let Ok(reset_time) = chrono::DateTime::parse_from_rfc3339(reset_at) else {
+        return "Unknown".to_string();
+    };
 
-        let hours = duration.num_hours();
-        let minutes = duration.num_minutes() % 60;
+    let duration = reset_time.signed_duration_since(chrono::Utc::now());
+    let hours = duration.num_hours();
+    let minutes = duration.num_minutes() % 60;
 
-        if hours > 0 {
-            format!("{}h {}m", hours, minutes)
-        } else if minutes > 0 {
-            format!("{}m", minutes)
-        } else {
-            "Soon".to_string()
-        }
+    if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m", minutes)
     } else {
-        "Unknown".to_string()
+        "Soon".to_string()
     }
 }
 
@@ -297,26 +295,21 @@ pub struct UsageHistory {
 impl UsageHistory {
     const MAX_HISTORY_POINTS: usize = 100;
 
-    pub fn add_session_point(&mut self, percent: f64) {
+    fn add_point(history: &mut Vec<(i64, f64)>, percent: f64) {
         let now = chrono::Utc::now().timestamp_millis();
-        self.session_history.push((now, percent));
-
-        // Trim old points
-        if self.session_history.len() > Self::MAX_HISTORY_POINTS {
-            self.session_history = self.session_history
-                .split_off(self.session_history.len() - Self::MAX_HISTORY_POINTS);
+        history.push((now, percent));
+        if history.len() > Self::MAX_HISTORY_POINTS {
+            *history = history.split_off(history.len() - Self::MAX_HISTORY_POINTS);
         }
     }
 
-    pub fn add_weekly_point(&mut self, percent: f64) {
-        let now = chrono::Utc::now().timestamp_millis();
-        self.weekly_history.push((now, percent));
+    pub fn add_session_point(&mut self, percent: f64) {
+        Self::add_point(&mut self.session_history, percent);
+    }
 
-        // Trim old points
-        if self.weekly_history.len() > Self::MAX_HISTORY_POINTS {
-            self.weekly_history = self.weekly_history
-                .split_off(self.weekly_history.len() - Self::MAX_HISTORY_POINTS);
-        }
+    #[allow(dead_code)]
+    pub fn add_weekly_point(&mut self, percent: f64) {
+        Self::add_point(&mut self.weekly_history, percent);
     }
 
     pub fn get_session_burn_rate(&self) -> Option<f64> {
@@ -328,14 +321,9 @@ impl UsageHistory {
     }
 }
 
-/// Get the Alice data directory
-fn get_alice_dir() -> PathBuf {
-    crate::platform::get_alice_dir()
-}
-
 /// Save usage history to disk
 pub fn save_usage_history(history: &UsageHistory) -> Result<(), String> {
-    let path = get_alice_dir().join("usage_history.json");
+    let path = crate::platform::get_alice_dir().join("usage_history.json");
     let content = serde_json::to_string_pretty(history)
         .map_err(|e| format!("Failed to serialize history: {}", e))?;
     std::fs::write(&path, content)
@@ -345,15 +333,11 @@ pub fn save_usage_history(history: &UsageHistory) -> Result<(), String> {
 
 /// Load usage history from disk
 pub fn load_usage_history() -> UsageHistory {
-    let path = get_alice_dir().join("usage_history.json");
-    if path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(history) = serde_json::from_str(&content) {
-                return history;
-            }
-        }
-    }
-    UsageHistory::default()
+    let path = crate::platform::get_alice_dir().join("usage_history.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
 }
 
 /// Anthropic service status
@@ -378,6 +362,47 @@ pub struct StatusIncident {
     pub updated_at: String,
 }
 
+/// Atlassian Statuspage API response types (used for typed deserialization)
+#[derive(Deserialize)]
+struct StatusPageResponse {
+    status: StatusPageInfo,
+}
+
+#[derive(Deserialize)]
+struct StatusPageInfo {
+    #[serde(default)]
+    indicator: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IncidentsResponse {
+    #[serde(default)]
+    incidents: Vec<StatusIncidentRaw>,
+}
+
+#[derive(Deserialize)]
+struct StatusIncidentRaw {
+    name: String,
+    status: String,
+    impact: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<StatusIncidentRaw> for StatusIncident {
+    fn from(raw: StatusIncidentRaw) -> Self {
+        Self {
+            name: raw.name,
+            status: raw.status,
+            impact: raw.impact,
+            created_at: raw.created_at,
+            updated_at: raw.updated_at,
+        }
+    }
+}
+
 /// Fetch Anthropic service status from status page API
 pub async fn fetch_anthropic_status() -> Result<AnthropicStatus, String> {
     let client = reqwest::Client::new();
@@ -393,28 +418,16 @@ pub async fn fetch_anthropic_status() -> Result<AnthropicStatus, String> {
         return Err(format!("Status API error: {}", response.status()));
     }
 
-    let status_json: serde_json::Value = response
+    let parsed: StatusPageResponse = response
         .json()
         .await
         .map_err(|e| format!("Failed to parse status: {}", e))?;
 
-    // Parse status response
-    let status_info = status_json.get("status").ok_or("Missing status field")?;
-    let indicator = status_info
-        .get("indicator")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let description = status_info
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Unknown");
-
-    // Fetch incidents
     let incidents = fetch_incidents(&client).await.unwrap_or_default();
 
     Ok(AnthropicStatus {
-        status: indicator.to_string(),
-        description: description.to_string(),
+        status: parsed.status.indicator.unwrap_or_else(|| "unknown".to_string()),
+        description: parsed.status.description.unwrap_or_else(|| "Unknown".to_string()),
         incidents,
         last_updated: chrono::Utc::now().timestamp_millis(),
     })
@@ -432,28 +445,10 @@ async fn fetch_incidents(client: &reqwest::Client) -> Result<Vec<StatusIncident>
         return Ok(vec![]);
     }
 
-    let json: serde_json::Value = response
+    let parsed: IncidentsResponse = response
         .json()
         .await
         .map_err(|e| format!("Failed to parse incidents: {}", e))?;
 
-    let incidents = json
-        .get("incidents")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|incident| {
-                    Some(StatusIncident {
-                        name: incident.get("name")?.as_str()?.to_string(),
-                        status: incident.get("status")?.as_str()?.to_string(),
-                        impact: incident.get("impact")?.as_str()?.to_string(),
-                        created_at: incident.get("created_at")?.as_str()?.to_string(),
-                        updated_at: incident.get("updated_at")?.as_str()?.to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(incidents)
+    Ok(parsed.incidents.into_iter().map(StatusIncident::from).collect())
 }

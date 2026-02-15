@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from "react";
+import { createContext, useContext, useState, useEffect, useCallback, useMemo, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Theme } from "../lib/types";
 
@@ -12,54 +12,31 @@ interface ThemeContextValue {
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
-function getSystemTheme(): ResolvedTheme {
-  if (typeof window !== "undefined" && window.matchMedia) {
-    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-  }
-  return "dark";
-}
-
-function resolveTheme(theme: Theme): ResolvedTheme {
-  if (theme === "system") {
-    return getSystemTheme();
-  }
-  return theme;
-}
+const darkModeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [theme, setThemeState] = useState<Theme>("system");
-  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(getSystemTheme());
+  const [systemIsDark, setSystemIsDark] = useState(darkModeQuery.matches);
+
+  const resolvedTheme: ResolvedTheme = theme === "system"
+    ? (systemIsDark ? "dark" : "light")
+    : theme;
 
   // Load theme from config on mount
   useEffect(() => {
-    const loadTheme = async () => {
-      try {
-        const config = await invoke<{ theme: Theme }>("get_config", {});
-        const loadedTheme = config.theme || "system";
-        setThemeState(loadedTheme);
-        setResolvedTheme(resolveTheme(loadedTheme));
-      } catch (error) {
-        console.error("Failed to load theme config:", error);
-      }
-    };
-    loadTheme();
+    invoke<{ theme: Theme }>("get_config", {})
+      .then((config) => setThemeState(config.theme || "system"))
+      .catch((error) => console.error("Failed to load theme config:", error));
   }, []);
 
   // Listen for system theme changes
   useEffect(() => {
-    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    const handleChange = (e: MediaQueryListEvent) => setSystemIsDark(e.matches);
+    darkModeQuery.addEventListener("change", handleChange);
+    return () => darkModeQuery.removeEventListener("change", handleChange);
+  }, []);
 
-    const handleChange = () => {
-      if (theme === "system") {
-        setResolvedTheme(getSystemTheme());
-      }
-    };
-
-    mediaQuery.addEventListener("change", handleChange);
-    return () => mediaQuery.removeEventListener("change", handleChange);
-  }, [theme]);
-
-  // Apply theme to document
+  // Apply theme class to document root
   useEffect(() => {
     const root = document.documentElement;
     root.classList.remove("light", "dark");
@@ -67,24 +44,23 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, [resolvedTheme]);
 
   const setTheme = useCallback(async (newTheme: Theme) => {
-    try {
-      await invoke("update_config", { key: "theme", value: newTheme });
-      setThemeState(newTheme);
-      setResolvedTheme(resolveTheme(newTheme));
-    } catch (error) {
-      console.error("Failed to save theme:", error);
-      throw error;
-    }
+    await invoke("update_config", { key: "theme", value: newTheme });
+    setThemeState(newTheme);
   }, []);
 
+  const value = useMemo<ThemeContextValue>(
+    () => ({ theme, resolvedTheme, setTheme }),
+    [theme, resolvedTheme, setTheme],
+  );
+
   return (
-    <ThemeContext.Provider value={{ theme, resolvedTheme, setTheme }}>
+    <ThemeContext.Provider value={value}>
       {children}
     </ThemeContext.Provider>
   );
 }
 
-export function useTheme() {
+export function useTheme(): ThemeContextValue {
   const context = useContext(ThemeContext);
   if (!context) {
     throw new Error("useTheme must be used within a ThemeProvider");

@@ -5,16 +5,6 @@
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
-/// Notification types
-#[derive(Debug, Clone, serde::Serialize)]
-pub enum NotificationType {
-    TaskCompleted,
-    TaskError,
-    NeedsInput,
-    QueueStarted,
-    DailyReport,
-}
-
 /// Send a notification for task completion
 pub fn notify_task_completed(
     app: &AppHandle,
@@ -23,15 +13,13 @@ pub fn notify_task_completed(
     cost: f64,
     duration_secs: u64,
 ) -> Result<(), String> {
-    let duration_str = format_duration(duration_secs);
     let title = format!("✓ {}", project_name);
     let body = format!(
         "\"{}\" finished ({}, ${:.2})",
-        truncate_string(prompt_snippet, 50),
-        duration_str,
+        truncate_str(prompt_snippet, 50),
+        format_duration(duration_secs),
         cost
     );
-
     send_notification(app, &title, &body)
 }
 
@@ -42,20 +30,14 @@ pub fn notify_task_error(
     error_message: &str,
 ) -> Result<(), String> {
     let title = format!("✗ {}", project_name);
-    let body = format!("Error: {}", truncate_string(error_message, 100));
-
+    let body = format!("Error: {}", truncate_str(error_message, 100));
     send_notification(app, &title, &body)
 }
 
 /// Send a notification when input is needed
-pub fn notify_needs_input(
-    app: &AppHandle,
-    project_name: &str,
-) -> Result<(), String> {
+pub fn notify_needs_input(app: &AppHandle, project_name: &str) -> Result<(), String> {
     let title = format!("⚠ {}", project_name);
-    let body = "Waiting for user input";
-
-    send_notification(app, &title, body)
+    send_notification(app, &title, "Waiting for user input")
 }
 
 /// Send a notification when queue task starts
@@ -65,8 +47,7 @@ pub fn notify_queue_started(
     prompt_snippet: &str,
 ) -> Result<(), String> {
     let title = format!("▶ Queue: {}", project_name);
-    let body = format!("Starting: \"{}\"", truncate_string(prompt_snippet, 50));
-
+    let body = format!("Starting: \"{}\"", truncate_str(prompt_snippet, 50));
     send_notification(app, &title, &body)
 }
 
@@ -77,18 +58,12 @@ pub fn notify_daily_report(
     session_count: i32,
     total_cost: f64,
 ) -> Result<(), String> {
-    let title = "📋 Daily Report";
-    let body = format!(
-        "{}: {} sessions, ${:.2}",
-        date, session_count, total_cost
-    );
-
-    send_notification(app, title, &body)
+    let body = format!("{}: {} sessions, ${:.2}", date, session_count, total_cost);
+    send_notification(app, "📋 Daily Report", &body)
 }
 
 /// Core notification sending function
 fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
-    // Send visual notification
     app.notification()
         .builder()
         .title(title)
@@ -96,9 +71,7 @@ fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), Str
         .show()
         .map_err(|e| e.to_string())?;
 
-    // Check if voice notifications are enabled
-    let config = crate::config::load_config();
-    if config.voice_notifications {
+    if crate::config::load_config().voice_notifications {
         speak_notification(title, body);
     }
 
@@ -107,7 +80,6 @@ fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), Str
 
 /// Speak notification using platform-native TTS
 fn speak_notification(title: &str, body: &str) {
-    // Clean up the text for speech
     let clean_title = title
         .replace("✓", "Completed:")
         .replace("✗", "Error:")
@@ -117,47 +89,42 @@ fn speak_notification(title: &str, body: &str) {
 
     let text = format!("{} {}", clean_title.trim(), body);
 
-    #[cfg(target_os = "macos")]
-    {
-        // macOS: use the built-in `say` command
-        std::thread::spawn(move || {
-            let _ = std::process::Command::new("say")
-                .args(["-v", "Samantha", "-r", "200", &text])
-                .output();
-        });
-    }
+    std::thread::spawn(move || {
+        let _ = build_tts_command(&text).output();
+    });
+}
 
-    #[cfg(target_os = "windows")]
-    {
-        // Windows: use PowerShell System.Speech.Synthesis
-        // Escape single quotes in text to prevent PowerShell injection
-        let escaped = text.replace('\'', "''");
-        std::thread::spawn(move || {
-            let _ = std::process::Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-Command",
-                    &format!(
-                        "Add-Type -AssemblyName System.Speech; \
-                         $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
-                         $s.Rate = 1; \
-                         $s.Speak('{}')",
-                        escaped
-                    ),
-                ])
-                .output();
-        });
-    }
+/// Build a platform-specific TTS command
+#[cfg(target_os = "macos")]
+fn build_tts_command(text: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("say");
+    cmd.args(["-v", "Samantha", "-r", "200", text]);
+    cmd
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        // Linux: try espeak if available
-        std::thread::spawn(move || {
-            let _ = std::process::Command::new("espeak")
-                .args([&text])
-                .output();
-        });
-    }
+#[cfg(target_os = "windows")]
+fn build_tts_command(text: &str) -> std::process::Command {
+    let escaped = text.replace('\'', "''");
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-Command",
+        &format!(
+            "Add-Type -AssemblyName System.Speech; \
+             $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
+             $s.Rate = 1; \
+             $s.Speak('{}')",
+            escaped
+        ),
+    ]);
+    cmd
+}
+
+#[cfg(target_os = "linux")]
+fn build_tts_command(text: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("espeak");
+    cmd.arg(text);
+    cmd
 }
 
 /// Format duration in human-readable format
@@ -174,13 +141,17 @@ fn format_duration(seconds: u64) -> String {
     }
 }
 
-/// Truncate string to max length with ellipsis
-fn truncate_string(s: &str, max_len: usize) -> String {
+/// Truncate string to max length with ellipsis, respecting char boundaries
+fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len - 3])
+        return s.to_string();
     }
+    // Find a valid char boundary at or before max_len - 3
+    let mut end = max_len - 3;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 /// Session status change event for frontend
@@ -195,15 +166,10 @@ pub struct SessionStatusEvent {
 }
 
 /// Emit session status change to frontend and send notification
-pub fn emit_session_status(
-    app: &AppHandle,
-    event: SessionStatusEvent,
-) -> Result<(), String> {
-    // Emit to frontend
+pub fn emit_session_status(app: &AppHandle, event: SessionStatusEvent) -> Result<(), String> {
     app.emit("session-status-changed", &event)
         .map_err(|e| e.to_string())?;
 
-    // Send notification based on status
     match event.status.as_str() {
         "completed" => {
             if let Some(cost) = event.cost {
@@ -212,7 +178,7 @@ pub fn emit_session_status(
                     &event.project_name,
                     event.prompt_snippet.as_deref().unwrap_or("Task"),
                     cost,
-                    0, // Duration would need to be tracked separately
+                    0,
                 )?;
             }
         }

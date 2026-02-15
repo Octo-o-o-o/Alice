@@ -476,3 +476,13 @@ body {
 :root.light .hover\:border-white\/\[0\.1\]:hover {
   border-color: rgba(0, 0, 0, 0.15) !important;
 }
+
+:root.light .bg-white\/\[0\.01\],
+:root.light .bg-white\/\[0\.02\] {
+  background-color: var(--color-bg-card) !important;
+}
+
+:root.light .bg-white\/\[0\.04\],
+:root.light .hover\:bg-white\/\[0\.04\]:hover {
+  background-color: rgba(0, 0, 0, 0.04) !important;
+}

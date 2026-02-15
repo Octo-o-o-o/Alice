@@ -1,17 +1,30 @@
-// TypeScript types matching the Rust backend
+// TypeScript types matching the Rust backend structs.
+// IMPORTANT: Field names and types must stay in sync with the Rust backend.
+
+// --- Enums & union types ---
 
 export type SessionStatus = "idle" | "active" | "completed" | "error" | "needs_input";
-
-// Theme setting
+export type ProviderId = "claude" | "codex" | "gemini";
 export type Theme = "system" | "light" | "dark";
-
-// Terminal app setting
 export type TerminalApp = "background" | "system" | "iterm2" | "windows_terminal" | "warp" | "custom";
-
-// Auto action type
 export type AutoActionType = "none" | "sleep" | "shutdown";
+export type TaskStatus = "backlog" | "queued" | "running" | "completed" | "failed" | "skipped";
 
-// Claude environment configuration (for multi-environment support)
+// --- Configuration ---
+
+export interface AutoActionConfig {
+  enabled: boolean;
+  action_type: AutoActionType;
+  delay_minutes: number;
+}
+
+export interface AutoActionState {
+  timer_active: boolean;
+  action_type: string;
+  remaining_seconds: number;
+  total_seconds: number;
+}
+
 export interface ClaudeEnvironment {
   id: string;
   name: string;
@@ -22,32 +35,17 @@ export interface ClaudeEnvironment {
   enabled: boolean;
 }
 
-// Auto action configuration
-export interface AutoActionConfig {
-  enabled: boolean;
-  action_type: AutoActionType;
-  delay_minutes: number;
-}
-
-// Auto action state
-export interface AutoActionState {
-  timer_active: boolean;
-  action_type: string;
-  remaining_seconds: number;
-  total_seconds: number;
-}
-
 export interface TerminalOption {
   value: string;
   label: string;
 }
 
-// App configuration
 export interface AppConfig {
   onboarding_completed: boolean;
   launch_at_login: boolean;
   auto_hide_on_blur: boolean;
   notification_sound: boolean;
+  voice_notifications: boolean;
   notifications: {
     on_task_completed: boolean;
     on_task_error: boolean;
@@ -58,6 +56,7 @@ export interface AppConfig {
   hooks_installed: boolean;
   data_retention_days: number;
   daily_report_time: string;
+  report_language: string;
   theme: Theme;
   terminal_app: TerminalApp;
   custom_terminal_command: string;
@@ -67,10 +66,7 @@ export interface AppConfig {
   active_environment_id?: string | null;
 }
 
-export interface QueueStartResult {
-  started: boolean;
-  needs_terminal_choice: boolean;
-}
+// --- Sessions ---
 
 export interface Session {
   session_id: string;
@@ -93,6 +89,7 @@ export interface Session {
   cache_write_tokens: number;
   model: string | null;
   status: SessionStatus;
+  provider: ProviderId;
 }
 
 export interface SessionMessage {
@@ -103,6 +100,14 @@ export interface SessionMessage {
   tokens_in: number | null;
   tokens_out: number | null;
   model: string | null;
+  images: ImageContent[];
+}
+
+export interface ImageContent {
+  source_type: string; // "base64" or "path"
+  media_type: string | null; // e.g., "image/png", "image/jpeg"
+  data: string | null; // base64 data
+  path: string | null; // file path
 }
 
 export interface SessionDetail {
@@ -110,13 +115,7 @@ export interface SessionDetail {
   messages: SessionMessage[];
 }
 
-export type TaskStatus =
-  | "backlog"
-  | "queued"
-  | "running"
-  | "completed"
-  | "failed"
-  | "skipped";
+// --- Tasks ---
 
 export interface Task {
   id: string;
@@ -141,7 +140,15 @@ export interface Task {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  provider: ProviderId;
 }
+
+export interface QueueStartResult {
+  started: boolean;
+  needs_terminal_choice: boolean;
+}
+
+// --- Usage ---
 
 export interface UsageStats {
   total_tokens: number;
@@ -170,14 +177,6 @@ export interface ProjectUsage {
   session_count: number;
 }
 
-// Events from Rust backend
-export interface SessionUpdateEvent {
-  session_id: string;
-  project_path: string;
-  status: string;
-}
-
-// Live OAuth usage stats
 export interface LiveUsageStats {
   session_percent: number;
   session_reset_at: string | null;
@@ -191,14 +190,32 @@ export interface LiveUsageStats {
   error: string | null;
 }
 
-// Queue status event
+export interface ProviderUsage {
+  id: ProviderId;
+  session_percent: number;
+  session_reset_at: string | null;
+  weekly_percent: number | null;
+  weekly_reset_at: string | null;
+  last_updated: number;
+  error: string | null;
+}
+
+// --- Events ---
+
+export interface SessionUpdateEvent {
+  session_id: string;
+  project_path: string;
+  status: string;
+}
+
 export interface QueueStatusEvent {
   is_running: boolean;
   current_task_id: string | null;
   queued_count: number;
 }
 
-// Daily report types
+// --- Daily reports ---
+
 export interface DailyReport {
   date: string;
   sessions: SessionSummary[];
@@ -208,6 +225,8 @@ export interface DailyReport {
   generated_at: number;
   markdown: string;
   ai_summary?: string;
+  work_value_score?: number;
+  workload_score?: number;
 }
 
 export interface SessionSummary {
@@ -248,7 +267,8 @@ export interface TaskSummary {
   priority: string;
 }
 
-// Anthropic service status
+// --- Service status ---
+
 export interface AnthropicStatus {
   status: string; // "none" | "minor" | "major" | "critical"
   description: string;
@@ -264,7 +284,8 @@ export interface StatusIncident {
   updated_at: string;
 }
 
-// Onboarding status for setup wizard
+// --- Onboarding & system info ---
+
 export interface OnboardingStatus {
   cli_installed: boolean;
   cli_version: string | null;
@@ -277,7 +298,6 @@ export interface OnboardingStatus {
   existing_sessions_count: number;
 }
 
-// Hook verification result
 export interface HookVerifyResult {
   success: boolean;
   settings_path: string;
@@ -286,7 +306,6 @@ export interface HookVerifyResult {
   session_end_installed: boolean;
 }
 
-// System info for config view
 export interface SystemInfo {
   claude_installed: boolean;
   claude_version: string | null;
@@ -298,7 +317,6 @@ export interface SystemInfo {
   };
 }
 
-// Scan result for directory scanning
 export interface ScanResult {
   session_count: number;
   project_count: number;
@@ -306,7 +324,8 @@ export interface ScanResult {
   projects: string[];
 }
 
-// Favorite prompt
+// --- Favorites ---
+
 export interface Favorite {
   id: string;
   name: string;
@@ -316,4 +335,16 @@ export interface Favorite {
   sort_order: number;
   created_at: string;
   updated_at: string;
+}
+
+// --- Provider status ---
+
+export interface ProviderStatus {
+  id: ProviderId;
+  display_name: string;
+  installed: boolean;
+  version: string | null;
+  data_dir: string;
+  enabled: boolean;
+  custom_data_dir: string | null;
 }

@@ -1,7 +1,5 @@
 // Task Queue Engine - Execute tasks via Claude CLI subprocess
 
-#![allow(dead_code)]
-
 use crate::database::{self, Task, TaskStatus};
 use crate::notification;
 use serde::{Deserialize, Serialize};
@@ -39,6 +37,59 @@ pub struct QueueStatusEvent {
     pub queued_count: usize,
 }
 
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Extract the project display name from a task, falling back to "Unknown".
+fn task_project_name(task: &Task) -> String {
+    task.project_path
+        .as_ref()
+        .map(|p| crate::platform::path_file_name(p))
+        .unwrap_or("Unknown")
+        .to_string()
+}
+
+/// Apply environment config variables to a `tokio::process::Command`.
+fn apply_env_config(cmd: &mut Command, env: &crate::config::ClaudeEnvironment) {
+    if !env.config_dir.is_empty() {
+        cmd.env("CLAUDE_CONFIG_DIR", &env.config_dir);
+    }
+    if let Some(ref api_key) = env.api_key {
+        if !api_key.is_empty() {
+            cmd.env("ANTHROPIC_API_KEY", api_key);
+        }
+    }
+    if let Some(ref model) = env.model {
+        if !model.is_empty() {
+            cmd.env("ANTHROPIC_MODEL", model);
+        }
+    }
+}
+
+/// Build a shell-compatible env prefix string for terminal execution.
+fn build_env_prefix(env: &crate::config::ClaudeEnvironment) -> String {
+    let mut prefix = String::new();
+    if !env.config_dir.is_empty() {
+        prefix.push_str(&format!("CLAUDE_CONFIG_DIR='{}' ", env.config_dir));
+    }
+    if let Some(ref api_key) = env.api_key {
+        if !api_key.is_empty() {
+            prefix.push_str(&format!("ANTHROPIC_API_KEY='{}' ", api_key));
+        }
+    }
+    if let Some(ref model) = env.model {
+        if !model.is_empty() {
+            prefix.push_str(&format!("ANTHROPIC_MODEL='{}' ", model));
+        }
+    }
+    prefix
+}
+
+// ============================================================================
+// QueueExecutor
+// ============================================================================
+
 impl QueueExecutor {
     pub fn new(app: AppHandle) -> Self {
         Self {
@@ -60,13 +111,12 @@ impl QueueExecutor {
         self.running.store(false, Ordering::SeqCst);
         self.emit_status().await;
 
-        // Check if we should start auto action timer (all tasks completed)
-        let remaining_tasks = database::get_tasks(&self.app, Some(TaskStatus::Queued), None)
-            .map(|tasks| tasks.len())
+        // Start auto-action timer if all tasks have been processed
+        let remaining = database::get_tasks(&self.app, Some(TaskStatus::Queued), None)
+            .map(|t| t.len())
             .unwrap_or(0);
 
-        if remaining_tasks == 0 {
-            // All tasks completed, start auto action timer if enabled
+        if remaining == 0 {
             if let Err(e) = crate::auto_action::start_auto_action_timer(&self.app).await {
                 tracing::debug!("Auto action timer not started: {}", e);
             }
@@ -86,57 +136,47 @@ impl QueueExecutor {
     }
 
     /// Get current task ID
+    #[allow(dead_code)]
     pub async fn current_task_id(&self) -> Option<String> {
         self.current_task.lock().await.clone()
     }
 
-    /// Find the next task that has all dependencies satisfied
+    /// Find the next task whose dependencies are satisfied.
+    /// Tasks with failed/skipped dependencies are automatically marked as skipped.
     fn find_next_executable_task(&self, tasks: &[Task]) -> Option<Task> {
-        // Get all tasks to check dependency status
         let all_tasks = database::get_tasks(&self.app, None, None).ok()?;
 
         for task in tasks {
-            if let Some(ref depends_on_id) = task.depends_on {
-                // Find the dependency task
-                let dependency = all_tasks.iter().find(|t| &t.id == depends_on_id);
+            let depends_on_id = match task.depends_on {
+                Some(ref id) => id,
+                None => return Some(task.clone()),
+            };
 
-                match dependency {
-                    Some(dep) => {
-                        // Check if dependency is completed
-                        if dep.status == TaskStatus::Completed {
-                            // Dependency is satisfied, this task can run
-                            return Some(task.clone());
-                        } else if dep.status == TaskStatus::Failed || dep.status == TaskStatus::Skipped {
-                            // Dependency failed, skip this task
-                            tracing::warn!(
-                                "Skipping task {} because dependency {} has status {:?}",
-                                task.id, depends_on_id, dep.status
-                            );
-                            let _ = database::update_task(
-                                &self.app,
-                                &task.id,
-                                Some(TaskStatus::Skipped),
-                                None,
-                                None,
-                                None,
-                            );
-                            continue;
-                        }
-                        // Dependency not yet completed, skip to next task
-                        continue;
-                    }
-                    None => {
-                        // Dependency task not found, treat as satisfied (may have been deleted)
-                        tracing::warn!(
-                            "Dependency {} for task {} not found, proceeding anyway",
-                            depends_on_id, task.id
-                        );
-                        return Some(task.clone());
-                    }
+            let dependency = all_tasks.iter().find(|t| &t.id == depends_on_id);
+
+            match dependency {
+                None => {
+                    // Dependency deleted -- treat as satisfied
+                    tracing::warn!(
+                        "Dependency {} for task {} not found, proceeding anyway",
+                        depends_on_id, task.id
+                    );
+                    return Some(task.clone());
                 }
-            } else {
-                // No dependency, this task can run
-                return Some(task.clone());
+                Some(dep) if dep.status == TaskStatus::Completed => {
+                    return Some(task.clone());
+                }
+                Some(dep) if dep.status == TaskStatus::Failed || dep.status == TaskStatus::Skipped => {
+                    tracing::warn!(
+                        "Skipping task {} because dependency {} has status {:?}",
+                        task.id, depends_on_id, dep.status
+                    );
+                    let _ = database::update_task(
+                        &self.app, &task.id, Some(TaskStatus::Skipped), None, None, None,
+                    );
+                }
+                // Dependency still pending/running -- skip to next candidate
+                _ => {}
             }
         }
 
@@ -145,14 +185,14 @@ impl QueueExecutor {
 
     /// Emit queue status to frontend
     async fn emit_status(&self) {
-        let queued = database::get_tasks(&self.app, Some(TaskStatus::Queued), None)
-            .map(|tasks| tasks.len())
+        let queued_count = database::get_tasks(&self.app, Some(TaskStatus::Queued), None)
+            .map(|t| t.len())
             .unwrap_or(0);
 
         let event = QueueStatusEvent {
             is_running: self.running.load(Ordering::SeqCst),
             current_task_id: self.current_task.lock().await.clone(),
-            queued_count: queued,
+            queued_count,
         };
 
         let _ = self.app.emit("queue-status", &event);
@@ -161,44 +201,31 @@ impl QueueExecutor {
     /// Run the queue loop
     async fn run_queue(&self) {
         while self.running.load(Ordering::SeqCst) {
-            // Get next queued task
             let tasks = match database::get_tasks(&self.app, Some(TaskStatus::Queued), None) {
-                Ok(tasks) => tasks,
+                Ok(t) => t,
                 Err(e) => {
                     tracing::error!("Failed to get queued tasks: {}", e);
                     break;
                 }
             };
 
-            // Find the next task that has all dependencies satisfied
-            let task = self.find_next_executable_task(&tasks);
-
-            let task = match task {
+            let task = match self.find_next_executable_task(&tasks) {
                 Some(t) => t,
                 None => {
                     if tasks.is_empty() {
-                        // No more tasks, stop queue
                         tracing::info!("Queue empty, stopping executor");
                     } else {
-                        // Tasks exist but all have unmet dependencies
                         tracing::info!("All queued tasks have unmet dependencies, stopping executor");
                     }
                     break;
                 }
             };
 
-            // Execute the task
+            let project_name = task_project_name(&task);
+
             match self.execute_task(&task).await {
                 Ok(result) => {
                     tracing::info!("Task {} completed with exit code {}", task.id, result.exit_code);
-
-                    // Notify completion
-                    let project_name = task.project_path
-                        .as_ref()
-                        .map(|p| crate::platform::path_file_name(p))
-                        .unwrap_or("Unknown")
-                        .to_string();
-
                     let _ = notification::notify_task_completed(
                         &self.app,
                         &project_name,
@@ -209,17 +236,7 @@ impl QueueExecutor {
                 }
                 Err(e) => {
                     tracing::error!("Task {} failed: {}", task.id, e);
-
-                    // Notify error
-                    let project_name = task.project_path
-                        .as_ref()
-                        .map(|p| crate::platform::path_file_name(p))
-                        .unwrap_or("Unknown")
-                        .to_string();
-
                     let _ = notification::notify_task_error(&self.app, &project_name, &e);
-
-                    // Stop queue on failure (user can resume)
                     break;
                 }
             }
@@ -230,162 +247,128 @@ impl QueueExecutor {
 
     /// Execute a single task
     async fn execute_task(&self, task: &Task) -> Result<TaskResult, String> {
-        // Update task status to running
         *self.current_task.lock().await = Some(task.id.clone());
         database::update_task(&self.app, &task.id, Some(TaskStatus::Running), None, None, None)
             .map_err(|e| e.to_string())?;
-
         self.emit_status().await;
 
-        // Emit queue started notification
-        let project_name = task.project_path
-            .as_ref()
-            .map(|p| crate::platform::path_file_name(p))
-            .unwrap_or("Unknown")
-            .to_string();
+        let project_name = task_project_name(task);
         let _ = notification::notify_queue_started(&self.app, &project_name, &task.prompt);
 
         let start_time = std::time::Instant::now();
 
-        // Load config to check terminal preference
+        // Validate provider CLI is installed
+        let provider = crate::providers::get_provider(task.provider);
+        if !provider.is_installed() {
+            let error_msg = format!(
+                "Provider {} CLI not installed. Please install '{}' first.",
+                task.provider,
+                provider.get_cli_command()
+            );
+            database::update_task(&self.app, &task.id, Some(TaskStatus::Failed), None, None, None)
+                .map_err(|e| e.to_string())?;
+            *self.current_task.lock().await = None;
+            return Err(error_msg);
+        }
+
+        tracing::info!("Executing task {} with provider {}", task.id, task.provider);
+
         let config = crate::config::load_config();
-
-        // Build command arguments
-        let claude_cmd = crate::platform::get_claude_command();
+        let env_config = crate::config::get_active_environment();
+        let cli_command = provider.get_cli_command();
+        let cmd_name = env_config.command.as_deref().unwrap_or(&cli_command);
         let max_turns = task.max_turns.unwrap_or(50);
-
-        let mut args: Vec<String> = vec![
-            "-p".to_string(),
-            task.prompt.clone(),
-            "--output-format".to_string(),
-            "json".to_string(),
-            "--max-turns".to_string(),
-            max_turns.to_string(),
-        ];
-
-        // Add system prompt if specified
-        if let Some(ref system_prompt) = task.system_prompt {
-            args.push("--system-prompt".to_string());
-            args.push(system_prompt.clone());
-        }
-
-        // Add allowed tools if specified
-        if let Some(ref allowed_tools) = task.allowed_tools {
-            if let Ok(tools) = serde_json::from_str::<Vec<String>>(allowed_tools) {
-                for tool in tools {
-                    args.push("--allowedTools".to_string());
-                    args.push(tool);
-                }
-            }
-        }
-
+        let args = build_provider_args(task, max_turns);
         let working_dir = task.project_path.as_deref();
 
-        // Get active environment for custom settings
-        let env_config = crate::config::get_active_environment();
-
-        // Check if we should use a visible terminal
+        // Terminal execution path (non-background)
         if config.terminal_app != crate::config::TerminalApp::Background {
-            // Build command with environment variables for terminal execution
-            let cmd_name = env_config.command.as_deref().unwrap_or(claude_cmd);
-            let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-            // Build env prefix for shell execution
-            let mut env_prefix = String::new();
-            if !env_config.config_dir.is_empty() {
-                env_prefix.push_str(&format!("CLAUDE_CONFIG_DIR='{}' ", env_config.config_dir));
-            }
-            if let Some(ref api_key) = env_config.api_key {
-                if !api_key.is_empty() {
-                    env_prefix.push_str(&format!("ANTHROPIC_API_KEY='{}' ", api_key));
-                }
-            }
-            if let Some(ref model) = env_config.model {
-                if !model.is_empty() {
-                    env_prefix.push_str(&format!("ANTHROPIC_MODEL='{}' ", model));
-                }
-            }
-
-            // If we have env vars and using default command, prepend them
-            let (final_cmd, final_args) = if !env_prefix.is_empty() && env_config.command.is_none() {
-                // For shell execution with env vars, we need to use shell wrapper
-                let full_cmd = format!("{}{} {}", env_prefix, cmd_name, args_str.join(" "));
-                ("sh".to_string(), vec!["-c".to_string(), full_cmd])
-            } else {
-                (cmd_name.to_string(), args.clone())
-            };
-
-            let final_args_str: Vec<&str> = final_args.iter().map(|s| s.as_str()).collect();
-            crate::platform::execute_in_terminal(
-                &config.terminal_app,
-                &config.custom_terminal_command,
-                working_dir,
-                &final_cmd,
-                &final_args_str,
-            )?;
-
-            // For terminal execution, we can't track the output directly
-            // Mark task as completed immediately (user can see result in terminal)
-            // Note: In the future, we could use a wrapper script to capture results
-
-            // Wait a moment to let terminal open
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-            let duration_secs = start_time.elapsed().as_secs();
-
-            // Mark as completed (we assume success since we can't track terminal output)
-            database::update_task(&self.app, &task.id, Some(TaskStatus::Completed), None, None, None)
-                .map_err(|e| e.to_string())?;
-
-            *self.current_task.lock().await = None;
-
-            return Ok(TaskResult {
-                task_id: task.id.clone(),
-                exit_code: 0,
-                output: "Task opened in terminal window".to_string(),
-                tokens_used: 0,
-                cost_usd: 0.0,
-                duration_secs,
-            });
+            return self
+                .execute_in_terminal(task, cmd_name, &args, &env_config, &config, working_dir, start_time)
+                .await;
         }
 
-        // Background execution (original behavior)
-        // Use custom command if specified, otherwise use platform default
-        let cmd_name = env_config.command.as_deref().unwrap_or(claude_cmd);
+        // Background execution path
+        self.execute_in_background(task, cmd_name, &args, &env_config, &cli_command, working_dir, start_time)
+            .await
+    }
+
+    /// Execute a task in a visible terminal window.
+    async fn execute_in_terminal(
+        &self,
+        task: &Task,
+        cmd_name: &str,
+        args: &[String],
+        env_config: &crate::config::ClaudeEnvironment,
+        config: &crate::config::AppConfig,
+        working_dir: Option<&str>,
+        start_time: std::time::Instant,
+    ) -> Result<TaskResult, String> {
+        let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let env_prefix = build_env_prefix(env_config);
+
+        // Wrap in a shell command when env vars are needed and no custom command is set
+        let (final_cmd, final_args) = if !env_prefix.is_empty() && env_config.command.is_none() {
+            let full_cmd = format!("{}{} {}", env_prefix, cmd_name, args_str.join(" "));
+            ("sh".to_string(), vec!["-c".to_string(), full_cmd])
+        } else {
+            (cmd_name.to_string(), args.to_vec())
+        };
+
+        let final_args_str: Vec<&str> = final_args.iter().map(|s| s.as_str()).collect();
+        crate::platform::execute_in_terminal(
+            &config.terminal_app,
+            &config.custom_terminal_command,
+            working_dir,
+            &final_cmd,
+            &final_args_str,
+        )?;
+
+        // Wait briefly to let the terminal open
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        let duration_secs = start_time.elapsed().as_secs();
+
+        database::update_task(&self.app, &task.id, Some(TaskStatus::Completed), None, None, None)
+            .map_err(|e| e.to_string())?;
+        *self.current_task.lock().await = None;
+
+        Ok(TaskResult {
+            task_id: task.id.clone(),
+            exit_code: 0,
+            output: "Task opened in terminal window".to_string(),
+            tokens_used: 0,
+            cost_usd: 0.0,
+            duration_secs,
+        })
+    }
+
+    /// Execute a task as a background subprocess, streaming output to the frontend.
+    async fn execute_in_background(
+        &self,
+        task: &Task,
+        cmd_name: &str,
+        args: &[String],
+        env_config: &crate::config::ClaudeEnvironment,
+        cli_command: &str,
+        working_dir: Option<&str>,
+        start_time: std::time::Instant,
+    ) -> Result<TaskResult, String> {
         let mut cmd = Command::new(cmd_name);
+        cmd.args(args);
 
-        for arg in &args {
-            cmd.arg(arg);
-        }
+        apply_env_config(&mut cmd, env_config);
 
-        // Set environment variables based on environment config
-        if !env_config.config_dir.is_empty() {
-            cmd.env("CLAUDE_CONFIG_DIR", &env_config.config_dir);
-        }
-        if let Some(ref api_key) = env_config.api_key {
-            if !api_key.is_empty() {
-                cmd.env("ANTHROPIC_API_KEY", api_key);
-            }
-        }
-        if let Some(ref model) = env_config.model {
-            if !model.is_empty() {
-                cmd.env("ANTHROPIC_MODEL", model);
-            }
+        if let Some(dir) = working_dir {
+            cmd.current_dir(dir);
         }
 
-        // Set working directory if project path is specified
-        if let Some(ref project_path) = task.project_path {
-            cmd.current_dir(project_path);
-        }
-
-        // Capture output
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        // Spawn process
-        let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn claude: {}", e))?;
+        let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn {}: {}", cli_command, e))?;
 
-        // Read stdout
+        // Stream stdout to the frontend
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
         let mut reader = BufReader::new(stdout).lines();
         let mut output = String::new();
@@ -394,22 +377,17 @@ impl QueueExecutor {
             output.push_str(&line);
             output.push('\n');
 
-            // Emit progress to frontend
             let _ = self.app.emit("task-output", serde_json::json!({
                 "task_id": task.id,
                 "line": line,
             }));
         }
 
-        // Wait for process
         let status = child.wait().await.map_err(|e| format!("Process error: {}", e))?;
         let exit_code = status.code().unwrap_or(-1);
         let duration_secs = start_time.elapsed().as_secs();
-
-        // Parse output for token usage (if JSON output)
         let (tokens_used, cost_usd) = parse_output_stats(&output);
 
-        // Update task status
         let new_status = if exit_code == 0 {
             TaskStatus::Completed
         } else {
@@ -418,7 +396,6 @@ impl QueueExecutor {
 
         database::update_task(&self.app, &task.id, Some(new_status), None, None, None)
             .map_err(|e| e.to_string())?;
-
         *self.current_task.lock().await = None;
 
         Ok(TaskResult {
@@ -432,27 +409,98 @@ impl QueueExecutor {
     }
 }
 
-/// Parse output for token usage stats
-fn parse_output_stats(output: &str) -> (i64, f64) {
-    // Try to parse JSON output from claude CLI
-    // Format: {"result": ..., "usage": {"input_tokens": N, "output_tokens": M}}
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(output) {
-        if let Some(usage) = json.get("usage") {
-            let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-            let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-            let total = input + output;
+// ============================================================================
+// Provider argument builders
+// ============================================================================
 
-            // Estimate cost (simplified, using Sonnet pricing)
-            let cost = (input as f64 * 3.0 / 1_000_000.0) + (output as f64 * 15.0 / 1_000_000.0);
+/// Build CLI arguments based on provider type.
+fn build_provider_args(task: &Task, max_turns: i32) -> Vec<String> {
+    use crate::providers::ProviderId;
 
-            return (total, cost);
+    match task.provider {
+        ProviderId::Claude => {
+            let mut args = vec![
+                "-p".to_string(),
+                task.prompt.clone(),
+                "--output-format".to_string(),
+                "json".to_string(),
+                "--max-turns".to_string(),
+                max_turns.to_string(),
+            ];
+            if let Some(ref system_prompt) = task.system_prompt {
+                args.push("--system-prompt".to_string());
+                args.push(system_prompt.clone());
+            }
+            if let Some(ref allowed_tools) = task.allowed_tools {
+                if let Ok(tools) = serde_json::from_str::<Vec<String>>(allowed_tools) {
+                    for tool in tools {
+                        args.push("--allowedTools".to_string());
+                        args.push(tool);
+                    }
+                }
+            }
+            args
+        }
+        ProviderId::Codex => {
+            let mut args = vec![
+                task.prompt.clone(),
+                "--json".to_string(),
+            ];
+            if max_turns > 0 {
+                args.push("--max-turns".to_string());
+                args.push(max_turns.to_string());
+            }
+            if let Some(ref system_prompt) = task.system_prompt {
+                args.push("--system".to_string());
+                args.push(system_prompt.clone());
+            }
+            args
+        }
+        ProviderId::Gemini => {
+            let mut args = vec![
+                task.prompt.clone(),
+                "--format".to_string(),
+                "json".to_string(),
+            ];
+            if max_turns > 0 {
+                args.push("--max-iterations".to_string());
+                args.push(max_turns.to_string());
+            }
+            if let Some(ref system_prompt) = task.system_prompt {
+                args.push("--system-instruction".to_string());
+                args.push(system_prompt.clone());
+            }
+            args
         }
     }
-
-    (0, 0.0)
 }
 
-/// Global queue executor instance
+/// Parse JSON output for token usage stats.
+fn parse_output_stats(output: &str) -> (i64, f64) {
+    let json = match serde_json::from_str::<serde_json::Value>(output) {
+        Ok(v) => v,
+        Err(_) => return (0, 0.0),
+    };
+
+    let usage = match json.get("usage") {
+        Some(u) => u,
+        None => return (0, 0.0),
+    };
+
+    let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+    let output_tokens = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+    let total = input + output_tokens;
+
+    // Estimate cost (simplified, using Sonnet pricing)
+    let cost = (input as f64 * 3.0 / 1_000_000.0) + (output_tokens as f64 * 15.0 / 1_000_000.0);
+
+    (total, cost)
+}
+
+// ============================================================================
+// Global queue management
+// ============================================================================
+
 static QUEUE_EXECUTOR: once_cell::sync::OnceCell<tokio::sync::Mutex<Option<QueueExecutor>>> =
     once_cell::sync::OnceCell::new();
 
@@ -462,9 +510,10 @@ pub fn init_queue(app: &AppHandle) {
     let _ = QUEUE_EXECUTOR.set(tokio::sync::Mutex::new(Some(executor)));
 }
 
-/// Get the queue executor
+/// Try to acquire the global queue executor lock.
+#[allow(dead_code)]
 pub async fn get_executor() -> Option<tokio::sync::MutexGuard<'static, Option<QueueExecutor>>> {
-    QUEUE_EXECUTOR.get().map(|m| m.try_lock().ok()).flatten()
+    QUEUE_EXECUTOR.get().and_then(|m| m.try_lock().ok())
 }
 
 /// Start queue execution

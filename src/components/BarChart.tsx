@@ -28,40 +28,38 @@ export default function BarChart({
   labelInterval = 2,
   barColor = "bg-blue-500/50",
   hoverColor = "bg-blue-500",
-  formatValue = (v) => v.toString(),
+  formatValue = String,
   formatSecondary,
-}: BarChartProps) {
+}: BarChartProps): React.ReactElement {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
-
+  const hoveredPoint = hoveredIndex !== null ? data[hoveredIndex] : null;
   const maxValue = providedMax ?? Math.max(...data.map((d) => d.value), 1);
 
   return (
     <div className="relative">
-      {/* Tooltip */}
-      {hoveredIndex !== null && data[hoveredIndex] && (
+      {hoveredPoint && (
         <div
           className="absolute z-10 bg-gray-900 border border-white/10 rounded-lg px-2 py-1.5 shadow-lg pointer-events-none"
           style={{
             bottom: `${height + 8}px`,
-            left: `${(hoveredIndex / data.length) * 100}%`,
+            left: `${((hoveredIndex ?? 0) / data.length) * 100}%`,
             transform: "translateX(-50%)",
           }}
         >
           <div className="text-xs text-gray-200 font-medium whitespace-nowrap">
-            {data[hoveredIndex].label}
+            {hoveredPoint.label}
           </div>
           <div className="text-xs text-blue-400 font-mono">
-            {formatValue(data[hoveredIndex].value)}
+            {formatValue(hoveredPoint.value)}
           </div>
-          {data[hoveredIndex].secondaryValue !== undefined && formatSecondary && (
+          {hoveredPoint.secondaryValue !== undefined && formatSecondary && (
             <div className="text-[10px] text-green-400 font-mono">
-              {formatSecondary(data[hoveredIndex].secondaryValue)}
+              {formatSecondary(hoveredPoint.secondaryValue)}
             </div>
           )}
         </div>
       )}
 
-      {/* Bars */}
       <div className="flex items-end gap-1" style={{ height }}>
         {data.map((point, index) => (
           <div

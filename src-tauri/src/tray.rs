@@ -9,36 +9,45 @@ use tauri::{AppHandle, Emitter};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TrayState {
-    Idle = 0,      // Gray - No active sessions
-    Active = 1,    // Blue - Session in progress
-    Success = 2,   // Green - Task completed successfully
-    Warning = 3,   // Yellow - Waiting for user input
-    Error = 4,     // Red - Error occurred
+    Idle = 0,
+    Active = 1,
+    Success = 2,
+    Warning = 3,
+    Error = 4,
 }
 
 impl TrayState {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
-            TrayState::Idle => "idle",
-            TrayState::Active => "active",
-            TrayState::Success => "success",
-            TrayState::Warning => "warning",
-            TrayState::Error => "error",
+            Self::Idle => "idle",
+            Self::Active => "active",
+            Self::Success => "success",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Idle => "Alice - No active sessions",
+            Self::Active => "Alice - Session in progress",
+            Self::Success => "Alice - Task completed",
+            Self::Warning => "Alice - Waiting for input",
+            Self::Error => "Alice - Error occurred",
         }
     }
 
     pub fn from_u8(v: u8) -> Self {
         match v {
-            1 => TrayState::Active,
-            2 => TrayState::Success,
-            3 => TrayState::Warning,
-            4 => TrayState::Error,
-            _ => TrayState::Idle,
+            1 => Self::Active,
+            2 => Self::Success,
+            3 => Self::Warning,
+            4 => Self::Error,
+            _ => Self::Idle,
         }
     }
 }
 
-// Global state for tray icon
 static CURRENT_STATE: AtomicU8 = AtomicU8::new(0);
 
 /// Event emitted when tray state changes
@@ -50,33 +59,22 @@ pub struct TrayStateEvent {
 
 /// Update the tray icon state
 pub fn set_tray_state(app: &AppHandle, state: TrayState) {
-    let prev = TrayState::from_u8(CURRENT_STATE.load(Ordering::SeqCst));
-
+    let prev = get_tray_state();
     if prev == state {
         return;
     }
 
     CURRENT_STATE.store(state as u8, Ordering::SeqCst);
 
-    let tooltip = match state {
-        TrayState::Idle => "Alice - No active sessions",
-        TrayState::Active => "Alice - Session in progress",
-        TrayState::Success => "Alice - Task completed",
-        TrayState::Warning => "Alice - Waiting for input",
-        TrayState::Error => "Alice - Error occurred",
-    };
-
-    // Update tray tooltip
     if let Some(tray) = app.tray_by_id("main") {
-        let _ = tray.set_tooltip(Some(tooltip));
+        let _ = tray.set_tooltip(Some(state.tooltip()));
     }
 
-    // Emit event to frontend for UI sync
     let _ = app.emit(
         "tray-state-changed",
         TrayStateEvent {
             state: state.as_str().to_string(),
-            tooltip: tooltip.to_string(),
+            tooltip: state.tooltip().to_string(),
         },
     );
 
