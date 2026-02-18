@@ -2,13 +2,13 @@
 
 use crate::config::{load_config, save_config, AutoActionType};
 use serde::Serialize;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
-/// Auto action timer state
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoActionState {
     pub timer_active: bool,
@@ -26,19 +26,28 @@ impl AutoActionState {
             total_seconds: 0,
         }
     }
-}
 
-impl AutoActionType {
-    fn as_str(&self) -> &'static str {
-        match self {
-            AutoActionType::Sleep => "sleep",
-            AutoActionType::Shutdown => "shutdown",
-            AutoActionType::None => "none",
+    fn active(action_type: &str, remaining: Duration, total: Duration) -> Self {
+        Self {
+            timer_active: true,
+            action_type: action_type.to_string(),
+            remaining_seconds: remaining.as_secs(),
+            total_seconds: total.as_secs(),
         }
     }
 }
 
-/// Auto action timer manager
+impl fmt::Display for AutoActionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            AutoActionType::Sleep => "sleep",
+            AutoActionType::Shutdown => "shutdown",
+            AutoActionType::None => "none",
+        };
+        f.write_str(label)
+    }
+}
+
 pub struct AutoActionManager {
     app: AppHandle,
     timer_active: Arc<AtomicBool>,
@@ -58,7 +67,18 @@ impl AutoActionManager {
         }
     }
 
-    /// Start the auto action timer
+    /// Compute remaining and total duration from current timer state.
+    async fn remaining(&self) -> (Duration, Duration) {
+        let elapsed = self
+            .start_time
+            .lock()
+            .await
+            .map(|s| s.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let total = *self.total_duration.lock().await;
+        (total.saturating_sub(elapsed), total)
+    }
+
     pub async fn start_timer(&self) -> Result<(), String> {
         let config = load_config();
 
@@ -88,7 +108,7 @@ impl AutoActionManager {
         let total_duration = self.total_duration.clone();
 
         tauri::async_runtime::spawn(async move {
-            let action_str = action_type.as_str();
+            let action_str = action_type.to_string();
 
             loop {
                 if cancelled.load(Ordering::SeqCst) {
@@ -96,10 +116,11 @@ impl AutoActionManager {
                     break;
                 }
 
-                let elapsed = {
-                    let start = start_time.lock().await;
-                    start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO)
-                };
+                let elapsed = start_time
+                    .lock()
+                    .await
+                    .map(|s| s.elapsed())
+                    .unwrap_or(Duration::ZERO);
                 let total = *total_duration.lock().await;
 
                 if elapsed >= total {
@@ -115,12 +136,7 @@ impl AutoActionManager {
                 let remaining = total.saturating_sub(elapsed);
                 let _ = app.emit(
                     "auto-action-state",
-                    AutoActionState {
-                        timer_active: true,
-                        action_type: action_str.to_string(),
-                        remaining_seconds: remaining.as_secs(),
-                        total_seconds: total.as_secs(),
-                    },
+                    AutoActionState::active(&action_str, remaining, total),
                 );
 
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -133,7 +149,6 @@ impl AutoActionManager {
         Ok(())
     }
 
-    /// Cancel the auto action timer
     pub fn cancel_timer(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
         self.timer_active.store(false, Ordering::SeqCst);
@@ -142,37 +157,23 @@ impl AutoActionManager {
             .emit("auto-action-state", AutoActionState::inactive("none"));
     }
 
-    /// Check if timer is active
     #[allow(dead_code)]
     pub fn is_timer_active(&self) -> bool {
         self.timer_active.load(Ordering::SeqCst)
     }
 
-    /// Get current state
     pub async fn get_state(&self) -> AutoActionState {
-        let action_str = load_config().auto_action.action_type.as_str();
+        let action_str = load_config().auto_action.action_type.to_string();
 
         if !self.timer_active.load(Ordering::SeqCst) {
-            return AutoActionState::inactive(action_str);
+            return AutoActionState::inactive(&action_str);
         }
 
-        let elapsed = {
-            let start = self.start_time.lock().await;
-            start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO)
-        };
-        let total = *self.total_duration.lock().await;
-        let remaining = total.saturating_sub(elapsed);
-
-        AutoActionState {
-            timer_active: true,
-            action_type: action_str.to_string(),
-            remaining_seconds: remaining.as_secs(),
-            total_seconds: total.as_secs(),
-        }
+        let (remaining, total) = self.remaining().await;
+        AutoActionState::active(&action_str, remaining, total)
     }
 }
 
-/// Reset auto action config after execution (one-time use)
 fn reset_auto_action_config() {
     let mut config = load_config();
     config.auto_action.enabled = false;
@@ -182,96 +183,87 @@ fn reset_auto_action_config() {
     }
 }
 
-/// Execute system sleep or shutdown
 fn execute_system_action(action_type: &AutoActionType) -> Result<(), String> {
     match action_type {
-        AutoActionType::Sleep => execute_sleep(),
-        AutoActionType::Shutdown => execute_shutdown(),
+        AutoActionType::Sleep => run_platform_command(sleep_command()),
+        AutoActionType::Shutdown => run_platform_command(shutdown_command()),
         AutoActionType::None => Ok(()),
     }
 }
 
-fn execute_sleep() -> Result<(), String> {
+/// Platform-specific command descriptor: (program, args).
+type PlatformCommand = (&'static str, Vec<&'static str>);
+
+fn sleep_command() -> PlatformCommand {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("pmset")
-            .arg("sleepnow")
-            .spawn()
-            .map_err(|e| format!("Failed to sleep: {}", e))?;
+        ("pmset", vec!["sleepnow"])
     }
 
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("powershell")
-            .args([
-                "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false)",
-            ])
-            .spawn()
-            .map_err(|e| format!("Failed to sleep: {}", e))?;
+        ("powershell", vec![
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false)",
+        ])
     }
 
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("systemctl")
-            .arg("suspend")
-            .spawn()
-            .map_err(|e| format!("Failed to sleep: {}", e))?;
+        ("systemctl", vec!["suspend"])
     }
-
-    Ok(())
 }
 
-fn execute_shutdown() -> Result<(), String> {
+fn shutdown_command() -> PlatformCommand {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("osascript")
-            .args(["-e", "tell application \"Finder\" to shut down"])
-            .spawn()
-            .map_err(|e| format!("Failed to shutdown: {}", e))?;
+        (
+            "osascript",
+            vec!["-e", "tell application \"Finder\" to shut down"],
+        )
     }
 
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("shutdown")
-            .args([
-                "/s",
-                "/t",
-                "60",
-                "/c",
-                "Alice: Auto shutdown in 60 seconds. Run 'shutdown /a' to cancel.",
-            ])
-            .spawn()
-            .map_err(|e| format!("Failed to shutdown: {}", e))?;
+        ("shutdown", vec![
+            "/s",
+            "/t",
+            "60",
+            "/c",
+            "Alice: Auto shutdown in 60 seconds. Run 'shutdown /a' to cancel.",
+        ])
     }
 
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("systemctl")
-            .arg("poweroff")
-            .spawn()
-            .map_err(|e| format!("Failed to shutdown: {}", e))?;
+        ("systemctl", vec!["poweroff"])
     }
+}
 
+fn run_platform_command((program, args): PlatformCommand) -> Result<(), String> {
+    std::process::Command::new(program)
+        .args(&args)
+        .spawn()
+        .map_err(|e| format!("Failed to execute '{}': {}", program, e))?;
     Ok(())
 }
 
-/// Global auto action manager instance
+// ---------------------------------------------------------------------------
+// Global manager instance
+// ---------------------------------------------------------------------------
+
 static AUTO_ACTION_MANAGER: once_cell::sync::OnceCell<Mutex<Option<AutoActionManager>>> =
     once_cell::sync::OnceCell::new();
 
-/// Initialize the auto action manager
 pub fn init_auto_action(app: &AppHandle) {
     let manager = AutoActionManager::new(app.clone());
     let _ = AUTO_ACTION_MANAGER.set(Mutex::new(Some(manager)));
 }
 
-/// Get the auto action manager
-pub async fn get_manager() -> Option<tokio::sync::MutexGuard<'static, Option<AutoActionManager>>> {
-    AUTO_ACTION_MANAGER.get().and_then(|m| m.try_lock().ok())
+fn try_get_manager() -> Option<tokio::sync::MutexGuard<'static, Option<AutoActionManager>>> {
+    AUTO_ACTION_MANAGER.get()?.try_lock().ok()
 }
 
-/// Start auto action timer (called when queue completes)
 pub async fn start_auto_action_timer(app: &AppHandle) -> Result<(), String> {
     let config = load_config();
 
@@ -279,13 +271,19 @@ pub async fn start_auto_action_timer(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    let manager = AutoActionManager::new(app.clone());
-    manager.start_timer().await
+    // Use the global manager so cancel/get_state work correctly.
+    if let Some(guard) = try_get_manager() {
+        if let Some(manager) = guard.as_ref() {
+            return manager.start_timer().await;
+        }
+    }
+
+    // Fallback: create an ephemeral manager if the global one is unavailable.
+    AutoActionManager::new(app.clone()).start_timer().await
 }
 
-/// Cancel auto action timer
 pub async fn cancel_auto_action_timer() -> Result<(), String> {
-    if let Some(guard) = get_manager().await {
+    if let Some(guard) = try_get_manager() {
         if let Some(manager) = guard.as_ref() {
             manager.cancel_timer();
         }
@@ -293,13 +291,12 @@ pub async fn cancel_auto_action_timer() -> Result<(), String> {
     Ok(())
 }
 
-/// Get auto action state
 pub async fn get_auto_action_state(_app: &AppHandle) -> AutoActionState {
-    if let Some(guard) = get_manager().await {
+    if let Some(guard) = try_get_manager() {
         if let Some(manager) = guard.as_ref() {
             return manager.get_state().await;
         }
     }
 
-    AutoActionState::inactive(load_config().auto_action.action_type.as_str())
+    AutoActionState::inactive(&load_config().auto_action.action_type.to_string())
 }

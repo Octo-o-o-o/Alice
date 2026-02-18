@@ -8,16 +8,31 @@
 import React, { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { RefreshCw, AlertTriangle, CheckCircle2, XCircle, Activity } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { ProviderId, LiveUsageStats, AnthropicStatus, UsageStats, ProviderUsage } from "../lib/types";
 import { getProviderColor, getProviderIcon, getProviderLabel } from "../lib/provider-colors";
 
 // --- Status styling lookup ---
 
-const STATUS_STYLES: Record<string, { bg: string; border: string; text: string; icon: typeof CheckCircle2 }> = {
+interface StatusStyle {
+  bg: string;
+  border: string;
+  text: string;
+  icon: LucideIcon;
+}
+
+const ERROR_STYLE: StatusStyle = {
+  bg: "bg-red-500/5",
+  border: "border-red-500/20",
+  text: "text-red-400",
+  icon: XCircle,
+};
+
+const STATUS_STYLES: Record<string, StatusStyle> = {
   none:     { bg: "bg-green-500/5",  border: "border-green-500/20",  text: "text-green-400",  icon: CheckCircle2 },
   minor:    { bg: "bg-yellow-500/5", border: "border-yellow-500/20", text: "text-yellow-400", icon: AlertTriangle },
-  major:    { bg: "bg-red-500/5",    border: "border-red-500/20",    text: "text-red-400",    icon: XCircle },
-  critical: { bg: "bg-red-500/5",    border: "border-red-500/20",    text: "text-red-400",    icon: XCircle },
+  major:    ERROR_STYLE,
+  critical: ERROR_STYLE,
 };
 
 const IMPACT_STYLES: Record<string, string> = {
@@ -25,8 +40,6 @@ const IMPACT_STYLES: Record<string, string> = {
   major:    "bg-orange-500/20 text-orange-400",
   minor:    "bg-yellow-500/20 text-yellow-400",
 };
-
-// --- Period-to-days mapping ---
 
 const PERIOD_DAYS: Record<string, number> = {
   today: 0,
@@ -74,7 +87,47 @@ function getStartDate(period: "today" | "week" | "month"): string {
   return date.toISOString().split("T")[0];
 }
 
-// --- Extracted sub-components ---
+function toLocalLiveStats(result: ProviderUsage): LiveUsageStats {
+  return {
+    session_percent: result.session_percent,
+    session_reset_at: result.session_reset_at,
+    weekly_percent: result.weekly_percent ?? 0,
+    weekly_reset_at: result.weekly_reset_at,
+    burn_rate_per_hour: null,
+    estimated_limit_in_minutes: null,
+    account_email: null,
+    account_plan: null,
+    last_updated: result.last_updated,
+    error: result.error,
+  };
+}
+
+// --- Sub-components ---
+
+interface CardShellProps {
+  borderColor: string;
+  className?: string;
+  children: React.ReactNode;
+}
+
+function CardShell({ borderColor, className = "", children }: CardShellProps): React.ReactElement {
+  return (
+    <div
+      className={`bg-white/[0.03] border rounded-lg p-4 ${className}`}
+      style={{ borderColor }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function SectionHeading({ children }: { children: React.ReactNode }): React.ReactElement {
+  return (
+    <h4 className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
+      {children}
+    </h4>
+  );
+}
 
 function SummaryCard({ value, label, color }: { value: string; label: string; color?: string }): React.ReactElement {
   return (
@@ -138,13 +191,13 @@ export default function ProviderUsageCard({ provider, period, refreshTrigger }: 
   const label = getProviderLabel(provider);
   const isClaude = provider === "claude";
 
-  const cardBorder = { borderColor: `${color.primary}20` };
+  const borderColor = `${color.primary}20`;
 
   async function loadStats(): Promise<void> {
     try {
       const result = await invoke<UsageStats>("get_usage_stats", {
         project: null,
-        provider: provider,
+        provider,
         startDate: getStartDate(period),
         endDate: null,
       });
@@ -161,7 +214,6 @@ export default function ProviderUsageCard({ provider, period, refreshTrigger }: 
   async function loadLiveUsage(): Promise<void> {
     try {
       if (isClaude) {
-        // Claude uses specialized usage API
         const hasCreds = await invoke<boolean>("has_claude_credentials");
         if (!hasCreds) return;
 
@@ -172,23 +224,8 @@ export default function ProviderUsageCard({ provider, period, refreshTrigger }: 
         setLiveUsage(result);
         setApiStatus(status);
       } else {
-        // Codex, Gemini use provider-generic OAuth API
         const result = await invoke<ProviderUsage>("get_provider_usage", { provider });
-
-        // Convert ProviderUsage to LiveUsageStats format
-        const liveStats: LiveUsageStats = {
-          session_percent: result.session_percent,
-          session_reset_at: result.session_reset_at,
-          weekly_percent: result.weekly_percent ?? 0,
-          weekly_reset_at: result.weekly_reset_at,
-          burn_rate_per_hour: null,
-          estimated_limit_in_minutes: null,
-          account_email: null,
-          account_plan: null,
-          last_updated: result.last_updated,
-          error: result.error,
-        };
-        setLiveUsage(liveStats);
+        setLiveUsage(toLocalLiveStats(result));
       }
     } catch (err) {
       console.error(`Failed to load ${provider} live usage:`, err);
@@ -218,30 +255,20 @@ export default function ProviderUsageCard({ provider, period, refreshTrigger }: 
     return () => clearInterval(interval);
   }, [period, provider, refreshTrigger]);
 
-  // --- Loading state ---
-
   if (loading) {
     return (
-      <div
-        className="bg-white/[0.03] border rounded-lg p-4 flex items-center justify-center h-[400px]"
-        style={cardBorder}
-      >
+      <CardShell borderColor={borderColor} className="flex items-center justify-center h-[400px]">
         <div
           className="w-6 h-6 border-2 border-t-transparent rounded-full animate-spin"
           style={{ borderColor: color.primary, borderTopColor: "transparent" }}
         />
-      </div>
+      </CardShell>
     );
   }
 
-  // --- Error state ---
-
   if (error) {
     return (
-      <div
-        className="bg-white/[0.03] border rounded-lg p-4 flex flex-col items-center justify-center h-[400px] gap-4"
-        style={cardBorder}
-      >
+      <CardShell borderColor={borderColor} className="flex flex-col items-center justify-center h-[400px] gap-4">
         <div className="flex flex-col items-center gap-3">
           <div className="p-3 rounded-full bg-red-500/10 border border-red-500/20">
             <AlertTriangle size={24} className="text-red-400" />
@@ -265,39 +292,27 @@ export default function ProviderUsageCard({ provider, period, refreshTrigger }: 
           <RefreshCw size={12} />
           Retry
         </button>
-      </div>
+      </CardShell>
     );
   }
 
-  // --- Empty state ---
-
   if (!stats || stats.session_count === 0) {
     return (
-      <div
-        className="bg-white/[0.03] border rounded-lg p-4 flex flex-col items-center justify-center h-[120px] gap-2"
-        style={cardBorder}
-      >
+      <CardShell borderColor={borderColor} className="flex flex-col items-center justify-center h-[120px] gap-2">
         <Icon size={24} style={{ color: color.light, opacity: 0.5 }} />
         <div className="text-center">
           <p className="text-xs text-gray-500">No {label} usage data</p>
           <p className="text-[10px] text-gray-600 mt-0.5">Start a session to see stats</p>
         </div>
-      </div>
+      </CardShell>
     );
   }
-
-  // --- Resolve status styling ---
 
   const statusStyle = apiStatus ? STATUS_STYLES[apiStatus.status] ?? STATUS_STYLES.major : null;
   const StatusIcon = statusStyle?.icon;
 
-  // --- Main content ---
-
   return (
-    <div
-      className="bg-white/[0.03] border rounded-lg p-4 space-y-4 h-full overflow-y-auto"
-      style={cardBorder}
-    >
+    <CardShell borderColor={borderColor} className="space-y-4 h-full overflow-y-auto">
       {/* Header */}
       <div className="flex items-center justify-between pb-3 border-b" style={{ borderColor: `${color.primary}10` }}>
         <div className="flex items-center gap-2">
@@ -334,13 +349,11 @@ export default function ProviderUsageCard({ provider, period, refreshTrigger }: 
           </h4>
           <div className="space-y-1.5">
             {apiStatus.incidents.map((incident, index) => (
-              <div key={index} className="text-[10px]">
-                <div className="flex items-center justify-between">
-                  <span className="text-gray-200">{incident.name}</span>
-                  <span className={`text-[9px] px-1 py-0.5 rounded ${IMPACT_STYLES[incident.impact] ?? IMPACT_STYLES.minor}`}>
-                    {incident.impact}
-                  </span>
-                </div>
+              <div key={index} className="flex items-center justify-between text-[10px]">
+                <span className="text-gray-200">{incident.name}</span>
+                <span className={`text-[9px] px-1 py-0.5 rounded ${IMPACT_STYLES[incident.impact] ?? IMPACT_STYLES.minor}`}>
+                  {incident.impact}
+                </span>
               </div>
             ))}
           </div>
@@ -357,9 +370,7 @@ export default function ProviderUsageCard({ provider, period, refreshTrigger }: 
       {/* Rate Limits (Claude only) */}
       {isClaude && liveUsage && !liveUsage.error && (
         <div className="space-y-3">
-          <h4 className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
-            Rate Limits
-          </h4>
+          <SectionHeading>Rate Limits</SectionHeading>
 
           <RateLimitBar label="Session (5h)" percent={liveUsage.session_percent} resetAt={liveUsage.session_reset_at} />
 
@@ -380,9 +391,7 @@ export default function ProviderUsageCard({ provider, period, refreshTrigger }: 
 
       {/* Token breakdown */}
       <div className="space-y-2">
-        <h4 className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
-          Token Breakdown
-        </h4>
+        <SectionHeading>Token Breakdown</SectionHeading>
         <div className="space-y-1.5">
           <TokenRow label="Input" tokens={stats.input_tokens} />
           <TokenRow label="Output" tokens={stats.output_tokens} />
@@ -400,6 +409,6 @@ export default function ProviderUsageCard({ provider, period, refreshTrigger }: 
           </div>
         </div>
       )}
-    </div>
+    </CardShell>
   );
 }

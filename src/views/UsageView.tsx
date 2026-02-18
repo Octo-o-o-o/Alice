@@ -5,13 +5,9 @@ import { UsageStats, ProjectUsage, ProviderStatus } from "../lib/types";
 import ProviderUsageCard from "../components/ProviderUsageCard";
 import BarChart from "../components/BarChart";
 
-// --- Types ---
-
 type Period = "today" | "week" | "month";
 type SortField = "name" | "tokens" | "cost" | "sessions";
 type SortDirection = "asc" | "desc";
-
-// --- Constants ---
 
 const PERIOD_LABELS: Record<Period, string> = {
   today: "Today",
@@ -26,18 +22,22 @@ const PERIOD_DAYS: Record<Period, number> = {
 };
 
 const PERIODS = Object.keys(PERIOD_LABELS) as Period[];
-
 const MAX_VISIBLE_PROJECTS = 8;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+const PROJECT_TABLE_COLUMNS: { field: SortField; label: string; className: string; labelFirst?: boolean }[] = [
+  { field: "name", label: "Project", className: "flex-1", labelFirst: true },
+  { field: "sessions", label: "#", className: "w-12 justify-end" },
+  { field: "tokens", label: "Tokens", className: "w-16 justify-end" },
+  { field: "cost", label: "Cost", className: "w-14 justify-end" },
+];
 
 const DATE_FORMAT_SHORT: Intl.DateTimeFormatOptions = { month: "short", day: "numeric" };
 const DATE_FORMAT_FULL: Intl.DateTimeFormatOptions = { month: "short", day: "numeric", year: "numeric" };
 
-// --- Helpers ---
-
 function getStartDate(period: Period): string {
-  const now = new Date();
   const daysBack = PERIOD_DAYS[period];
-  const date = daysBack === 0 ? now : new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000);
+  const date = daysBack === 0 ? new Date() : new Date(Date.now() - daysBack * MS_PER_DAY);
   return date.toISOString().split("T")[0];
 }
 
@@ -45,7 +45,7 @@ function getDateRangeLabel(period: Period): string | null {
   if (period === "today") return null;
 
   const now = new Date();
-  const start = new Date(now.getTime() - PERIOD_DAYS[period] * 24 * 60 * 60 * 1000);
+  const start = new Date(now.getTime() - PERIOD_DAYS[period] * MS_PER_DAY);
   return `${start.toLocaleDateString("en-US", DATE_FORMAT_SHORT)} - ${now.toLocaleDateString("en-US", DATE_FORMAT_FULL)}`;
 }
 
@@ -59,45 +59,30 @@ function formatCost(cost: number): string {
   return `$${cost.toFixed(2)}`;
 }
 
+const SORT_COMPARATORS: Record<SortField, (a: ProjectUsage, b: ProjectUsage) => number> = {
+  name: (a, b) => a.project_name.localeCompare(b.project_name),
+  tokens: (a, b) => a.tokens - b.tokens,
+  cost: (a, b) => a.cost_usd - b.cost_usd,
+  sessions: (a, b) => a.session_count - b.session_count,
+};
+
 function sortProjects(
   projects: ProjectUsage[],
   field: SortField,
   direction: SortDirection,
 ): ProjectUsage[] {
-  return [...projects].sort((a, b) => {
-    let comparison = 0;
-    switch (field) {
-      case "name":
-        comparison = a.project_name.localeCompare(b.project_name);
-        break;
-      case "tokens":
-        comparison = a.tokens - b.tokens;
-        break;
-      case "cost":
-        comparison = a.cost_usd - b.cost_usd;
-        break;
-      case "sessions":
-        comparison = a.session_count - b.session_count;
-        break;
-    }
-    return direction === "asc" ? comparison : -comparison;
-  });
+  const comparator = SORT_COMPARATORS[field];
+  const sign = direction === "asc" ? 1 : -1;
+  return [...projects].sort((a, b) => sign * comparator(a, b));
 }
 
-// --- Subcomponents ---
-
-function SortIcon({ field, activeField, direction }: {
-  field: SortField;
-  activeField: SortField;
+function SortIcon({ active, direction }: {
+  active: boolean;
   direction: SortDirection;
 }): React.ReactElement {
-  if (field !== activeField) {
-    return <ArrowUpDown size={10} className="text-gray-600" />;
-  }
-  if (direction === "asc") {
-    return <ArrowUp size={10} className="text-blue-400" />;
-  }
-  return <ArrowDown size={10} className="text-blue-400" />;
+  if (!active) return <ArrowUpDown size={10} className="text-gray-600" />;
+  const Icon = direction === "asc" ? ArrowUp : ArrowDown;
+  return <Icon size={10} className="text-blue-400" />;
 }
 
 interface SortColumnProps {
@@ -111,18 +96,35 @@ interface SortColumnProps {
 }
 
 function SortColumn({ field, label, activeField, direction, onToggle, className = "", labelFirst = false }: SortColumnProps): React.ReactElement {
-  const icon = <SortIcon field={field} activeField={activeField} direction={direction} />;
   return (
     <button
       onClick={() => onToggle(field)}
-      className={`flex items-center gap-1 text-[10px] text-gray-500 hover:text-gray-300 ${className}`}
+      className={`flex items-center gap-1 text-[10px] text-gray-500 hover:text-gray-300 ${labelFirst ? "flex-row" : "flex-row-reverse"} ${className}`}
     >
-      {labelFirst ? <>{label} {icon}</> : <>{icon} {label}</>}
+      {label}
+      <SortIcon active={field === activeField} direction={direction} />
     </button>
   );
 }
 
-// --- Main component ---
+function ProjectRow({ project }: { project: ProjectUsage }): React.ReactElement {
+  return (
+    <div className="flex items-center gap-2 py-1 hover:bg-white/[0.02] rounded transition-colors">
+      <span className="flex-1 text-xs text-gray-300 truncate">
+        {project.project_name}
+      </span>
+      <span className="w-12 text-right text-[10px] text-gray-500 font-mono">
+        {project.session_count}
+      </span>
+      <span className="w-16 text-right text-[10px] text-gray-400 font-mono">
+        {formatTokens(project.tokens)}
+      </span>
+      <span className="w-14 text-right text-[10px] text-green-400 font-mono">
+        {formatCost(project.cost_usd)}
+      </span>
+    </div>
+  );
+}
 
 export default function UsageView(): React.ReactElement {
   const [stats, setStats] = useState<UsageStats | null>(null);
@@ -316,61 +318,24 @@ export default function UsageView(): React.ReactElement {
 
             {/* Table header */}
             <div className="flex items-center gap-2 pb-2 border-b border-white/5 mb-2">
-              <SortColumn
-                field="name"
-                label="Project"
-                activeField={sortField}
-                direction={sortDirection}
-                onToggle={toggleSort}
-                className="flex-1"
-                labelFirst
-              />
-              <SortColumn
-                field="sessions"
-                label="#"
-                activeField={sortField}
-                direction={sortDirection}
-                onToggle={toggleSort}
-                className="w-12 justify-end"
-              />
-              <SortColumn
-                field="tokens"
-                label="Tokens"
-                activeField={sortField}
-                direction={sortDirection}
-                onToggle={toggleSort}
-                className="w-16 justify-end"
-              />
-              <SortColumn
-                field="cost"
-                label="Cost"
-                activeField={sortField}
-                direction={sortDirection}
-                onToggle={toggleSort}
-                className="w-14 justify-end"
-              />
+              {PROJECT_TABLE_COLUMNS.map((col) => (
+                <SortColumn
+                  key={col.field}
+                  field={col.field}
+                  label={col.label}
+                  activeField={sortField}
+                  direction={sortDirection}
+                  onToggle={toggleSort}
+                  className={col.className}
+                  labelFirst={col.labelFirst}
+                />
+              ))}
             </div>
 
             {/* Table rows */}
             <div className="space-y-1.5">
               {sortedProjects.slice(0, MAX_VISIBLE_PROJECTS).map((project) => (
-                <div
-                  key={project.project_path}
-                  className="flex items-center gap-2 py-1 hover:bg-white/[0.02] rounded transition-colors"
-                >
-                  <span className="flex-1 text-xs text-gray-300 truncate">
-                    {project.project_name}
-                  </span>
-                  <span className="w-12 text-right text-[10px] text-gray-500 font-mono">
-                    {project.session_count}
-                  </span>
-                  <span className="w-16 text-right text-[10px] text-gray-400 font-mono">
-                    {formatTokens(project.tokens)}
-                  </span>
-                  <span className="w-14 text-right text-[10px] text-green-400 font-mono">
-                    {formatCost(project.cost_usd)}
-                  </span>
-                </div>
+                <ProjectRow key={project.project_path} project={project} />
               ))}
             </div>
 

@@ -8,7 +8,7 @@ use chrono::{Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::AppHandle;
 
@@ -51,6 +51,14 @@ pub struct GitCommit {
     pub author: String,
     pub timestamp: String,
     pub is_cc_assisted: bool,
+}
+
+impl GitCommit {
+    fn is_claude_assisted(message: &str) -> bool {
+        message.contains("Co-Authored-By: Claude")
+            || message.contains("\u{1F916}")
+            || message.to_lowercase().contains("claude")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,7 +228,7 @@ fn build_session_summaries(sessions: &[Session]) -> Vec<SessionSummary> {
         .map(|s| SessionSummary {
             project_name: s.project_name.clone(),
             prompt: s.first_prompt.clone().unwrap_or_default(),
-            status: format!("{:?}", s.status).to_lowercase(),
+            status: s.status.as_str().to_string(),
             tokens: s.total_tokens,
             cost_usd: s.total_cost_usd,
             duration_minutes: (s.last_active_at - s.started_at) / 60_000,
@@ -268,17 +276,13 @@ fn get_git_commits_for_date(project_paths: &[String], date: &NaiveDate) -> Vec<G
             }
 
             let message = parts[1].to_string();
-            let is_cc_assisted = message.contains("Co-Authored-By: Claude")
-                || message.contains("🤖")
-                || message.to_lowercase().contains("claude");
-
             commits.push(GitCommit {
                 project_name: project_name.clone(),
                 hash: parts[0][..7].to_string(),
+                is_cc_assisted: GitCommit::is_claude_assisted(&message),
                 message,
                 author: parts[2].to_string(),
                 timestamp: parts[3].to_string(),
-                is_cc_assisted,
             });
         }
     }
@@ -317,22 +321,23 @@ fn calculate_usage_summary(sessions: &[Session]) -> UsageSummary {
 }
 
 fn get_pending_tasks(app: &AppHandle) -> Result<Vec<TaskSummary>, String> {
-    let backlog = database::get_tasks(app, Some(TaskStatus::Backlog), None)
-        .map_err(|e| e.to_string())?;
-    let queued = database::get_tasks(app, Some(TaskStatus::Queued), None)
-        .map_err(|e| e.to_string())?;
+    let mut all_tasks = Vec::new();
+    for status in [TaskStatus::Backlog, TaskStatus::Queued] {
+        let tasks = database::get_tasks(app, Some(status), None)
+            .map_err(|e| e.to_string())?;
+        all_tasks.extend(tasks);
+    }
 
-    let tasks = backlog
+    let summaries = all_tasks
         .into_iter()
-        .chain(queued)
         .map(|t| TaskSummary {
             prompt: t.prompt,
-            project_name: t.project_path.as_deref().map(|p| project_name_from_path(&PathBuf::from(p))),
+            project_name: t.project_path.as_deref().map(|p| project_name_from_path(Path::new(p))),
             priority: format!("{:?}", t.priority).to_lowercase(),
         })
         .collect();
 
-    Ok(tasks)
+    Ok(summaries)
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +355,15 @@ fn generate_markdown(
 
     writeln!(md, "# Daily Report \u{2014} {}\n", date).unwrap();
 
-    // Sessions section
+    write_sessions_section(&mut md, sessions);
+    write_cc_commits_section(&mut md, commits);
+    write_usage_table(&mut md, usage);
+    write_pending_tasks_section(&mut md, tasks);
+
+    md
+}
+
+fn write_sessions_section(md: &mut String, sessions: &[SessionSummary]) {
     writeln!(md, "## Sessions ({})\n", sessions.len()).unwrap();
     for s in sessions {
         writeln!(
@@ -365,18 +378,22 @@ fn generate_markdown(
         .unwrap();
     }
     md.push('\n');
+}
 
-    // CC-assisted git commits section
-    let cc_commits: Vec<_> = commits.iter().filter(|c| c.is_cc_assisted).collect();
-    if !cc_commits.is_empty() {
-        writeln!(md, "## Git Commits (CC-assisted: {})\n", cc_commits.len()).unwrap();
-        for c in &cc_commits {
-            writeln!(md, "- {}: `{}` \u{2014} {}", c.project_name, c.hash, c.message).unwrap();
-        }
-        md.push('\n');
+fn write_cc_commits_section(md: &mut String, commits: &[GitCommit]) {
+    let cc_commits: Vec<_> = cc_assisted_commits(commits);
+    if cc_commits.is_empty() {
+        return;
     }
 
-    // Usage summary table
+    writeln!(md, "## Git Commits (CC-assisted: {})\n", cc_commits.len()).unwrap();
+    for c in &cc_commits {
+        writeln!(md, "- {}: `{}` \u{2014} {}", c.project_name, c.hash, c.message).unwrap();
+    }
+    md.push('\n');
+}
+
+fn write_usage_table(md: &mut String, usage: &UsageSummary) {
     writeln!(md, "## Usage Summary\n").unwrap();
     writeln!(md, "| Project | Sessions | Tokens | Cost |").unwrap();
     writeln!(md, "|---------|----------|--------|------|").unwrap();
@@ -399,20 +416,21 @@ fn generate_markdown(
         usage.total_cost_usd
     )
     .unwrap();
+}
 
-    // Pending tasks section
-    if !tasks.is_empty() {
-        writeln!(md, "## Queued Tasks ({} pending)\n", tasks.len()).unwrap();
-        for t in tasks.iter().take(5) {
-            let project = t.project_name.as_deref().unwrap_or("No project");
-            writeln!(md, "- \"{}\" ({})", truncate(&t.prompt, 50), project).unwrap();
-        }
-        if tasks.len() > 5 {
-            writeln!(md, "- ...and {} more", tasks.len() - 5).unwrap();
-        }
+fn write_pending_tasks_section(md: &mut String, tasks: &[TaskSummary]) {
+    if tasks.is_empty() {
+        return;
     }
 
-    md
+    writeln!(md, "## Queued Tasks ({} pending)\n", tasks.len()).unwrap();
+    for t in tasks.iter().take(5) {
+        let project = t.project_name.as_deref().unwrap_or("No project");
+        writeln!(md, "- \"{}\" ({})", truncate(&t.prompt, 50), project).unwrap();
+    }
+    if tasks.len() > 5 {
+        writeln!(md, "- ...and {} more", tasks.len() - 5).unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -447,24 +465,32 @@ async fn generate_ai_analysis(report: &DailyReport, language: &str) -> Result<Ai
     }
 
     let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    let json_str = response
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
+    let json_str = strip_code_fences(&response);
 
     let analysis: AiAnalysis = serde_json::from_str(json_str)
         .map_err(|e| format!("Failed to parse AI response as JSON: {}. Response was: {}", e, json_str))?;
 
-    if !(1..=10).contains(&analysis.work_value_score) {
-        return Err(format!("Invalid work_value_score: {}", analysis.work_value_score));
-    }
-    if !(1..=10).contains(&analysis.workload_score) {
-        return Err(format!("Invalid workload_score: {}", analysis.workload_score));
-    }
+    validate_score(analysis.work_value_score, "work_value_score")?;
+    validate_score(analysis.workload_score, "workload_score")?;
 
     Ok(analysis)
+}
+
+/// Validate that a score falls within the expected 1-10 range.
+fn validate_score(score: i32, name: &str) -> Result<(), String> {
+    if (1..=10).contains(&score) {
+        Ok(())
+    } else {
+        Err(format!("Invalid {}: {}", name, score))
+    }
+}
+
+/// Strip optional markdown code fences (```json ... ```) from an AI response.
+fn strip_code_fences(s: &str) -> &str {
+    s.trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
 }
 
 fn build_ai_prompt(report: &DailyReport, language: &str) -> String {
@@ -472,69 +498,86 @@ fn build_ai_prompt(report: &DailyReport, language: &str) -> String {
 
     writeln!(p, "You are analyzing a developer's daily work activity. Generate a comprehensive daily report.\n").unwrap();
 
-    // Language instruction
-    if language != "auto" {
-        let instructions: &[(&str, &str)] = &[
-            ("en", "IMPORTANT: Generate the report in English."),
-            ("zh", "重要提示：请使用中文生成报告。"),
-            ("ja", "重要：レポートは日本語で生成してください。"),
-            ("es", "IMPORTANTE: Genere el informe en español."),
-            ("fr", "IMPORTANT : Générez le rapport en français."),
-            ("de", "WICHTIG: Erstellen Sie den Bericht auf Deutsch."),
-            ("ko", "중요: 보고서를 한국어로 생성하세요."),
-        ];
-        let instruction = instructions
-            .iter()
-            .find(|(code, _)| *code == language)
-            .map(|(_, text)| *text)
-            .unwrap_or("IMPORTANT: Generate the report in the specified language.");
-        writeln!(p, "{}\n", instruction).unwrap();
-    }
+    write_language_instruction(&mut p, language);
 
-    // Input data header
     writeln!(p, "# Input Data\n").unwrap();
     writeln!(p, "**Date:** {}\n", report.date).unwrap();
 
-    // Sessions grouped by project
-    if !report.sessions.is_empty() {
-        writeln!(p, "## Work Sessions by Project\n").unwrap();
+    write_sessions_by_project(&mut p, &report.sessions);
+    write_cc_commits_by_project(&mut p, &report.git_commits);
+    write_summary_statistics(&mut p, report);
 
-        let project_sessions = group_by(&report.sessions, |s| &s.project_name);
-        for (project, sessions) in &project_sessions {
-            let total_tokens: i64 = sessions.iter().map(|s| s.tokens).sum();
-            let total_cost: f64 = sessions.iter().map(|s| s.cost_usd).sum();
-            let total_duration: i64 = sessions.iter().map(|s| s.duration_minutes).sum();
+    write!(p, "{}", AI_TASK_INSTRUCTIONS).unwrap();
 
-            writeln!(p, "### {}", project).unwrap();
-            writeln!(p, "- Sessions: {}", sessions.len()).unwrap();
-            writeln!(p, "- Duration: {} minutes", total_duration).unwrap();
-            writeln!(p, "- Tokens: {} ({} tokens)", format_tokens(total_tokens), total_tokens).unwrap();
-            writeln!(p, "- Cost: ${:.2}\n", total_cost).unwrap();
+    p
+}
 
-            writeln!(p, "**Session prompts:**").unwrap();
-            for s in sessions {
-                writeln!(p, "- \"{}\"", s.prompt).unwrap();
-            }
-            p.push('\n');
-        }
+fn write_language_instruction(p: &mut String, language: &str) {
+    if language == "auto" {
+        return;
     }
 
-    // CC-assisted git commits grouped by project
-    let cc_commits: Vec<_> = report.git_commits.iter().filter(|c| c.is_cc_assisted).collect();
-    if !cc_commits.is_empty() {
-        writeln!(p, "## Claude Code Assisted Git Commits\n").unwrap();
+    let instruction = match language {
+        "en" => "IMPORTANT: Generate the report in English.",
+        "zh" => "\u{91CD}\u{8981}\u{63D0}\u{793A}\u{FF1A}\u{8BF7}\u{4F7F}\u{7528}\u{4E2D}\u{6587}\u{751F}\u{6210}\u{62A5}\u{544A}\u{3002}",
+        "ja" => "\u{91CD}\u{8981}\u{FF1A}\u{30EC}\u{30DD}\u{30FC}\u{30C8}\u{306F}\u{65E5}\u{672C}\u{8A9E}\u{3067}\u{751F}\u{6210}\u{3057}\u{3066}\u{304F}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "es" => "IMPORTANTE: Genere el informe en espa\u{00F1}ol.",
+        "fr" => "IMPORTANT : G\u{00E9}n\u{00E9}rez le rapport en fran\u{00E7}ais.",
+        "de" => "WICHTIG: Erstellen Sie den Bericht auf Deutsch.",
+        "ko" => "\u{C911}\u{C694}: \u{BCF4}\u{ACE0}\u{C11C}\u{B97C} \u{D55C}\u{AD6D}\u{C5B4}\u{B85C} \u{C0DD}\u{C131}\u{D558}\u{C138}\u{C694}.",
+        _ => "IMPORTANT: Generate the report in the specified language.",
+    };
+    writeln!(p, "{}\n", instruction).unwrap();
+}
 
-        let commit_groups = group_by(&cc_commits, |c| &c.project_name);
-        for (project, commits) in &commit_groups {
-            writeln!(p, "### {}", project).unwrap();
-            for c in commits {
-                writeln!(p, "- `{}` {}", c.hash, c.message).unwrap();
-            }
-            p.push('\n');
-        }
+fn write_sessions_by_project(p: &mut String, sessions: &[SessionSummary]) {
+    if sessions.is_empty() {
+        return;
     }
 
-    // Summary statistics
+    writeln!(p, "## Work Sessions by Project\n").unwrap();
+
+    let project_sessions = group_by(sessions, |s| &s.project_name);
+    for (project, sessions) in &project_sessions {
+        let total_tokens: i64 = sessions.iter().map(|s| s.tokens).sum();
+        let total_cost: f64 = sessions.iter().map(|s| s.cost_usd).sum();
+        let total_duration: i64 = sessions.iter().map(|s| s.duration_minutes).sum();
+
+        writeln!(p, "### {}", project).unwrap();
+        writeln!(p, "- Sessions: {}", sessions.len()).unwrap();
+        writeln!(p, "- Duration: {} minutes", total_duration).unwrap();
+        writeln!(p, "- Tokens: {} ({} tokens)", format_tokens(total_tokens), total_tokens).unwrap();
+        writeln!(p, "- Cost: ${:.2}\n", total_cost).unwrap();
+
+        writeln!(p, "**Session prompts:**").unwrap();
+        for s in sessions {
+            writeln!(p, "- \"{}\"", s.prompt).unwrap();
+        }
+        p.push('\n');
+    }
+}
+
+fn write_cc_commits_by_project(p: &mut String, commits: &[GitCommit]) {
+    let cc_commits = cc_assisted_commits(commits);
+    if cc_commits.is_empty() {
+        return;
+    }
+
+    writeln!(p, "## Claude Code Assisted Git Commits\n").unwrap();
+
+    let commit_groups = group_by(&cc_commits, |c| &c.project_name);
+    for (project, commits) in &commit_groups {
+        writeln!(p, "### {}", project).unwrap();
+        for c in commits {
+            writeln!(p, "- `{}` {}", c.hash, c.message).unwrap();
+        }
+        p.push('\n');
+    }
+}
+
+fn write_summary_statistics(p: &mut String, report: &DailyReport) {
+    let cc_count = report.git_commits.iter().filter(|c| c.is_cc_assisted).count();
+
     writeln!(p, "## Summary Statistics\n").unwrap();
     writeln!(p, "- Total sessions: {}", report.usage_summary.total_sessions).unwrap();
     writeln!(p, "- Total tokens: {} ({})", format_tokens(report.usage_summary.total_tokens), report.usage_summary.total_tokens).unwrap();
@@ -543,14 +586,9 @@ fn build_ai_prompt(report: &DailyReport, language: &str) -> String {
         p,
         "- Git commits: {} ({} CC-assisted)\n",
         report.git_commits.len(),
-        cc_commits.len()
+        cc_count
     )
     .unwrap();
-
-    // Task instructions
-    write!(p, "{}", AI_TASK_INSTRUCTIONS).unwrap();
-
-    p
 }
 
 const AI_TASK_INSTRUCTIONS: &str = "\
@@ -585,6 +623,11 @@ Return ONLY the JSON object, no other text.";
 // Shared utilities
 // ---------------------------------------------------------------------------
 
+/// Filter commits to only those assisted by Claude Code.
+fn cc_assisted_commits(commits: &[GitCommit]) -> Vec<&GitCommit> {
+    commits.iter().filter(|c| c.is_cc_assisted).collect()
+}
+
 fn format_tokens(tokens: i64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
@@ -606,7 +649,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 }
 
 /// Extract the project name from a filesystem path
-fn project_name_from_path(path: &PathBuf) -> String {
+fn project_name_from_path(path: &Path) -> String {
     path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")

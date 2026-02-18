@@ -1,17 +1,17 @@
-import { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
+  Check,
+  Copy,
+  FolderOpen,
+  GripVertical,
+  Pencil,
+  Play,
   Plus,
   Star,
-  Copy,
-  Play,
-  Pencil,
-  Trash2,
-  GripVertical,
-  FolderOpen,
-  Check,
   Tag,
+  Trash2,
 } from "lucide-react";
 import { Favorite } from "../lib/types";
 import { useToast } from "../contexts/ToastContext";
@@ -33,7 +33,121 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
-export default function FavoriteView() {
+// --- Shared styles ---
+
+const INPUT_CLASS =
+  "w-full bg-white/5 border border-white/10 rounded-lg py-2 px-3 text-sm text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:outline-none";
+
+const TAGS_INPUT_CLASS =
+  "flex-1 bg-white/5 border border-white/10 rounded-lg py-1.5 px-3 text-xs text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:outline-none";
+
+// --- Helpers ---
+
+function projectName(path: string): string {
+  return path.split(/[/\\]/).pop() ?? path;
+}
+
+function parseTags(tags: string | null): string[] {
+  if (!tags) return [];
+  return tags.split(",").map((t) => t.trim()).filter(Boolean);
+}
+
+// --- Reusable sub-components ---
+
+interface EmptyStateProps {
+  title: string;
+  subtitle: string;
+}
+
+function EmptyState({ title, subtitle }: EmptyStateProps): React.ReactElement {
+  return (
+    <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-3">
+      <Star size={32} className="opacity-50" />
+      <p className="text-sm">{title}</p>
+      <p className="text-xs text-gray-600">{subtitle}</p>
+    </div>
+  );
+}
+
+interface FavoriteFormProps {
+  name: string;
+  prompt: string;
+  tags: string;
+  onNameChange: (value: string) => void;
+  onPromptChange: (value: string) => void;
+  onTagsChange: (value: string) => void;
+  onSave: () => void;
+  onCancel: () => void;
+  saveLabel: string;
+  saveIcon?: React.ReactElement;
+  autoFocusName?: boolean;
+}
+
+function FavoriteForm({
+  name,
+  prompt,
+  tags,
+  onNameChange,
+  onPromptChange,
+  onTagsChange,
+  onSave,
+  onCancel,
+  saveLabel,
+  saveIcon,
+  autoFocusName = false,
+}: FavoriteFormProps): React.ReactElement {
+  const isSaveDisabled = !name.trim() || !prompt.trim();
+
+  return (
+    <div className="space-y-3">
+      <input
+        type="text"
+        value={name}
+        onChange={(e) => onNameChange(e.target.value)}
+        placeholder="Name (e.g., 'Fix TypeScript errors')"
+        className={INPUT_CLASS}
+        autoFocus={autoFocusName}
+      />
+      <textarea
+        value={prompt}
+        onChange={(e) => onPromptChange(e.target.value)}
+        placeholder="Prompt template..."
+        rows={3}
+        className={`${INPUT_CLASS} resize-none`}
+      />
+      <div className="flex items-center gap-2">
+        <Tag size={14} className="text-gray-500 shrink-0" />
+        <input
+          type="text"
+          value={tags}
+          onChange={(e) => onTagsChange(e.target.value)}
+          placeholder="Tags (comma separated, e.g., 'debug, typescript')"
+          className={TAGS_INPUT_CLASS}
+        />
+      </div>
+      <div className="flex items-center justify-end gap-2">
+        <button
+          onClick={onCancel}
+          className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={onSave}
+          disabled={isSaveDisabled}
+          className="flex items-center gap-1 px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+        >
+          {saveIcon}
+          {saveLabel}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// --- Main view ---
+
+export default function FavoriteView(): React.ReactElement {
   const [favorites, setFavorites] = useState<Favorite[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAddForm, setShowAddForm] = useState(false);
@@ -49,16 +163,14 @@ export default function FavoriteView() {
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
-      activationConstraint: {
-        distance: 8,
-      },
+      activationConstraint: { distance: 8 },
     }),
     useSensor(KeyboardSensor, {
       coordinateGetter: sortableKeyboardCoordinates,
     })
   );
 
-  const loadFavorites = async () => {
+  async function loadFavorites(): Promise<void> {
     try {
       const result = await invoke<Favorite[]>("get_favorites", {});
       setFavorites(result);
@@ -67,35 +179,41 @@ export default function FavoriteView() {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const loadProjects = async () => {
+  async function loadProjects(): Promise<void> {
     try {
       const result = await invoke<string[]>("get_projects", {});
       setProjects(result);
     } catch (error) {
       console.error("Failed to load projects:", error);
     }
-  };
+  }
 
   useEffect(() => {
     loadFavorites();
     loadProjects();
   }, []);
 
-  // Close pickers when clicking outside
   useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
+    function handleClickOutside(event: MouseEvent): void {
       if (runPickerRef.current && !runPickerRef.current.contains(event.target as Node)) {
         setShowRunPicker(null);
       }
-    };
+    }
 
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  const createFavorite = async () => {
+  function resetAddForm(): void {
+    setNewName("");
+    setNewPrompt("");
+    setNewTags("");
+    setShowAddForm(false);
+  }
+
+  async function createFavorite(): Promise<void> {
     if (!newName.trim() || !newPrompt.trim()) return;
 
     try {
@@ -105,19 +223,16 @@ export default function FavoriteView() {
         projectPath: null,
         tags: newTags.trim() || null,
       });
-      setNewName("");
-      setNewPrompt("");
-      setNewTags("");
-      setShowAddForm(false);
+      resetAddForm();
       loadFavorites();
       toast.success("Favorite created");
     } catch (error) {
       console.error("Failed to create favorite:", error);
       toast.error("Failed to create favorite");
     }
-  };
+  }
 
-  const updateFavorite = async (id: string, name: string, prompt: string, tags: string) => {
+  async function updateFavorite(id: string, name: string, prompt: string, tags: string): Promise<void> {
     try {
       await invoke("update_favorite", {
         id,
@@ -133,9 +248,9 @@ export default function FavoriteView() {
       console.error("Failed to update favorite:", error);
       toast.error("Failed to update favorite");
     }
-  };
+  }
 
-  const deleteFavorite = async (id: string) => {
+  async function deleteFavorite(id: string): Promise<void> {
     try {
       await invoke("delete_favorite", { id });
       loadFavorites();
@@ -144,9 +259,9 @@ export default function FavoriteView() {
       console.error("Failed to delete favorite:", error);
       toast.error("Failed to delete favorite");
     }
-  };
+  }
 
-  const copyPrompt = async (prompt: string) => {
+  async function copyPrompt(prompt: string): Promise<void> {
     try {
       await writeText(prompt);
       toast.success("Copied to clipboard");
@@ -154,9 +269,9 @@ export default function FavoriteView() {
       console.error("Failed to copy:", error);
       toast.error("Failed to copy");
     }
-  };
+  }
 
-  const runPrompt = async (prompt: string, projectPath: string) => {
+  async function runPrompt(prompt: string, projectPath: string): Promise<void> {
     try {
       await invoke("create_task", {
         prompt,
@@ -170,31 +285,29 @@ export default function FavoriteView() {
       console.error("Failed to create task:", error);
       toast.error("Failed to create task");
     }
-  };
+  }
 
-  const handleDragEnd = async (event: DragEndEvent) => {
+  async function handleDragEnd(event: DragEndEvent): Promise<void> {
     const { active, over } = event;
-
     if (!over || active.id === over.id) return;
 
     const oldIndex = favorites.findIndex((f) => f.id === active.id);
     const newIndex = favorites.findIndex((f) => f.id === over.id);
+    if (oldIndex === -1 || newIndex === -1) return;
 
-    if (oldIndex !== -1 && newIndex !== -1) {
-      const reordered = arrayMove(favorites, oldIndex, newIndex);
-      setFavorites(reordered);
+    const reordered = arrayMove(favorites, oldIndex, newIndex);
+    setFavorites(reordered);
 
-      try {
-        await invoke("reorder_favorites", {
-          favoriteIds: reordered.map((f) => f.id),
-        });
-      } catch (error) {
-        console.error("Failed to reorder favorites:", error);
-        toast.error("Failed to save order");
-        loadFavorites();
-      }
+    try {
+      await invoke("reorder_favorites", {
+        favoriteIds: reordered.map((f) => f.id),
+      });
+    } catch (error) {
+      console.error("Failed to reorder favorites:", error);
+      toast.error("Failed to save order");
+      loadFavorites();
     }
-  };
+  }
 
   if (loading) {
     return (
@@ -204,7 +317,6 @@ export default function FavoriteView() {
     );
   }
 
-  // Filter favorites based on search query
   const filteredFavorites = favorites.filter((fav) => {
     if (!searchQuery.trim()) return true;
     const query = searchQuery.toLowerCase();
@@ -215,9 +327,44 @@ export default function FavoriteView() {
     );
   });
 
+  function renderFavoritesList(): React.ReactElement {
+    if (favorites.length === 0) {
+      return <EmptyState title="No favorites yet" subtitle="Save your frequently used prompts here" />;
+    }
+    if (filteredFavorites.length === 0) {
+      return <EmptyState title="No matches found" subtitle="Try a different search term" />;
+    }
+    return (
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+        <SortableContext items={filteredFavorites.map((f) => f.id)} strategy={verticalListSortingStrategy}>
+          <div className="space-y-2">
+            {filteredFavorites.map((favorite) => (
+              <SortableFavoriteItem
+                key={favorite.id}
+                favorite={favorite}
+                isEditing={editingId === favorite.id}
+                projects={projects}
+                showRunPicker={showRunPicker === favorite.id}
+                runPickerRef={runPickerRef}
+                onEdit={() => setEditingId(favorite.id)}
+                onSave={(name, prompt, tags) => updateFavorite(favorite.id, name, prompt, tags)}
+                onCancel={() => setEditingId(null)}
+                onDelete={() => deleteFavorite(favorite.id)}
+                onCopy={() => copyPrompt(favorite.prompt)}
+                onRunClick={() => setShowRunPicker(favorite.id)}
+                onRunProject={(projectPath) => runPrompt(favorite.prompt, projectPath)}
+                onCloseRunPicker={() => setShowRunPicker(null)}
+              />
+            ))}
+          </div>
+        </SortableContext>
+      </DndContext>
+    );
+  }
+
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      {/* Header with search */}
+      {/* Header */}
       <div className="px-3 py-2 border-b border-white/5 shrink-0 space-y-2">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-medium text-gray-300">Favorite Prompts</h2>
@@ -243,108 +390,30 @@ export default function FavoriteView() {
       {/* Add form */}
       {showAddForm && (
         <div className="p-3 border-b border-white/5 bg-white/[0.02] shrink-0">
-          <div className="space-y-3">
-            <input
-              type="text"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              placeholder="Name (e.g., 'Fix TypeScript errors')"
-              className="w-full bg-white/5 border border-white/10 rounded-lg py-2 px-3 text-sm text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
-              autoFocus
-            />
-            <textarea
-              value={newPrompt}
-              onChange={(e) => setNewPrompt(e.target.value)}
-              placeholder="Prompt template..."
-              rows={3}
-              className="w-full bg-white/5 border border-white/10 rounded-lg py-2 px-3 text-sm text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:outline-none resize-none"
-            />
-            <div className="flex items-center gap-2">
-              <Tag size={14} className="text-gray-500 shrink-0" />
-              <input
-                type="text"
-                value={newTags}
-                onChange={(e) => setNewTags(e.target.value)}
-                placeholder="Tags (comma separated, e.g., 'debug, typescript')"
-                className="flex-1 bg-white/5 border border-white/10 rounded-lg py-1.5 px-3 text-xs text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
-              />
-            </div>
-            <div className="flex items-center justify-end gap-2">
-              <button
-                onClick={() => {
-                  setShowAddForm(false);
-                  setNewName("");
-                  setNewPrompt("");
-                  setNewTags("");
-                }}
-                className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={createFavorite}
-                disabled={!newName.trim() || !newPrompt.trim()}
-                className="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
-              >
-                Save
-              </button>
-            </div>
-          </div>
+          <FavoriteForm
+            name={newName}
+            prompt={newPrompt}
+            tags={newTags}
+            onNameChange={setNewName}
+            onPromptChange={setNewPrompt}
+            onTagsChange={setNewTags}
+            onSave={createFavorite}
+            onCancel={resetAddForm}
+            saveLabel="Save"
+            autoFocusName
+          />
         </div>
       )}
 
       {/* Favorites list */}
       <div className="flex-1 overflow-y-auto p-3">
-        {favorites.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-3">
-            <Star size={32} className="opacity-50" />
-            <p className="text-sm">No favorites yet</p>
-            <p className="text-xs text-gray-600">
-              Save your frequently used prompts here
-            </p>
-          </div>
-        ) : filteredFavorites.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-3">
-            <Star size={32} className="opacity-50" />
-            <p className="text-sm">No matches found</p>
-            <p className="text-xs text-gray-600">
-              Try a different search term
-            </p>
-          </div>
-        ) : (
-          <DndContext
-            sensors={sensors}
-            collisionDetection={closestCenter}
-            onDragEnd={handleDragEnd}
-          >
-            <SortableContext items={filteredFavorites.map((f) => f.id)} strategy={verticalListSortingStrategy}>
-              <div className="space-y-2">
-                {filteredFavorites.map((favorite) => (
-                  <SortableFavoriteItem
-                    key={favorite.id}
-                    favorite={favorite}
-                    isEditing={editingId === favorite.id}
-                    projects={projects}
-                    showRunPicker={showRunPicker === favorite.id}
-                    runPickerRef={runPickerRef}
-                    onEdit={() => setEditingId(favorite.id)}
-                    onSave={(name, prompt, tags) => updateFavorite(favorite.id, name, prompt, tags)}
-                    onCancel={() => setEditingId(null)}
-                    onDelete={() => deleteFavorite(favorite.id)}
-                    onCopy={() => copyPrompt(favorite.prompt)}
-                    onRunClick={() => setShowRunPicker(favorite.id)}
-                    onRunProject={(projectPath) => runPrompt(favorite.prompt, projectPath)}
-                    onCloseRunPicker={() => setShowRunPicker(null)}
-                  />
-                ))}
-              </div>
-            </SortableContext>
-          </DndContext>
-        )}
+        {renderFavoritesList()}
       </div>
     </div>
   );
 }
+
+// --- Sortable item ---
 
 interface SortableFavoriteItemProps {
   favorite: Favorite;
@@ -376,7 +445,7 @@ function SortableFavoriteItem({
   onRunClick,
   onRunProject,
   onCloseRunPicker,
-}: SortableFavoriteItemProps) {
+}: SortableFavoriteItemProps): React.ReactElement {
   const [editName, setEditName] = useState(favorite.name);
   const [editPrompt, setEditPrompt] = useState(favorite.prompt);
   const [editTags, setEditTags] = useState(favorite.tags || "");
@@ -405,57 +474,24 @@ function SortableFavoriteItem({
     }
   }, [isEditing, favorite]);
 
-  // Parse tags string into array
-  const tagList = favorite.tags
-    ? favorite.tags.split(",").map((t) => t.trim()).filter((t) => t)
-    : [];
+  const tagList = parseTags(favorite.tags);
 
   if (isEditing) {
     return (
-      <div
-        ref={setNodeRef}
-        style={style}
-        className="p-3 bg-white/[0.03] border border-blue-500/30 rounded-lg"
-      >
-        <input
-          type="text"
-          value={editName}
-          onChange={(e) => setEditName(e.target.value)}
-          className="w-full bg-white/5 border border-white/10 rounded-lg py-2 px-3 text-sm text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:outline-none mb-2"
-          autoFocus
+      <div ref={setNodeRef} style={style} className="p-3 bg-white/[0.03] border border-blue-500/30 rounded-lg">
+        <FavoriteForm
+          name={editName}
+          prompt={editPrompt}
+          tags={editTags}
+          onNameChange={setEditName}
+          onPromptChange={setEditPrompt}
+          onTagsChange={setEditTags}
+          onSave={() => onSave(editName, editPrompt, editTags)}
+          onCancel={onCancel}
+          saveLabel="Save"
+          saveIcon={<Check size={12} />}
+          autoFocusName
         />
-        <textarea
-          value={editPrompt}
-          onChange={(e) => setEditPrompt(e.target.value)}
-          rows={3}
-          className="w-full bg-white/5 border border-white/10 rounded-lg py-2 px-3 text-sm text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:outline-none resize-none mb-2"
-        />
-        <div className="flex items-center gap-2 mb-3">
-          <Tag size={14} className="text-gray-500 shrink-0" />
-          <input
-            type="text"
-            value={editTags}
-            onChange={(e) => setEditTags(e.target.value)}
-            placeholder="Tags (comma separated)"
-            className="flex-1 bg-white/5 border border-white/10 rounded-lg py-1.5 px-3 text-xs text-gray-200 placeholder:text-gray-500 focus:ring-1 focus:ring-blue-500/50 focus:outline-none"
-          />
-        </div>
-        <div className="flex justify-end gap-2">
-          <button
-            onClick={onCancel}
-            className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => onSave(editName, editPrompt, editTags)}
-            disabled={!editName.trim() || !editPrompt.trim()}
-            className="flex items-center gap-1 px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
-          >
-            <Check size={12} />
-            Save
-          </button>
-        </div>
       </div>
     );
   }
@@ -466,7 +502,7 @@ function SortableFavoriteItem({
       style={style}
       className="group relative p-3 bg-white/[0.03] border border-white/[0.05] rounded-lg hover:bg-white/[0.06] transition-colors"
     >
-      {/* Title row with buttons */}
+      {/* Title row */}
       <div className="flex items-center gap-2 mb-1">
         <button
           {...attributes}
@@ -479,7 +515,8 @@ function SortableFavoriteItem({
         <span className="text-sm font-medium text-gray-200 truncate flex-1 min-w-0 group-hover:mr-[120px] transition-all">
           {favorite.name}
         </span>
-        {/* Action buttons - positioned absolutely on hover */}
+
+        {/* Action buttons */}
         <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0 absolute right-3">
           <button
             onClick={onCopy}
@@ -518,7 +555,7 @@ function SortableFavoriteItem({
                         className="w-full text-left px-3 py-1.5 text-xs text-gray-300 hover:bg-white/5 rounded transition-colors flex items-center gap-2"
                       >
                         <FolderOpen size={12} className="text-gray-500" />
-                        {project.split(/[/\\]/).pop()}
+                        {projectName(project)}
                       </button>
                     ))
                   )}

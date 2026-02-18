@@ -70,6 +70,17 @@ function priorityDotColor(priority: string): string {
 
 // --- Sub-components ---
 
+interface SpinnerProps {
+  size?: string;
+  color?: string;
+}
+
+function Spinner({ size = "w-6 h-6", color = "border-blue-500" }: SpinnerProps) {
+  return (
+    <div className={`${size} border-2 ${color} border-t-transparent rounded-full animate-spin`} />
+  );
+}
+
 interface SectionCardProps {
   children: React.ReactNode;
 }
@@ -160,7 +171,7 @@ export default function ReportsView() {
     setGenerating(true);
     try {
       const result = await invoke<DailyReport>("generate_daily_report", {
-        date: date || null,
+        date: date ?? null,
       });
       setReport(result);
       setSelectedDate(result.date);
@@ -203,7 +214,7 @@ export default function ReportsView() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full">
-        <div className="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+        <Spinner />
       </div>
     );
   }
@@ -214,23 +225,21 @@ export default function ReportsView() {
     <div className="h-full flex flex-col overflow-hidden">
       {/* Header */}
       <div className="p-3 border-b border-white/5 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-2">
-          <select
-            value={selectedDate || ""}
-            onChange={(e) => setSelectedDate(e.target.value)}
-            className="bg-white/5 border border-white/10 rounded-lg py-1.5 px-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
-          >
-            {reports.length === 0 ? (
-              <option value="">No reports</option>
-            ) : (
-              reports.map((date) => (
-                <option key={date} value={date}>
-                  {formatDate(date)}
-                </option>
-              ))
-            )}
-          </select>
-        </div>
+        <select
+          value={selectedDate ?? ""}
+          onChange={(e) => setSelectedDate(e.target.value)}
+          className="bg-white/5 border border-white/10 rounded-lg py-1.5 px-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+        >
+          {reports.length === 0 ? (
+            <option value="">No reports</option>
+          ) : (
+            reports.map((date) => (
+              <option key={date} value={date}>
+                {formatDate(date)}
+              </option>
+            ))
+          )}
+        </select>
         <div className="flex items-center gap-2">
           <button
             onClick={() => generateReport()}
@@ -283,7 +292,7 @@ export default function ReportsView() {
                   >
                     {generatingAI ? (
                       <>
-                        <div className="w-3 h-3 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                        <Spinner size="w-3 h-3" color="border-purple-400" />
                         Generating...
                       </>
                     ) : (
@@ -422,9 +431,9 @@ export default function ReportsView() {
             {/* Pending Tasks */}
             {report.pending_tasks.length > 0 && (
               <SectionCard>
-                <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
+                <SectionHeader icon={<Clock size={12} />}>
                   Pending Tasks ({report.pending_tasks.length})
-                </h4>
+                </SectionHeader>
                 <div className="space-y-2">
                   {report.pending_tasks.slice(0, 5).map((task, index) => (
                     <div

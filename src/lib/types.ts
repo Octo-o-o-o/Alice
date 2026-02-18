@@ -1,16 +1,69 @@
 // TypeScript types matching the Rust backend structs.
 // IMPORTANT: Field names and types must stay in sync with the Rust backend.
 
-// --- Enums & union types ---
+// ---------------------------------------------------------------------------
+// Enums and union types
+// ---------------------------------------------------------------------------
 
-export type SessionStatus = "idle" | "active" | "completed" | "error" | "needs_input";
+export type SessionStatus =
+  | "idle"
+  | "active"
+  | "completed"
+  | "error"
+  | "needs_input";
+
 export type ProviderId = "claude" | "codex" | "gemini";
-export type Theme = "system" | "light" | "dark";
-export type TerminalApp = "background" | "system" | "iterm2" | "windows_terminal" | "warp" | "custom";
-export type AutoActionType = "none" | "sleep" | "shutdown";
-export type TaskStatus = "backlog" | "queued" | "running" | "completed" | "failed" | "skipped";
 
-// --- Configuration ---
+export type Theme = "system" | "light" | "dark";
+
+export type TerminalApp =
+  | "background"
+  | "system"
+  | "iterm2"
+  | "windows_terminal"
+  | "warp"
+  | "custom";
+
+export type AutoActionType = "none" | "sleep" | "shutdown";
+
+export type TaskStatus =
+  | "backlog"
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped";
+
+export type ImageSourceType = "base64" | "path";
+
+export type ServiceImpact = "none" | "minor" | "major" | "critical";
+
+export type SubscriptionType = "max" | "pro" | "free" | "team" | "enterprise";
+
+export type Platform = "macos" | "windows" | "linux";
+
+// ---------------------------------------------------------------------------
+// Shared field groups (used via intersection to reduce duplication)
+// ---------------------------------------------------------------------------
+
+/** Fields common to usage aggregations: tokens, cost, and session count. */
+interface UsageMetrics {
+  tokens: number;
+  cost_usd: number;
+  session_count: number;
+}
+
+/** Detailed token breakdown used by Session and UsageStats. */
+interface TokenBreakdown {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
 export interface AutoActionConfig {
   enabled: boolean;
@@ -66,9 +119,11 @@ export interface AppConfig {
   active_environment_id?: string | null;
 }
 
-// --- Sessions ---
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
 
-export interface Session {
+export interface Session extends TokenBreakdown {
   session_id: string;
   project_path: string;
   project_name: string;
@@ -82,11 +137,6 @@ export interface Session {
   message_count: number;
   total_tokens: number;
   total_cost_usd: number;
-  /** Detailed token breakdown */
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_write_tokens: number;
   model: string | null;
   status: SessionStatus;
   provider: ProviderId;
@@ -104,10 +154,10 @@ export interface SessionMessage {
 }
 
 export interface ImageContent {
-  source_type: string; // "base64" or "path"
-  media_type: string | null; // e.g., "image/png", "image/jpeg"
-  data: string | null; // base64 data
-  path: string | null; // file path
+  source_type: ImageSourceType;
+  media_type: string | null;
+  data: string | null;
+  path: string | null;
 }
 
 export interface SessionDetail {
@@ -115,7 +165,9 @@ export interface SessionDetail {
   messages: SessionMessage[];
 }
 
-// --- Tasks ---
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
 
 export interface Task {
   id: string;
@@ -148,33 +200,25 @@ export interface QueueStartResult {
   needs_terminal_choice: boolean;
 }
 
-// --- Usage ---
+// ---------------------------------------------------------------------------
+// Usage
+// ---------------------------------------------------------------------------
 
-export interface UsageStats {
+export interface UsageStats extends TokenBreakdown {
   total_tokens: number;
   total_cost_usd: number;
   session_count: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_write_tokens: number;
   daily_usage: DailyUsage[];
   project_usage: ProjectUsage[];
 }
 
-export interface DailyUsage {
+export interface DailyUsage extends UsageMetrics {
   date: string;
-  tokens: number;
-  cost_usd: number;
-  session_count: number;
 }
 
-export interface ProjectUsage {
+export interface ProjectUsage extends UsageMetrics {
   project_name: string;
   project_path: string;
-  tokens: number;
-  cost_usd: number;
-  session_count: number;
 }
 
 export interface LiveUsageStats {
@@ -200,7 +244,9 @@ export interface ProviderUsage {
   error: string | null;
 }
 
-// --- Events ---
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
 
 export interface SessionUpdateEvent {
   session_id: string;
@@ -214,7 +260,9 @@ export interface QueueStatusEvent {
   queued_count: number;
 }
 
-// --- Daily reports ---
+// ---------------------------------------------------------------------------
+// Daily reports
+// ---------------------------------------------------------------------------
 
 export interface DailyReport {
   date: string;
@@ -267,10 +315,12 @@ export interface TaskSummary {
   priority: string;
 }
 
-// --- Service status ---
+// ---------------------------------------------------------------------------
+// Service status
+// ---------------------------------------------------------------------------
 
 export interface AnthropicStatus {
-  status: string; // "none" | "minor" | "major" | "critical"
+  status: ServiceImpact;
   description: string;
   incidents: StatusIncident[];
   last_updated: number;
@@ -284,16 +334,18 @@ export interface StatusIncident {
   updated_at: string;
 }
 
-// --- Onboarding & system info ---
+// ---------------------------------------------------------------------------
+// Onboarding and system info
+// ---------------------------------------------------------------------------
 
 export interface OnboardingStatus {
   cli_installed: boolean;
   cli_version: string | null;
   credentials_found: boolean;
   account_email: string | null;
-  subscription_type: 'max' | 'pro' | 'free' | 'team' | 'enterprise' | null;
+  subscription_type: SubscriptionType | null;
   claude_dir_exists: boolean;
-  platform: 'macos' | 'windows' | 'linux';
+  platform: Platform;
   hooks_installed: boolean;
   existing_sessions_count: number;
 }
@@ -324,7 +376,9 @@ export interface ScanResult {
   projects: string[];
 }
 
-// --- Favorites ---
+// ---------------------------------------------------------------------------
+// Favorites
+// ---------------------------------------------------------------------------
 
 export interface Favorite {
   id: string;
@@ -337,7 +391,9 @@ export interface Favorite {
   updated_at: string;
 }
 
-// --- Provider status ---
+// ---------------------------------------------------------------------------
+// Provider status
+// ---------------------------------------------------------------------------
 
 export interface ProviderStatus {
   id: ProviderId;

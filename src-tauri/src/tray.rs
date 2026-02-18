@@ -1,12 +1,9 @@
-// Tray icon management for Alice
-
-#![allow(dead_code)]
-
+use crate::session::SessionStatus;
 use std::sync::atomic::{AtomicU8, Ordering};
 use tauri::{AppHandle, Emitter};
 
-/// Tray icon states
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 #[repr(u8)]
 pub enum TrayState {
     Idle = 0,
@@ -17,16 +14,6 @@ pub enum TrayState {
 }
 
 impl TrayState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Active => "active",
-            Self::Success => "success",
-            Self::Warning => "warning",
-            Self::Error => "error",
-        }
-    }
-
     pub fn tooltip(self) -> &'static str {
         match self {
             Self::Idle => "Alice - No active sessions",
@@ -36,8 +23,10 @@ impl TrayState {
             Self::Error => "Alice - Error occurred",
         }
     }
+}
 
-    pub fn from_u8(v: u8) -> Self {
+impl From<u8> for TrayState {
+    fn from(v: u8) -> Self {
         match v {
             1 => Self::Active,
             2 => Self::Success,
@@ -48,48 +37,54 @@ impl TrayState {
     }
 }
 
-static CURRENT_STATE: AtomicU8 = AtomicU8::new(0);
-
-/// Event emitted when tray state changes
-#[derive(Clone, serde::Serialize)]
-pub struct TrayStateEvent {
-    pub state: String,
-    pub tooltip: String,
+impl From<SessionStatus> for TrayState {
+    fn from(status: SessionStatus) -> Self {
+        match status {
+            SessionStatus::Active => Self::Active,
+            SessionStatus::NeedsInput => Self::Warning,
+            SessionStatus::Error => Self::Error,
+            SessionStatus::Completed => Self::Success,
+            SessionStatus::Idle => Self::Idle,
+        }
+    }
 }
 
-/// Update the tray icon state
+static CURRENT_STATE: AtomicU8 = AtomicU8::new(0);
+
+#[derive(Clone, serde::Serialize)]
+struct TrayStateEvent {
+    state: TrayState,
+    tooltip: &'static str,
+}
+
+/// Update the tray icon state and emit a change event to the frontend.
 pub fn set_tray_state(app: &AppHandle, state: TrayState) {
-    let prev = get_tray_state();
+    let prev = current_state();
     if prev == state {
         return;
     }
 
     CURRENT_STATE.store(state as u8, Ordering::SeqCst);
 
+    let tooltip = state.tooltip();
+
     if let Some(tray) = app.tray_by_id("main") {
-        let _ = tray.set_tooltip(Some(state.tooltip()));
+        let _ = tray.set_tooltip(Some(tooltip));
     }
 
-    let _ = app.emit(
-        "tray-state-changed",
-        TrayStateEvent {
-            state: state.as_str().to_string(),
-            tooltip: state.tooltip().to_string(),
-        },
-    );
+    let _ = app.emit("tray-state-changed", TrayStateEvent { state, tooltip });
 
     tracing::debug!("Tray state changed: {:?} -> {:?}", prev, state);
 }
 
-/// Get current tray state
-pub fn get_tray_state() -> TrayState {
-    TrayState::from_u8(CURRENT_STATE.load(Ordering::SeqCst))
-}
-
-/// Reset tray state to idle after a delay
+/// Reset tray state to idle after a delay.
 pub fn reset_tray_state_delayed(app: AppHandle, delay_ms: u64) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         set_tray_state(&app, TrayState::Idle);
     });
+}
+
+fn current_state() -> TrayState {
+    TrayState::from(CURRENT_STATE.load(Ordering::SeqCst))
 }

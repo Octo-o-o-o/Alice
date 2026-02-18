@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, useCallback, useMemo, ReactNode } from "react";
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Theme } from "../lib/types";
 
@@ -10,37 +10,42 @@ interface ThemeContextValue {
   setTheme: (theme: Theme) => Promise<void>;
 }
 
+interface ThemeProviderProps {
+  children: ReactNode;
+}
+
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 const darkModeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
-export function ThemeProvider({ children }: { children: ReactNode }) {
+function resolveTheme(theme: Theme, systemIsDark: boolean): ResolvedTheme {
+  if (theme === "system") {
+    return systemIsDark ? "dark" : "light";
+  }
+  return theme;
+}
+
+export function ThemeProvider({ children }: ThemeProviderProps): React.ReactElement {
   const [theme, setThemeState] = useState<Theme>("system");
   const [systemIsDark, setSystemIsDark] = useState(darkModeQuery.matches);
 
-  const resolvedTheme: ResolvedTheme = theme === "system"
-    ? (systemIsDark ? "dark" : "light")
-    : theme;
+  const resolvedTheme = resolveTheme(theme, systemIsDark);
 
-  // Load theme from config on mount
   useEffect(() => {
     invoke<{ theme: Theme }>("get_config", {})
       .then((config) => setThemeState(config.theme || "system"))
       .catch((error) => console.error("Failed to load theme config:", error));
   }, []);
 
-  // Listen for system theme changes
   useEffect(() => {
     const handleChange = (e: MediaQueryListEvent) => setSystemIsDark(e.matches);
     darkModeQuery.addEventListener("change", handleChange);
     return () => darkModeQuery.removeEventListener("change", handleChange);
   }, []);
 
-  // Apply theme class to document root
   useEffect(() => {
-    const root = document.documentElement;
-    root.classList.remove("light", "dark");
-    root.classList.add(resolvedTheme);
+    document.documentElement.classList.remove("light", "dark");
+    document.documentElement.classList.add(resolvedTheme);
   }, [resolvedTheme]);
 
   const setTheme = useCallback(async (newTheme: Theme) => {

@@ -17,13 +17,13 @@ import {
   Image as ImageIcon,
   X,
 } from "lucide-react";
-import { Session, ImageContent } from "../lib/types";
+import type { Session, SessionStatus, ImageContent } from "../lib/types";
 import { useToast } from "../contexts/ToastContext";
 import { getProviderColor } from "../lib/provider-colors";
-import ProviderBadge from "./ProviderBadge";
-import ImageGallery from "./ImageGallery";
+import ProviderBadge from "./ProviderBadge.js";
+import ImageGallery from "./ImageGallery.js";
 
-// --- Pure utility functions (no component state dependency) ---
+// --- Pure utility functions ---
 
 function formatDuration(startMs: number, endMs?: number): string {
   const durationMs = (endMs || Date.now()) - startMs;
@@ -54,7 +54,7 @@ function formatTimeAgo(timestamp: number): string {
   return "Just now";
 }
 
-function getStatusDot(status: string): string {
+function getStatusDotClass(status: SessionStatus): string {
   switch (status) {
     case "active":
       return "bg-blue-500 shadow-glow-blue animate-pulse";
@@ -69,7 +69,16 @@ function getStatusDot(status: string): string {
   }
 }
 
-// --- Label input sub-component (used in both compact and full views) ---
+const CARD_BASE_CLASS =
+  "group relative bg-white/[0.03] hover:bg-white/[0.06] border-t border-r border-b border-white/[0.05] hover:border-white/[0.1] rounded-lg transition-all border-l-[3px]";
+
+const MENU_ITEM_CLASS =
+  "w-full flex items-center gap-2 px-3 py-2 text-xs text-gray-300 hover:bg-white/10 transition-colors";
+
+const ICON_BUTTON_CLASS =
+  "p-1.5 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors";
+
+// --- Sub-components ---
 
 interface LabelInputProps {
   inputRef: React.RefObject<HTMLInputElement | null>;
@@ -77,9 +86,6 @@ interface LabelInputProps {
   onChange: (value: string) => void;
   onSave: () => void;
   onCancel: () => void;
-  onCompositionStart: () => void;
-  onCompositionEnd: () => void;
-  isComposing: boolean;
 }
 
 function LabelInput({
@@ -88,10 +94,9 @@ function LabelInput({
   onChange,
   onSave,
   onCancel,
-  onCompositionStart,
-  onCompositionEnd,
-  isComposing,
 }: LabelInputProps): React.ReactElement {
+  const [isComposing, setIsComposing] = useState(false);
+
   function handleKeyDown(e: React.KeyboardEvent): void {
     if (e.key === "Enter" && !isComposing) {
       onSave();
@@ -108,11 +113,54 @@ function LabelInput({
       onChange={(e) => onChange(e.target.value)}
       onBlur={onSave}
       onKeyDown={handleKeyDown}
-      onCompositionStart={onCompositionStart}
-      onCompositionEnd={onCompositionEnd}
+      onCompositionStart={() => setIsComposing(true)}
+      onCompositionEnd={() => setIsComposing(false)}
       placeholder="Add label..."
       className="w-32 bg-white/5 border border-white/10 rounded px-2 py-1 text-xs text-gray-200 placeholder:text-gray-500 focus:outline-none focus:ring-1 focus:ring-purple-500/50"
     />
+  );
+}
+
+interface ResumeButtonProps {
+  copied: boolean;
+  onClick: () => void;
+  className?: string;
+}
+
+function ResumeButton({ copied, onClick, className = "" }: ResumeButtonProps): React.ReactElement {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex items-center gap-1 px-2 py-1 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded transition-colors ${className}`}
+      title="Copy resume command"
+    >
+      {copied ? <CheckCircle2 size={12} /> : <Play size={12} />}
+      Resume
+    </button>
+  );
+}
+
+interface ImageModalProps {
+  images: ImageContent[];
+  sessionId: string;
+  onClose: () => void;
+}
+
+function ImageModal({ images, sessionId, onClose }: ImageModalProps): React.ReactElement {
+  return (
+    <div className="fixed inset-0 bg-black/90 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+      <div className="relative w-full max-w-6xl max-h-full overflow-auto bg-gray-900/95 rounded-lg p-4">
+        <div className="flex justify-between items-center mb-4 sticky top-0 bg-gray-900/95 z-10 pb-2 border-b border-white/10">
+          <h3 className="text-sm font-medium text-gray-200">
+            Session Images ({images.length})
+          </h3>
+          <button onClick={onClose} className={ICON_BUTTON_CLASS} title="Close">
+            <X size={12} />
+          </button>
+        </div>
+        <ImageGallery images={images} sessionId={sessionId} />
+      </div>
+    </div>
   );
 }
 
@@ -130,13 +178,12 @@ export default function SessionCard({
   compact = false,
   onLabelChange,
   onDelete,
-}: SessionCardProps) {
+}: SessionCardProps): React.ReactElement {
   const [copied, setCopied] = useState(false);
   const [isEditingLabel, setIsEditingLabel] = useState(false);
   const [labelValue, setLabelValue] = useState(session.label || "");
   const [showActions, setShowActions] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [isComposing, setIsComposing] = useState(false);
   const [showImages, setShowImages] = useState(false);
   const [images, setImages] = useState<ImageContent[]>([]);
   const [loadingImages, setLoadingImages] = useState(false);
@@ -166,12 +213,9 @@ export default function SessionCard({
     }
   }, [isEditingLabel]);
 
-  // --- Shared command helper ---
+  // --- Event handlers ---
 
-  async function copyCommand(
-    commandName: string,
-    successMessage: string,
-  ): Promise<void> {
+  async function copyCommand(commandName: string, successMessage: string): Promise<void> {
     try {
       const command = await invoke<string>(commandName, {
         sessionId: session.session_id,
@@ -183,8 +227,6 @@ export default function SessionCard({
       toast.error("Failed to copy command");
     }
   }
-
-  // --- Event handlers ---
 
   async function saveLabel(): Promise<void> {
     const newLabel = labelValue.trim() || null;
@@ -295,17 +337,12 @@ export default function SessionCard({
     }
   }
 
-  // --- Shared label input props ---
-
-  const labelInputProps = {
+  const labelInputProps: LabelInputProps = {
     inputRef: labelInputRef,
     value: labelValue,
     onChange: setLabelValue,
     onSave: saveLabel,
     onCancel: cancelLabelEdit,
-    onCompositionStart: () => setIsComposing(true),
-    onCompositionEnd: () => setIsComposing(false),
-    isComposing,
   };
 
   // --- Compact view ---
@@ -313,7 +350,7 @@ export default function SessionCard({
   if (compact) {
     return (
       <div
-        className="group relative bg-white/[0.03] hover:bg-white/[0.06] border-t border-r border-b border-white/[0.05] hover:border-white/[0.1] rounded-lg p-2.5 transition-all border-l-[3px]"
+        className={`${CARD_BASE_CLASS} p-2.5`}
         style={{ borderLeftColor: providerBorderColor }}
       >
         <div className="flex items-center justify-between gap-2">
@@ -347,14 +384,7 @@ export default function SessionCard({
           >
             <Tag size={12} />
           </button>
-          <button
-            onClick={handleResumeClick}
-            className="flex items-center gap-1 px-2 py-1 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded transition-colors"
-            title="Copy resume command"
-          >
-            {copied ? <CheckCircle2 size={12} /> : <Play size={12} />}
-            Resume
-          </button>
+          <ResumeButton copied={copied} onClick={handleResumeClick} />
         </div>
 
         {/* Label edit popup */}
@@ -371,13 +401,13 @@ export default function SessionCard({
 
   return (
     <div
-      className="group relative bg-white/[0.03] hover:bg-white/[0.06] border-t border-r border-b border-white/[0.05] hover:border-white/[0.1] rounded-lg p-3 transition-all border-l-[3px]"
+      className={`${CARD_BASE_CLASS} p-3`}
       style={{ borderLeftColor: providerBorderColor }}
     >
       {/* Header */}
       <div className="flex justify-between items-start mb-2">
         <div className="flex items-center gap-2 overflow-hidden">
-          <div className={`w-1.5 h-1.5 rounded-full ${getStatusDot(session.status)}`} />
+          <div className={`w-1.5 h-1.5 rounded-full ${getStatusDotClass(session.status)}`} />
           <span className="font-medium text-blue-100 text-sm truncate">
             {session.project_name}
           </span>
@@ -458,17 +488,10 @@ export default function SessionCard({
 
       {/* Hover actions */}
       <div className="absolute right-2 top-2 flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
-        <button
-          onClick={handleResumeClick}
-          className="flex items-center gap-1 px-2 py-1 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded transition-colors shadow-lg"
-          title="Copy resume command"
-        >
-          {copied ? <CheckCircle2 size={12} /> : <Play size={12} />}
-          Resume
-        </button>
+        <ResumeButton copied={copied} onClick={handleResumeClick} className="shadow-lg" />
         <button
           onClick={handleCopySessionId}
-          className="p-1.5 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
+          className={ICON_BUTTON_CLASS}
           title="Copy session ID"
         >
           <Copy size={12} />
@@ -477,7 +500,7 @@ export default function SessionCard({
         <div ref={actionsRef} className="relative">
           <button
             onClick={() => setShowActions(!showActions)}
-            className="p-1.5 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
+            className={ICON_BUTTON_CLASS}
             title="More actions"
           >
             <MoreHorizontal size={12} />
@@ -487,30 +510,21 @@ export default function SessionCard({
               <button
                 onClick={handleViewImages}
                 disabled={loadingImages}
-                className="w-full flex items-center gap-2 px-3 py-2 text-xs text-gray-300 hover:bg-white/10 transition-colors disabled:opacity-50"
+                className={`${MENU_ITEM_CLASS} disabled:opacity-50`}
               >
                 <ImageIcon size={12} />
                 {loadingImages ? "Loading..." : "View Images"}
               </button>
               <div className="border-t border-white/5" />
-              <button
-                onClick={handleForkClick}
-                className="w-full flex items-center gap-2 px-3 py-2 text-xs text-gray-300 hover:bg-white/10 transition-colors"
-              >
+              <button onClick={handleForkClick} className={MENU_ITEM_CLASS}>
                 <GitBranch size={12} />
                 Fork Session
               </button>
-              <button
-                onClick={() => handleExport("markdown")}
-                className="w-full flex items-center gap-2 px-3 py-2 text-xs text-gray-300 hover:bg-white/10 transition-colors"
-              >
+              <button onClick={() => handleExport("markdown")} className={MENU_ITEM_CLASS}>
                 <Download size={12} />
                 Export as MD
               </button>
-              <button
-                onClick={() => handleExport("json")}
-                className="w-full flex items-center gap-2 px-3 py-2 text-xs text-gray-300 hover:bg-white/10 transition-colors"
-              >
+              <button onClick={() => handleExport("json")} className={MENU_ITEM_CLASS}>
                 <Download size={12} />
                 Export as JSON
               </button>
@@ -533,23 +547,11 @@ export default function SessionCard({
 
       {/* Image Gallery Modal */}
       {showImages && images.length > 0 && (
-        <div className="fixed inset-0 bg-black/90 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="relative w-full max-w-6xl max-h-full overflow-auto bg-gray-900/95 rounded-lg p-4">
-            <div className="flex justify-between items-center mb-4 sticky top-0 bg-gray-900/95 z-10 pb-2 border-b border-white/10">
-              <h3 className="text-sm font-medium text-gray-200">
-                Session Images ({images.length})
-              </h3>
-              <button
-                onClick={() => setShowImages(false)}
-                className="p-1.5 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
-                title="Close"
-              >
-                <X size={12} />
-              </button>
-            </div>
-            <ImageGallery images={images} sessionId={session.session_id} />
-          </div>
-        </div>
+        <ImageModal
+          images={images}
+          sessionId={session.session_id}
+          onClose={() => setShowImages(false)}
+        />
       )}
     </div>
   );

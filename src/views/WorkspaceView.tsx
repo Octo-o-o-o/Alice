@@ -102,6 +102,10 @@ function getActionIcon(type: AutoActionType | string): ReactNode {
   }
 }
 
+function isQueueStatus(status: string): boolean {
+  return status === "queued" || status === "running";
+}
+
 /** Shared invoke wrapper to update a task's status without changing other fields. */
 async function invokeUpdateTaskStatus(id: string, status: string): Promise<void> {
   await invoke("update_task", {
@@ -113,7 +117,7 @@ async function invokeUpdateTaskStatus(id: string, status: string): Promise<void>
   });
 }
 
-/** Registers a click-outside handler for a set of refs. Returns a cleanup function. */
+/** Registers click-outside handlers for a set of refs. Returns a cleanup function. */
 function addClickOutsideListener(
   pairs: Array<{ ref: React.RefObject<HTMLElement | null>; close: () => void }>
 ): () => void {
@@ -126,6 +130,19 @@ function addClickOutsideListener(
   }
   document.addEventListener("mousedown", handleClickOutside);
   return () => document.removeEventListener("mousedown", handleClickOutside);
+}
+
+/**
+ * Wraps an async invoke call with console.error logging.
+ * Returns the result on success, or undefined on failure.
+ */
+async function safeInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T | undefined> {
+  try {
+    return await invoke<T>(command, args ?? {});
+  } catch (error) {
+    console.error(`Failed to invoke ${command}:`, error);
+    return undefined;
+  }
 }
 
 // --- Sub-components (internal to this module) ---
@@ -209,23 +226,12 @@ function TerminalPickerModal({
 
         <div className="space-y-2 mb-4">
           {terminalOptions.map((option) => (
-            <button
+            <TerminalOptionButton
               key={option.value}
-              onClick={() => onSelectTerminal(option.value)}
-              className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors ${
-                selectedTerminal === option.value
-                  ? "bg-blue-600 text-white"
-                  : "bg-white/5 text-gray-300 hover:bg-white/10"
-              }`}
-            >
-              {option.label}
-              {option.value === "background" && (
-                <span className="block text-xs opacity-60 mt-0.5">Hidden execution</span>
-              )}
-              {option.value !== "background" && option.value !== "custom" && (
-                <span className="block text-xs opacity-60 mt-0.5">Watch Claude work</span>
-              )}
-            </button>
+              option={option}
+              isSelected={selectedTerminal === option.value}
+              onSelect={onSelectTerminal}
+            />
           ))}
         </div>
 
@@ -258,6 +264,38 @@ function TerminalPickerModal({
   );
 }
 
+interface TerminalOptionButtonProps {
+  option: TerminalOption;
+  isSelected: boolean;
+  onSelect: (value: string) => void;
+}
+
+function TerminalOptionButton({ option, isSelected, onSelect }: TerminalOptionButtonProps) {
+  function getDescription(): string | null {
+    if (option.value === "background") return "Hidden execution";
+    if (option.value !== "custom") return "Watch Claude work";
+    return null;
+  }
+
+  const description = getDescription();
+
+  return (
+    <button
+      onClick={() => onSelect(option.value)}
+      className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors ${
+        isSelected
+          ? "bg-blue-600 text-white"
+          : "bg-white/5 text-gray-300 hover:bg-white/10"
+      }`}
+    >
+      {option.label}
+      {description && (
+        <span className="block text-xs opacity-60 mt-0.5">{description}</span>
+      )}
+    </button>
+  );
+}
+
 interface AutoActionPanelProps {
   autoActionState: AutoActionState | null;
   autoActionEnabled: boolean;
@@ -267,10 +305,8 @@ interface AutoActionPanelProps {
   dropdownRef: React.RefObject<HTMLDivElement | null>;
   onToggleDropdown: () => void;
   onCancelAction: () => void;
-  onUpdateConfig: (key: string, value: boolean | string | number) => void;
-  onSetType: (type: AutoActionType) => void;
-  onSetEnabled: (enabled: boolean) => void;
-  onSetDelay: (delay: number) => void;
+  onSelectActionType: (type: AutoActionType) => void;
+  onSelectDelay: (delay: number) => void;
 }
 
 function AutoActionPanel({
@@ -282,10 +318,8 @@ function AutoActionPanel({
   dropdownRef,
   onToggleDropdown,
   onCancelAction,
-  onUpdateConfig,
-  onSetType,
-  onSetEnabled,
-  onSetDelay,
+  onSelectActionType,
+  onSelectDelay,
 }: AutoActionPanelProps) {
   if (autoActionState?.timer_active) {
     return (
@@ -343,12 +377,7 @@ function AutoActionPanel({
             {(["none", "sleep", "shutdown"] as AutoActionType[]).map((type) => (
               <button
                 key={type}
-                onClick={() => {
-                  onUpdateConfig("action_type", type);
-                  onUpdateConfig("enabled", type !== "none");
-                  onSetType(type);
-                  onSetEnabled(type !== "none");
-                }}
+                onClick={() => onSelectActionType(type)}
                 className={`w-full flex items-center gap-2.5 px-3 py-2 text-sm rounded-lg transition-colors ${
                   autoActionType === type
                     ? "bg-blue-500/10 border border-blue-500/20"
@@ -379,10 +408,7 @@ function AutoActionPanel({
                 {delayOptions.map((mins) => (
                   <button
                     key={mins}
-                    onClick={() => {
-                      onUpdateConfig("delay_minutes", mins);
-                      onSetDelay(mins);
-                    }}
+                    onClick={() => onSelectDelay(mins)}
                     className={`flex-1 px-2.5 py-1.5 text-xs font-medium rounded-lg transition-colors ${
                       autoActionDelay === mins
                         ? "bg-blue-600 text-white shadow-lg shadow-blue-500/20 dark:shadow-blue-900/20"
@@ -829,16 +855,16 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [selectedTasks, setSelectedTasks] = useState<Set<string>>(new Set());
   const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [overId, setOverId] = useState<string | null>(null);
+  const [dragActiveId, setDragActiveId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [isComposing, setIsComposing] = useState(false);
   const [showTerminalPicker, setShowTerminalPicker] = useState(false);
   const [terminalOptions, setTerminalOptions] = useState<TerminalOption[]>([]);
   const [selectedTerminal, setSelectedTerminal] = useState<string>("system");
   const [rememberChoice, setRememberChoice] = useState(true);
   const [selectedProjects, setSelectedProjects] = useState<Set<string>>(new Set());
-  const [isDropdownOpen, setIsDropdownOpen] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement>(null);
+  const [isProjectFilterOpen, setIsProjectFilterOpen] = useState(false);
+  const projectFilterRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const projectPickerRef = useRef<HTMLDivElement>(null);
   const toast = useToast();
@@ -858,82 +884,66 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
 
   // --- Data loading ---
 
-  const loadTasks = async () => {
-    try {
-      const result = await invoke<Task[]>("get_tasks", {});
+  const loadTasks = useCallback(async () => {
+    const result = await safeInvoke<Task[]>("get_tasks");
+    if (result) {
       setTasks(result);
       onTaskCountChange(result.filter((t) => t.status !== "completed" && t.status !== "failed").length);
-    } catch (error) {
-      console.error("Failed to load tasks:", error);
     }
-  };
+  }, [onTaskCountChange]);
 
-  const loadSessions = async () => {
-    try {
-      const result = await invoke<Session[]>("get_active_sessions");
+  const loadSessions = useCallback(async () => {
+    const result = await safeInvoke<Session[]>("get_active_sessions");
+    if (result) {
       setSessions(result);
       onActiveSessionCountChange(result.length);
-    } catch (error) {
-      console.error("Failed to load active sessions:", error);
     }
-  };
+  }, [onActiveSessionCountChange]);
 
-  const loadProjects = async () => {
-    try {
-      const result = await invoke<string[]>("get_projects", {});
+  const loadProjects = useCallback(async () => {
+    const result = await safeInvoke<string[]>("get_projects");
+    if (result) {
       setProjects(result);
-    } catch (error) {
-      console.error("Failed to load projects:", error);
     }
-  };
+  }, []);
 
-  const loadTerminalOptions = async () => {
-    try {
-      const result = await invoke<TerminalOption[]>("get_available_terminals", {});
+  const loadTerminalOptions = useCallback(async () => {
+    const result = await safeInvoke<TerminalOption[]>("get_available_terminals");
+    if (result) {
       setTerminalOptions(result);
       if (result.length > 1) {
         setSelectedTerminal(result[1].value);
       }
-    } catch (error) {
-      console.error("Failed to load terminal options:", error);
     }
-  };
+  }, []);
 
-  const loadQueueStatus = async () => {
-    try {
-      const running = await invoke<boolean>("get_queue_status", {});
+  const loadQueueStatus = useCallback(async () => {
+    const running = await safeInvoke<boolean>("get_queue_status");
+    if (running !== undefined) {
       setQueueRunning(running);
-    } catch (error) {
-      console.error("Failed to get queue status:", error);
     }
-  };
+  }, []);
 
-  const loadAutoActionConfig = async () => {
-    try {
-      const config = await invoke<AppConfig>("get_config");
+  const loadAutoActionConfig = useCallback(async () => {
+    const config = await safeInvoke<AppConfig>("get_config");
+    if (config) {
       setAutoActionEnabled(config.auto_action.enabled);
       setAutoActionType(config.auto_action.action_type);
       setAutoActionDelay(config.auto_action.delay_minutes);
-    } catch (error) {
-      console.error("Failed to load auto action config:", error);
     }
-  };
+  }, []);
 
-  const loadAutoActionState = async () => {
-    try {
-      const state = await invoke<AutoActionState>("get_auto_action_state");
+  const loadAutoActionState = useCallback(async () => {
+    const state = await safeInvoke<AutoActionState>("get_auto_action_state");
+    if (state) {
       setAutoActionState(state);
-    } catch (error) {
-      console.error("Failed to load auto action state:", error);
     }
-  };
+  }, []);
 
   const updateAutoActionConfig = async (key: string, value: boolean | string | number) => {
-    try {
-      await invoke("update_config", { key: `auto_action.${key}`, value });
+    const success = await safeInvoke("update_config", { key: `auto_action.${key}`, value });
+    if (success !== undefined) {
       await loadAutoActionConfig();
-    } catch (error) {
-      console.error("Failed to update auto action config:", error);
     }
   };
 
@@ -951,10 +961,22 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
     }
   };
 
+  const handleSelectActionType = async (type: AutoActionType) => {
+    await updateAutoActionConfig("action_type", type);
+    await updateAutoActionConfig("enabled", type !== "none");
+    setAutoActionType(type);
+    setAutoActionEnabled(type !== "none");
+  };
+
+  const handleSelectDelay = async (delay: number) => {
+    await updateAutoActionConfig("delay_minutes", delay);
+    setAutoActionDelay(delay);
+  };
+
   // --- Effects ---
 
   useEffect(() => {
-    const loadAll = async () => {
+    async function loadAll() {
       await Promise.all([
         loadTasks(),
         loadSessions(),
@@ -964,7 +986,7 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
         loadAutoActionState(),
       ]);
       setLoading(false);
-    };
+    }
     loadAll();
 
     const unlistenQueue = listen<QueueStatusEvent>("queue-status", (event) => {
@@ -997,7 +1019,7 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
   useEffect(() => {
     return addClickOutsideListener([
       { ref: projectPickerRef, close: () => setShowProjectPicker(false) },
-      { ref: dropdownRef, close: () => setIsDropdownOpen(false) },
+      { ref: projectFilterRef, close: () => setIsProjectFilterOpen(false) },
       { ref: autoActionDropdownRef, close: () => setIsAutoActionDropdownOpen(false) },
     ]);
   }, []);
@@ -1101,17 +1123,30 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
   // --- Drag and drop ---
 
   const handleDragStart = (event: DragStartEvent) => {
-    setActiveId(event.active.id as string);
+    setDragActiveId(event.active.id as string);
   };
 
   const handleDragOver = (event: DragOverEvent) => {
-    setOverId((event.over?.id as string) ?? null);
+    setDragOverId((event.over?.id as string) ?? null);
   };
+
+  /** Move a task between sections (backlog <-> queue) via drag-and-drop. */
+  async function moveBetweenSections(taskId: string, targetStatus: "queued" | "backlog"): Promise<void> {
+    try {
+      await invokeUpdateTaskStatus(taskId, targetStatus);
+      loadTasks();
+      const label = targetStatus === "queued" ? "queue" : "backlog";
+      toast.success(`Task moved to ${label}`);
+    } catch (error) {
+      console.error(`Failed to move task to ${targetStatus}:`, error);
+      toast.error("Failed to move task");
+    }
+  }
 
   const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event;
-    setActiveId(null);
-    setOverId(null);
+    setDragActiveId(null);
+    setDragOverId(null);
 
     if (!over) return;
 
@@ -1122,35 +1157,19 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
     if (!activeTask) return;
 
     const fromBacklog = activeTask.status === "backlog";
-    const fromQueue = activeTask.status === "queued" || activeTask.status === "running";
+    const fromQueue = isQueueStatus(activeTask.status);
 
     const overTask = tasks.find((t) => t.id === overTaskId);
     const toBacklog = overTaskId === "backlog-dropzone" || (overTask && overTask.status === "backlog");
-    const toQueue = overTaskId === "queue-dropzone" || (overTask && (overTask.status === "queued" || overTask.status === "running"));
+    const toQueue = overTaskId === "queue-dropzone" || (overTask && isQueueStatus(overTask.status));
 
-    // Cross-section move: backlog -> queue
+    // Cross-section moves
     if (fromBacklog && toQueue) {
-      try {
-        await invokeUpdateTaskStatus(activeTaskId, "queued");
-        loadTasks();
-        toast.success("Task moved to queue");
-      } catch (error) {
-        console.error("Failed to move task to queue:", error);
-        toast.error("Failed to move task");
-      }
+      await moveBetweenSections(activeTaskId, "queued");
       return;
     }
-
-    // Cross-section move: queue -> backlog
     if (fromQueue && toBacklog && activeTask.status !== "running") {
-      try {
-        await invokeUpdateTaskStatus(activeTaskId, "backlog");
-        loadTasks();
-        toast.success("Task moved to backlog");
-      } catch (error) {
-        console.error("Failed to move task to backlog:", error);
-        toast.error("Failed to move task");
-      }
+      await moveBetweenSections(activeTaskId, "backlog");
       return;
     }
 
@@ -1170,7 +1189,7 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
               const others = prev.filter((t) => t.status !== "backlog");
               return [...reordered, ...others];
             }
-            const others = prev.filter((t) => t.status !== "queued" && t.status !== "running");
+            const others = prev.filter((t) => !isQueueStatus(t.status));
             return [...others, ...reordered];
           });
 
@@ -1189,7 +1208,7 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
   // --- Derived data ---
 
   const backlogTasks = tasks.filter((t) => t.status === "backlog");
-  const queuedTasks = tasks.filter((t) => t.status === "queued" || t.status === "running");
+  const queuedTasks = tasks.filter((t) => isQueueStatus(t.status));
   const completedTasks = tasks.filter((t) => t.status === "completed" || t.status === "failed");
 
   const projectGroups = sessions.reduce<Record<string, Session[]>>((acc, session) => {
@@ -1227,7 +1246,7 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
 
   const selectAllProjects = () => {
     setSelectedProjects(new Set());
-    setIsDropdownOpen(false);
+    setIsProjectFilterOpen(false);
   };
 
   function getFilterLabel(): string {
@@ -1376,9 +1395,9 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
               projectGroups={projectGroups}
               selectedProjects={selectedProjects}
               isAllSelected={isAllSelected}
-              isOpen={isDropdownOpen}
-              dropdownRef={dropdownRef}
-              onToggleOpen={() => setIsDropdownOpen(!isDropdownOpen)}
+              isOpen={isProjectFilterOpen}
+              dropdownRef={projectFilterRef}
+              onToggleOpen={() => setIsProjectFilterOpen(!isProjectFilterOpen)}
               onToggleProject={toggleProject}
               onSelectAll={selectAllProjects}
               filterLabel={getFilterLabel()}
@@ -1410,10 +1429,8 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
               dropdownRef={autoActionDropdownRef}
               onToggleDropdown={() => setIsAutoActionDropdownOpen(!isAutoActionDropdownOpen)}
               onCancelAction={cancelAutoAction}
-              onUpdateConfig={updateAutoActionConfig}
-              onSetType={setAutoActionType}
-              onSetEnabled={setAutoActionEnabled}
-              onSetDelay={setAutoActionDelay}
+              onSelectActionType={handleSelectActionType}
+              onSelectDelay={handleSelectDelay}
             />
           </div>
         </div>
@@ -1465,10 +1482,10 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
               )}
             </div>
 
-            <DroppableSection id="queue-dropzone" isOver={overId === "queue-dropzone"}>
+            <DroppableSection id="queue-dropzone" isOver={dragOverId === "queue-dropzone"}>
               {queuedTasks.length === 0 ? (
                 <div className="text-center py-8 text-gray-600 text-xs">
-                  {activeId && backlogTasks.find((t) => t.id === activeId) ? (
+                  {dragActiveId && backlogTasks.find((t) => t.id === dragActiveId) ? (
                     <p className="text-blue-400">Drop here to add to queue</p>
                   ) : (
                     <>
@@ -1589,12 +1606,12 @@ export default function WorkspaceView({ onTaskCountChange, onActiveSessionCountC
                 )}
               </div>
 
-              <DroppableSection id="backlog-dropzone" isOver={overId === "backlog-dropzone"}>
+              <DroppableSection id="backlog-dropzone" isOver={dragOverId === "backlog-dropzone"}>
                 {backlogTasks.length === 0 ? (
                   <div className="text-center py-6 text-gray-500 text-sm">
                     <ListTodo size={24} className="mx-auto mb-2 opacity-50" />
                     <p>No tasks yet</p>
-                    {activeId && queuedTasks.find((t) => t.id === activeId) && (
+                    {dragActiveId && queuedTasks.find((t) => t.id === dragActiveId) && (
                       <p className="text-xs text-blue-400 mt-2">Drop here to move to backlog</p>
                     )}
                   </div>

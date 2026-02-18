@@ -1,28 +1,36 @@
+import type { ReactElement } from 'react';
+
 import { getProviderColor, getProviderIcon, getProviderLabel } from '../lib/provider-colors';
 import type { ProviderId } from '../lib/types';
 
 type BadgeSize = 'xs' | 'sm' | 'md';
 
-interface ProviderBadgeProps {
+interface SizeConfig {
+  classes: string;
+  iconSize: number;
+  textClass: string;
+}
+
+export interface ProviderBadgeProps {
   provider: ProviderId;
   size?: BadgeSize;
   showLabel?: boolean;
 }
 
-const sizeConfig: Record<BadgeSize, { classes: string; icon: number; text: string }> = {
-  xs: { classes: 'px-1 py-0.5 gap-0.5', icon: 8, text: 'text-[9px]' },
-  sm: { classes: 'px-1.5 py-1 gap-1', icon: 10, text: 'text-[10px]' },
-  md: { classes: 'px-2 py-1.5 gap-1.5', icon: 12, text: 'text-xs' },
+const SIZE_CONFIG: Record<BadgeSize, SizeConfig> = {
+  xs: { classes: 'px-1 py-0.5 gap-0.5', iconSize: 8, textClass: 'text-[9px]' },
+  sm: { classes: 'px-1.5 py-1 gap-1', iconSize: 10, textClass: 'text-[10px]' },
+  md: { classes: 'px-2 py-1.5 gap-1.5', iconSize: 12, textClass: 'text-xs' },
 };
 
 export default function ProviderBadge({
   provider,
   size = 'sm',
   showLabel = false,
-}: ProviderBadgeProps): React.ReactElement {
+}: ProviderBadgeProps): ReactElement {
   const color = getProviderColor(provider);
   const Icon = getProviderIcon(provider);
-  const { classes, icon, text } = sizeConfig[size];
+  const { classes, iconSize, textClass } = SIZE_CONFIG[size];
 
   return (
     <div
@@ -32,10 +40,10 @@ export default function ProviderBadge({
         border: `1px solid ${color.primary}30`,
       }}
     >
-      <Icon size={icon} style={{ color: color.light }} />
+      <Icon size={iconSize} style={{ color: color.light }} />
       {showLabel && (
         <span
-          className={`font-medium ${text}`}
+          className={`font-medium ${textClass}`}
           style={{ color: color.light }}
         >
           {getProviderLabel(provider)}

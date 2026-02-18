@@ -9,14 +9,65 @@ interface ActiveViewProps {
   onSessionCountChange: (count: number) => void;
 }
 
+const AUTO_ACTION_OPTIONS: AutoActionType[] = ["none", "sleep", "shutdown"];
+const DELAY_OPTIONS = [1, 3, 5, 10, 15, 30];
+
+const ACTION_META: Record<string, { label: string; icon: React.ReactNode }> = {
+  sleep: { label: "Sleep", icon: <Moon size={12} /> },
+  shutdown: { label: "Shutdown", icon: <Power size={12} /> },
+  none: { label: "None", icon: <Clock size={12} /> },
+};
+
+function getActionLabel(type: string): string {
+  return ACTION_META[type]?.label ?? "None";
+}
+
+function getActionIcon(type: string): React.ReactNode {
+  return ACTION_META[type]?.icon ?? <Clock size={12} />;
+}
+
+function formatTime(seconds: number): string {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+function CheckboxIndicator({ checked }: { checked: boolean }): React.ReactElement {
+  return (
+    <div
+      className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 ${
+        checked ? "bg-blue-500 border-blue-500" : "border-gray-400 dark:border-gray-600"
+      }`}
+    >
+      {checked && <Check size={10} className="text-white" />}
+    </div>
+  );
+}
+
+function useClickOutside(refs: React.RefObject<HTMLElement | null>[], onClickOutside: () => void): void {
+  useEffect(() => {
+    function handleMouseDown(event: MouseEvent) {
+      const target = event.target as Node;
+      const isOutside = refs.every(
+        (ref) => !ref.current || !ref.current.contains(target)
+      );
+      if (isOutside) {
+        onClickOutside();
+      }
+    }
+
+    document.addEventListener("mousedown", handleMouseDown);
+    return () => document.removeEventListener("mousedown", handleMouseDown);
+  }, [refs, onClickOutside]);
+}
+
 export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
-  const [selectedProjects, setSelectedProjects] = useState<Set<string>>(new Set()); // empty = all selected
+  const [selectedProjects, setSelectedProjects] = useState<Set<string>>(new Set());
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  // Auto action state
   const [autoActionState, setAutoActionState] = useState<AutoActionState | null>(null);
   const [autoActionEnabled, setAutoActionEnabled] = useState(false);
   const [autoActionType, setAutoActionType] = useState<AutoActionType>("none");
@@ -24,7 +75,12 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
   const [isAutoActionDropdownOpen, setIsAutoActionDropdownOpen] = useState(false);
   const autoActionDropdownRef = useRef<HTMLDivElement>(null);
 
-  const loadSessions = async () => {
+  useClickOutside([dropdownRef, autoActionDropdownRef], () => {
+    setIsDropdownOpen(false);
+    setIsAutoActionDropdownOpen(false);
+  });
+
+  async function loadSessions(): Promise<void> {
     try {
       const result = await invoke<Session[]>("get_active_sessions");
       setSessions(result);
@@ -34,10 +90,9 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  // Load auto action config
-  const loadAutoActionConfig = async () => {
+  async function loadAutoActionConfig(): Promise<void> {
     try {
       const config = await invoke<AppConfig>("get_config");
       setAutoActionEnabled(config.auto_action.enabled);
@@ -46,54 +101,60 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
     } catch (error) {
       console.error("Failed to load auto action config:", error);
     }
-  };
+  }
 
-  // Load auto action state
-  const loadAutoActionState = async () => {
+  async function loadAutoActionState(): Promise<void> {
     try {
       const state = await invoke<AutoActionState>("get_auto_action_state");
       setAutoActionState(state);
     } catch (error) {
       console.error("Failed to load auto action state:", error);
     }
-  };
+  }
 
-  // Update auto action config
-  const updateAutoActionConfig = async (key: string, value: boolean | string | number) => {
+  async function updateAutoActionConfig(key: string, value: boolean | string | number): Promise<void> {
     try {
       await invoke("update_config", { key: `auto_action.${key}`, value });
       await loadAutoActionConfig();
     } catch (error) {
       console.error("Failed to update auto action config:", error);
     }
-  };
+  }
 
-  // Cancel auto action timer
-  const cancelAutoAction = async () => {
+  async function cancelAutoAction(): Promise<void> {
     try {
       await invoke("cancel_auto_action_timer");
       setAutoActionState(null);
     } catch (error) {
       console.error("Failed to cancel auto action:", error);
     }
-  };
+  }
+
+  function selectActionType(type: AutoActionType): void {
+    updateAutoActionConfig("action_type", type);
+    updateAutoActionConfig("enabled", type !== "none");
+    setAutoActionType(type);
+    setAutoActionEnabled(type !== "none");
+  }
+
+  function selectDelay(mins: number): void {
+    updateAutoActionConfig("delay_minutes", mins);
+    setAutoActionDelay(mins);
+  }
 
   useEffect(() => {
     loadSessions();
     loadAutoActionConfig();
     loadAutoActionState();
 
-    // Listen for session updates
     const unlisten = listen("session-updated", () => {
       loadSessions();
     });
 
-    // Listen for auto action state updates
     const unlistenAutoAction = listen<AutoActionState>("auto-action-state", (event) => {
       setAutoActionState(event.payload);
     });
 
-    // Poll every 5 seconds for active sessions
     const interval = setInterval(loadSessions, 5000);
 
     return () => {
@@ -103,30 +164,14 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
     };
   }, []);
 
-  // Close dropdowns when clicking outside
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
-        setIsDropdownOpen(false);
-      }
-      if (autoActionDropdownRef.current && !autoActionDropdownRef.current.contains(event.target as Node)) {
-        setIsAutoActionDropdownOpen(false);
-      }
-    };
-
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, []);
-
-  // Group sessions by project
-  const projectGroups = sessions.reduce((acc, session) => {
+  const projectGroups = sessions.reduce<Record<string, Session[]>>((acc, session) => {
     const project = session.project_name;
     if (!acc[project]) {
       acc[project] = [];
     }
     acc[project].push(session);
     return acc;
-  }, {} as Record<string, Session[]>);
+  }, {});
 
   const projectList = Object.keys(projectGroups).sort();
   const isAllSelected = selectedProjects.size === 0;
@@ -135,7 +180,7 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
     ? sessions
     : sessions.filter((s) => selectedProjects.has(s.project_name));
 
-  const toggleProject = (project: string) => {
+  function toggleProject(project: string): void {
     setSelectedProjects((prev) => {
       const next = new Set(prev);
       if (next.has(project)) {
@@ -143,52 +188,25 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
       } else {
         next.add(project);
       }
-      // If all projects are selected, reset to "All" state
       if (next.size === projectList.length) {
         return new Set();
       }
       return next;
     });
-  };
+  }
 
-  const selectAll = () => {
+  function selectAll(): void {
     setSelectedProjects(new Set());
     setIsDropdownOpen(false);
-  };
+  }
 
-  const getFilterLabel = () => {
+  function getFilterLabel(): string {
     if (isAllSelected) return "All Projects";
-    if (selectedProjects.size === 1) {
-      const project = Array.from(selectedProjects)[0];
-      return project;
-    }
+    if (selectedProjects.size === 1) return Array.from(selectedProjects)[0];
     return `${selectedProjects.size} Projects`;
-  };
+  }
 
-  // Format remaining time
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}:${secs.toString().padStart(2, "0")}`;
-  };
-
-  // Get action label
-  const getActionLabel = (type: AutoActionType | string) => {
-    switch (type) {
-      case "sleep": return "Sleep";
-      case "shutdown": return "Shutdown";
-      default: return "None";
-    }
-  };
-
-  // Get action icon
-  const getActionIcon = (type: AutoActionType | string) => {
-    switch (type) {
-      case "sleep": return <Moon size={12} />;
-      case "shutdown": return <Power size={12} />;
-      default: return <Clock size={12} />;
-    }
-  };
+  const isAutoActionActive = autoActionEnabled && autoActionType !== "none";
 
   if (loading) {
     return (
@@ -230,17 +248,11 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
 
             {isDropdownOpen && (
               <div className="absolute top-full left-0 mt-1 w-56 bg-gray-900/95 backdrop-blur-xl border border-white/10 rounded-lg shadow-xl z-50 overflow-hidden">
-                {/* All Projects option */}
                 <button
                   onClick={selectAll}
                   className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-white/5 transition-colors border-b border-white/5"
                 >
-                  <div className={`w-4 h-4 rounded border flex items-center justify-center ${isAllSelected
-                      ? "bg-blue-500 border-blue-500"
-                      : "border-gray-600"
-                    }`}>
-                    {isAllSelected && <Check size={10} className="text-white" />}
-                  </div>
+                  <CheckboxIndicator checked={isAllSelected} />
                   <span className={isAllSelected ? "text-blue-300" : "text-gray-300"}>
                     All Projects
                   </span>
@@ -249,7 +261,6 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
                   </span>
                 </button>
 
-                {/* Project list */}
                 <div className="max-h-48 overflow-y-auto">
                   {projectList.map((project) => {
                     const isSelected = isAllSelected || selectedProjects.has(project);
@@ -259,12 +270,7 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
                         onClick={() => toggleProject(project)}
                         className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-white/5 transition-colors"
                       >
-                        <div className={`w-4 h-4 rounded border flex items-center justify-center ${isSelected
-                            ? "bg-blue-500 border-blue-500"
-                            : "border-gray-600"
-                          }`}>
-                          {isSelected && <Check size={10} className="text-white" />}
-                        </div>
+                        <CheckboxIndicator checked={isSelected} />
                         <FolderOpen size={10} className="text-gray-400" />
                         <span className={isSelected ? "text-gray-200" : "text-gray-400"}>
                           {project}
@@ -291,7 +297,6 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
 
       {/* Auto Action Panel */}
       <div className="px-3 py-2 border-t border-white/5 shrink-0">
-        {/* Timer active - show countdown */}
         {autoActionState?.timer_active ? (
           <div className="flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
             <div className="flex items-center gap-2">
@@ -309,19 +314,19 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
             </button>
           </div>
         ) : (
-          /* Timer inactive - show config */
           <div className="relative" ref={autoActionDropdownRef}>
             <button
               onClick={() => setIsAutoActionDropdownOpen(!isAutoActionDropdownOpen)}
-              className={`flex items-center gap-2 px-2.5 py-1.5 text-xs rounded-lg border transition-colors w-full justify-between ${autoActionEnabled && autoActionType !== "none"
+              className={`flex items-center gap-2 px-2.5 py-1.5 text-xs rounded-lg border transition-colors w-full justify-between ${
+                isAutoActionActive
                   ? "bg-blue-500/10 border-blue-500/30 text-blue-600 dark:text-blue-300 hover:bg-blue-500/15"
                   : "bg-gray-50 dark:bg-white/5 border-gray-200 dark:border-white/10 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-white/8 hover:border-gray-300 dark:hover:border-white/20"
-                }`}
+              }`}
             >
               <div className="flex items-center gap-2">
                 {getActionIcon(autoActionType)}
                 <span>
-                  {autoActionEnabled && autoActionType !== "none"
+                  {isAutoActionActive
                     ? `${getActionLabel(autoActionType)} after ${autoActionDelay}m`
                     : "Auto action off"}
                 </span>
@@ -334,55 +339,49 @@ export default function ActiveView({ onSessionCountChange }: ActiveViewProps) {
 
             {isAutoActionDropdownOpen && (
               <div className="absolute bottom-full left-0 mb-1 w-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-white/10 rounded-lg shadow-lg dark:shadow-xl z-50 overflow-hidden">
-                {/* Action type options */}
                 <div className="p-2 space-y-1">
-                  <div className="text-[10px] text-gray-500 dark:text-gray-400 font-semibold uppercase tracking-wider px-2 py-1">After all tasks complete:</div>
-                  {(["none", "sleep", "shutdown"] as AutoActionType[]).map((type) => (
-                    <button
-                      key={type}
-                      onClick={() => {
-                        updateAutoActionConfig("action_type", type);
-                        updateAutoActionConfig("enabled", type !== "none");
-                        setAutoActionType(type);
-                        setAutoActionEnabled(type !== "none");
-                      }}
-                      className={`w-full flex items-center gap-2 px-2 py-1.5 text-xs rounded transition-colors ${autoActionType === type
-                          ? "bg-blue-500/10 border border-blue-500/20"
-                          : "hover:bg-gray-100 dark:hover:bg-white/5 border border-transparent"
+                  <div className="text-[10px] text-gray-500 dark:text-gray-400 font-semibold uppercase tracking-wider px-2 py-1">
+                    After all tasks complete:
+                  </div>
+                  {AUTO_ACTION_OPTIONS.map((type) => {
+                    const isSelected = autoActionType === type;
+                    return (
+                      <button
+                        key={type}
+                        onClick={() => selectActionType(type)}
+                        className={`w-full flex items-center gap-2 px-2 py-1.5 text-xs rounded transition-colors ${
+                          isSelected
+                            ? "bg-blue-500/10 border border-blue-500/20"
+                            : "hover:bg-gray-100 dark:hover:bg-white/5 border border-transparent"
                         }`}
-                    >
-                      <div className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 ${autoActionType === type
-                          ? "bg-blue-500 border-blue-500"
-                          : "border-gray-400 dark:border-gray-600"
-                        }`}>
-                        {autoActionType === type && <Check size={10} className="text-white" />}
-                      </div>
-                      <div className="shrink-0 text-gray-500 dark:text-gray-400">
-                        {getActionIcon(type)}
-                      </div>
-                      <span className={`font-medium ${autoActionType === type ? "text-blue-600 dark:text-blue-300" : "text-gray-700 dark:text-gray-300"}`}>
-                        {getActionLabel(type)}
-                      </span>
-                    </button>
-                  ))}
+                      >
+                        <CheckboxIndicator checked={isSelected} />
+                        <div className="shrink-0 text-gray-500 dark:text-gray-400">
+                          {getActionIcon(type)}
+                        </div>
+                        <span className={`font-medium ${isSelected ? "text-blue-600 dark:text-blue-300" : "text-gray-700 dark:text-gray-300"}`}>
+                          {getActionLabel(type)}
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
 
-                {/* Delay input */}
                 {autoActionType !== "none" && (
                   <div className="border-t border-gray-100 dark:border-white/5 p-2 pt-3">
-                    <div className="text-[10px] text-gray-500 dark:text-gray-400 font-semibold uppercase tracking-wider px-2 py-1 mb-1">Delay (minutes):</div>
+                    <div className="text-[10px] text-gray-500 dark:text-gray-400 font-semibold uppercase tracking-wider px-2 py-1 mb-1">
+                      Delay (minutes):
+                    </div>
                     <div className="flex items-center gap-2 px-2">
-                      {[1, 3, 5, 10, 15, 30].map((mins) => (
+                      {DELAY_OPTIONS.map((mins) => (
                         <button
                           key={mins}
-                          onClick={() => {
-                            updateAutoActionConfig("delay_minutes", mins);
-                            setAutoActionDelay(mins);
-                          }}
-                          className={`flex-1 px-2 py-1 text-xs font-medium rounded transition-colors ${autoActionDelay === mins
+                          onClick={() => selectDelay(mins)}
+                          className={`flex-1 px-2 py-1 text-xs font-medium rounded transition-colors ${
+                            autoActionDelay === mins
                               ? "bg-blue-600 text-white shadow-sm"
                               : "bg-gray-100 dark:bg-white/5 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-white/10 border border-transparent"
-                            }`}
+                          }`}
                         >
                           {mins}
                         </button>

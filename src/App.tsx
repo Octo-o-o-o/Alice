@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import type { ReactElement } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -21,9 +22,11 @@ import type { AppConfig } from "./lib/types";
 
 type ViewType = "tasks" | "favorites" | "usage" | "report" | "settings";
 
+type IconComponent = React.ComponentType<{ size?: number }>;
+
 interface TabDefinition {
   id: ViewType;
-  icon: React.ComponentType<{ size?: number }>;
+  icon: IconComponent;
   label: string;
 }
 
@@ -35,15 +38,20 @@ const TABS: TabDefinition[] = [
   { id: "settings", icon: Settings, label: "Settings" },
 ];
 
+const SHORTCUT_VIEW_MAP: Record<string, ViewType> = {
+  n: "tasks",
+  ",": "settings",
+};
+
 interface TabProps {
-  icon: React.ComponentType<{ size?: number }>;
-  label: string;
+  tab: TabDefinition;
   isActive: boolean;
   onClick: () => void;
   badge?: number;
 }
 
-function ViewTab({ icon: Icon, label, isActive, onClick, badge }: TabProps) {
+function ViewTab({ tab, isActive, onClick, badge }: TabProps): ReactElement {
+  const Icon = tab.icon;
   return (
     <button
       onClick={onClick}
@@ -53,18 +61,18 @@ function ViewTab({ icon: Icon, label, isActive, onClick, badge }: TabProps) {
     >
       <div className="relative">
         <Icon size={16} />
-        {badge !== undefined && badge > 0 && (
+        {badge != null && badge > 0 && (
           <span className="absolute -top-1 -right-2 bg-blue-500 text-white text-[8px] font-medium rounded-full w-3.5 h-3.5 flex items-center justify-center">
             {badge > 9 ? "9+" : badge}
           </span>
         )}
       </div>
-      <span className="text-[9px] font-medium">{label}</span>
+      <span className="text-[9px] font-medium">{tab.label}</span>
     </button>
   );
 }
 
-function App() {
+function App(): ReactElement {
   const [activeView, setActiveView] = useState<ViewType>("tasks");
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [taskCount, setTaskCount] = useState(0);
@@ -73,7 +81,6 @@ function App() {
   const [isLoading, setIsLoading] = useState(true);
   const viewRef = useRef<{ refresh?: () => void }>(null);
 
-  // Check if onboarding is needed
   useEffect(() => {
     invoke<AppConfig>("get_config", {})
       .then((config) => {
@@ -85,7 +92,6 @@ function App() {
       .finally(() => setIsLoading(false));
   }, []);
 
-  // Listen for session updates from Rust backend
   useEffect(() => {
     const unlisten = listen<{ session_id: string; status: string }>(
       "session-updated",
@@ -99,35 +105,31 @@ function App() {
     };
   }, []);
 
-  // Global keyboard shortcuts
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent): void {
       if (!(e.metaKey || e.ctrlKey)) return;
 
-      switch (e.key) {
-        case "n":
-          e.preventDefault();
-          setActiveView("tasks");
-          break;
-        case "r":
-          e.preventDefault();
-          setRefreshKey((k) => k + 1);
-          viewRef.current?.refresh?.();
-          break;
-        case ",":
-          e.preventDefault();
-          setActiveView("settings");
-          break;
-        case "1":
-        case "2":
-        case "3":
-        case "4":
-        case "5": {
-          e.preventDefault();
-          const index = parseInt(e.key) - 1;
-          setActiveView(TABS[index].id);
-          break;
-        }
+      // Direct view shortcuts (Cmd+N -> tasks, Cmd+, -> settings)
+      const mappedView = SHORTCUT_VIEW_MAP[e.key];
+      if (mappedView) {
+        e.preventDefault();
+        setActiveView(mappedView);
+        return;
+      }
+
+      // Refresh shortcut
+      if (e.key === "r") {
+        e.preventDefault();
+        setRefreshKey((k) => k + 1);
+        viewRef.current?.refresh?.();
+        return;
+      }
+
+      // Numeric tab shortcuts (Cmd+1 through Cmd+5)
+      const tabIndex = parseInt(e.key) - 1;
+      if (tabIndex >= 0 && tabIndex < TABS.length) {
+        e.preventDefault();
+        setActiveView(TABS[tabIndex].id);
       }
     }
 
@@ -137,7 +139,7 @@ function App() {
 
   const tasksBadge = activeSessionCount + taskCount;
 
-  function renderView(): React.ReactNode {
+  function renderView(): ReactElement {
     switch (activeView) {
       case "tasks":
         return (
@@ -170,19 +172,15 @@ function App() {
     <ThemeProvider>
       <ToastProvider>
         <div className="h-full flex flex-col glass-panel overflow-hidden">
-          {/* Drag region for window */}
           <div className="h-3 drag-region shrink-0 bg-gray-950/80" />
 
-          {/* Main content area */}
           <main className="flex-1 overflow-hidden">{renderView()}</main>
 
-          {/* Bottom navigation */}
           <nav className="h-12 border-t border-white/5 bg-gray-950/80 backdrop-blur-xl flex items-center justify-center gap-6 px-4 shrink-0">
             {TABS.map((tab) => (
               <ViewTab
                 key={tab.id}
-                icon={tab.icon}
-                label={tab.label}
+                tab={tab}
                 isActive={activeView === tab.id}
                 onClick={() => setActiveView(tab.id)}
                 badge={tab.id === "tasks" ? tasksBadge : undefined}

@@ -96,6 +96,84 @@ function ToggleGroup({ children }: { children: ReactNode }) {
   );
 }
 
+// --- Environment form sub-component ---
+
+interface EnvFormFieldsProps {
+  form: Partial<ClaudeEnvironment>;
+  onUpdate: (updates: Partial<ClaudeEnvironment>) => void;
+  onSave: () => void;
+  onCancel: () => void;
+  isNew: boolean;
+}
+
+function EnvFormFields({ form, onUpdate, onSave, onCancel, isNew }: EnvFormFieldsProps) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <h4 className="text-xs font-medium text-blue-400">
+          {isNew ? "New Profile" : "Edit Profile"}
+        </h4>
+        <button
+          onClick={onCancel}
+          className="text-gray-500 hover:text-gray-300"
+        >
+          <XCircle size={14} />
+        </button>
+      </div>
+      <input
+        type="text"
+        value={form.name || ""}
+        onChange={(e) => {
+          const name = e.target.value;
+          if (isNew) {
+            const id = name
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, "-")
+              .replace(/^-|-$/g, "");
+            onUpdate({ name, id });
+          } else {
+            onUpdate({ name });
+          }
+        }}
+        className="w-full bg-black/20 border border-white/10 rounded px-2 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-blue-500/50"
+        placeholder="Profile Name"
+      />
+      {isNew && (
+        <div className="flex items-center gap-2 bg-black/20 border border-white/10 rounded px-2 py-1.5">
+          <FolderOpen size={12} className="text-gray-500" />
+          <input
+            type="text"
+            value={form.config_dir || ""}
+            onChange={(e) => onUpdate({ config_dir: e.target.value })}
+            className="flex-1 bg-transparent text-xs text-gray-200 font-mono focus:outline-none"
+            placeholder="~/.claude-custom"
+          />
+        </div>
+      )}
+      <div className="flex gap-2 justify-end">
+        {!isNew && (
+          <button
+            onClick={onCancel}
+            className="px-2 py-1 text-[10px] text-gray-400"
+          >
+            Cancel
+          </button>
+        )}
+        <button
+          onClick={onSave}
+          className={`py-1.5 text-xs text-white rounded shadow-sm ${
+            isNew
+              ? "w-full bg-blue-600 hover:bg-blue-500"
+              : "px-2 bg-green-600"
+          }`}
+        >
+          {isNew ? "Create" : "Save"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // --- Environment editing state ---
 
 type EnvEditMode =
@@ -105,7 +183,7 @@ type EnvEditMode =
 
 const IDLE_MODE: EnvEditMode = { kind: "idle" };
 
-// --- Tab definitions ---
+// --- Static data ---
 
 const TABS = [
   { id: "general", label: "General", icon: Settings },
@@ -132,6 +210,28 @@ const LANGUAGE_OPTIONS = [
   { value: "zh", label: "Chinese" },
   { value: "ja", label: "Japanese" },
 ];
+
+const BEHAVIOR_TOGGLES = [
+  { key: "launch_at_login", label: "Launch at login", description: "Start automatically" },
+  { key: "auto_hide_on_blur", label: "Auto-hide", description: "Close when clicking outside" },
+] as const;
+
+function getVoiceDescription(): string {
+  return isMacSync() ? "Use macOS Voice" : "Use System Voice";
+}
+
+const NOTIFICATION_TOGGLES: ReadonlyArray<{ key: string; label: string; description?: string | (() => string) }> = [
+  { key: "notification_sound", label: "Sound Effect", description: "Play sound on completion" },
+  { key: "voice_notifications", label: "Voice Announcement", description: getVoiceDescription },
+  { key: "notifications.on_task_completed", label: "Task Completed" },
+  { key: "notifications.on_task_error", label: "Task Error" },
+  { key: "notifications.on_needs_input", label: "Input Needed" },
+];
+
+const DATA_STATS = [
+  { icon: Database, label: "Database", getValue: (info: SystemInfo) => formatBytes(info.db_stats.db_size_bytes) },
+  { icon: FileText, label: "Reports", getValue: (info: SystemInfo) => String(info.db_stats.report_count) },
+] as const;
 
 // --- Helpers ---
 
@@ -162,6 +262,20 @@ function buildEnvData(form: Partial<ClaudeEnvironment>): ClaudeEnvironment {
     command: form.command || null,
     enabled: form.enabled ?? true,
   };
+}
+
+function resolveConfigValue(config: AppConfig, key: string): boolean {
+  if (key.startsWith("notifications.")) {
+    const subKey = key.replace("notifications.", "") as keyof AppConfig["notifications"];
+    return config.notifications[subKey];
+  }
+  return config[key as keyof AppConfig] as boolean;
+}
+
+function getHooksButtonLabel(installing: boolean, installed: boolean): string {
+  if (installing) return "Installing...";
+  if (installed) return "Reinstall";
+  return "Install Hooks";
 }
 
 // --- Main component ---
@@ -315,6 +429,10 @@ export default function ConfigView() {
     setEnvEditMode({ ...envEditMode, form: { ...envEditMode.form, ...updates } });
   }
 
+  function cancelEnvEdit(): void {
+    setEnvEditMode(IDLE_MODE);
+  }
+
   async function saveEnv(): Promise<void> {
     if (envEditMode.kind === "idle") return;
     const { form } = envEditMode;
@@ -382,6 +500,7 @@ export default function ConfigView() {
 
   const envForm = envEditMode.kind !== "idle" ? envEditMode.form : null;
   const modKey = getModKey();
+  const isConnected = systemInfo?.credentials_exist ?? false;
 
   return (
     <div className="flex flex-col h-full bg-gray-950 text-gray-200 font-sans">
@@ -434,59 +553,34 @@ export default function ConfigView() {
               <section className="space-y-3">
                 <SectionHeading>Behavior</SectionHeading>
                 <ToggleGroup>
-                  <Toggle
-                    enabled={config.launch_at_login}
-                    onChange={(v) => updateSetting("launch_at_login", v)}
-                    label="Launch at login"
-                    description="Start automatically"
-                  />
-                  <Toggle
-                    enabled={config.auto_hide_on_blur}
-                    onChange={(v) => updateSetting("auto_hide_on_blur", v)}
-                    label="Auto-hide"
-                    description="Close when clicking outside"
-                  />
+                  {BEHAVIOR_TOGGLES.map((toggle) => (
+                    <Toggle
+                      key={toggle.key}
+                      enabled={resolveConfigValue(config, toggle.key)}
+                      onChange={(v) => updateSetting(toggle.key, v)}
+                      label={toggle.label}
+                      description={toggle.description}
+                    />
+                  ))}
                 </ToggleGroup>
               </section>
 
               <section className="space-y-3">
                 <SectionHeading>Notifications</SectionHeading>
                 <ToggleGroup>
-                  <Toggle
-                    enabled={config.notification_sound}
-                    onChange={(v) => updateSetting("notification_sound", v)}
-                    label="Sound Effect"
-                    description="Play sound on completion"
-                  />
-                  <Toggle
-                    enabled={config.voice_notifications}
-                    onChange={(v) => updateSetting("voice_notifications", v)}
-                    label="Voice Announcement"
-                    description={
-                      isMacSync() ? "Use macOS Voice" : "Use System Voice"
-                    }
-                  />
-                  <Toggle
-                    enabled={config.notifications.on_task_completed}
-                    onChange={(v) =>
-                      updateSetting("notifications.on_task_completed", v)
-                    }
-                    label="Task Completed"
-                  />
-                  <Toggle
-                    enabled={config.notifications.on_task_error}
-                    onChange={(v) =>
-                      updateSetting("notifications.on_task_error", v)
-                    }
-                    label="Task Error"
-                  />
-                  <Toggle
-                    enabled={config.notifications.on_needs_input}
-                    onChange={(v) =>
-                      updateSetting("notifications.on_needs_input", v)
-                    }
-                    label="Input Needed"
-                  />
+                  {NOTIFICATION_TOGGLES.map((toggle) => (
+                    <Toggle
+                      key={toggle.key}
+                      enabled={resolveConfigValue(config, toggle.key)}
+                      onChange={(v) => updateSetting(toggle.key, v)}
+                      label={toggle.label}
+                      description={
+                        typeof toggle.description === "function"
+                          ? toggle.description()
+                          : toggle.description
+                      }
+                    />
+                  ))}
                 </ToggleGroup>
               </section>
 
@@ -521,13 +615,9 @@ export default function ConfigView() {
                     disabled={installingHooks}
                     className="w-full flex justify-center items-center gap-2 px-3 py-1.5 text-xs bg-white/5 hover:bg-white/10 text-gray-200 border border-white/10 rounded transition-colors"
                   >
-                    {installingHooks ? (
-                      <span className="animate-pulse">Installing...</span>
-                    ) : config.hooks_installed ? (
-                      "Reinstall"
-                    ) : (
-                      "Install Hooks"
-                    )}
+                    <span className={installingHooks ? "animate-pulse" : ""}>
+                      {getHooksButtonLabel(installingHooks, config.hooks_installed)}
+                    </span>
                   </button>
                 </div>
 
@@ -672,50 +762,14 @@ export default function ConfigView() {
                 </div>
 
                 {envEditMode.kind === "adding" && envForm && (
-                  <div className="glass-panel p-3 space-y-3 animate-in fade-in slide-in-from-top-2">
-                    <div className="flex items-center justify-between">
-                      <h4 className="text-xs font-medium text-blue-400">
-                        New Profile
-                      </h4>
-                      <button
-                        onClick={() => setEnvEditMode(IDLE_MODE)}
-                        className="text-gray-500 hover:text-gray-300"
-                      >
-                        <XCircle size={14} />
-                      </button>
-                    </div>
-                    <input
-                      type="text"
-                      value={envForm.name || ""}
-                      onChange={(e) => {
-                        const name = e.target.value;
-                        const id = name
-                          .toLowerCase()
-                          .replace(/[^a-z0-9]+/g, "-")
-                          .replace(/^-|-$/g, "");
-                        updateEnvForm({ name, id });
-                      }}
-                      className="w-full bg-black/20 border border-white/10 rounded px-2 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-blue-500/50"
-                      placeholder="Profile Name"
+                  <div className="glass-panel p-3 animate-in fade-in slide-in-from-top-2">
+                    <EnvFormFields
+                      form={envForm}
+                      onUpdate={updateEnvForm}
+                      onSave={saveEnv}
+                      onCancel={cancelEnvEdit}
+                      isNew
                     />
-                    <div className="flex items-center gap-2 bg-black/20 border border-white/10 rounded px-2 py-1.5">
-                      <FolderOpen size={12} className="text-gray-500" />
-                      <input
-                        type="text"
-                        value={envForm.config_dir || ""}
-                        onChange={(e) =>
-                          updateEnvForm({ config_dir: e.target.value })
-                        }
-                        className="flex-1 bg-transparent text-xs text-gray-200 font-mono focus:outline-none"
-                        placeholder="~/.claude-custom"
-                      />
-                    </div>
-                    <button
-                      onClick={saveEnv}
-                      className="w-full py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded shadow-sm"
-                    >
-                      Create
-                    </button>
                   </div>
                 )}
 
@@ -735,30 +789,13 @@ export default function ConfigView() {
                           }`}
                       >
                         {isEditing && envForm ? (
-                          <div className="space-y-2">
-                            <input
-                              type="text"
-                              value={envForm.name || ""}
-                              onChange={(e) =>
-                                updateEnvForm({ name: e.target.value })
-                              }
-                              className="w-full bg-black/20 border border-white/10 rounded px-2 py-1 text-xs text-gray-200"
-                            />
-                            <div className="flex gap-2 justify-end">
-                              <button
-                                onClick={() => setEnvEditMode(IDLE_MODE)}
-                                className="px-2 py-1 text-[10px] text-gray-400"
-                              >
-                                Cancel
-                              </button>
-                              <button
-                                onClick={saveEnv}
-                                className="px-2 py-1 text-[10px] bg-green-600 text-white rounded"
-                              >
-                                Save
-                              </button>
-                            </div>
-                          </div>
+                          <EnvFormFields
+                            form={envForm}
+                            onUpdate={updateEnvForm}
+                            onSave={saveEnv}
+                            onCancel={cancelEnvEdit}
+                            isNew={false}
+                          />
                         ) : (
                           <div className="flex items-center justify-between">
                             <div className="min-w-0 flex-1 mr-2">
@@ -849,7 +886,7 @@ export default function ConfigView() {
                 <div className="glass-panel p-4 relative overflow-hidden group hover:border-white/10 transition-colors">
                   <div className="flex items-center gap-3">
                     <div
-                      className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${systemInfo?.credentials_exist
+                      className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${isConnected
                         ? "bg-green-500/10 text-green-400 ring-1 ring-green-500/20"
                         : "bg-red-500/10 text-red-400 ring-1 ring-red-500/20"
                         }`}
@@ -859,9 +896,9 @@ export default function ConfigView() {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center justify-between mb-0.5">
                         <span className="text-xs font-semibold text-gray-200">
-                          {systemInfo?.credentials_exist ? "Connected" : "Disconnected"}
+                          {isConnected ? "Connected" : "Disconnected"}
                         </span>
-                        {systemInfo?.credentials_exist && (
+                        {isConnected && (
                           <div className="flex items-center gap-1.5">
                             <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
                             <span className="text-[10px] text-green-500/80 font-medium uppercase tracking-wider">Active</span>
@@ -886,24 +923,17 @@ export default function ConfigView() {
 
                 {/* Data Stats Grid */}
                 <div className="grid grid-cols-2 gap-3">
-                  <div className="glass-panel p-3 flex flex-col items-center justify-center gap-1 hover:bg-white/5 transition-colors">
-                    <div className="flex items-center gap-2 text-[10px] text-gray-500 uppercase tracking-wider mb-1">
-                      <Database size={12} />
-                      <span>Database</span>
+                  {DATA_STATS.map(({ icon: Icon, label, getValue }) => (
+                    <div key={label} className="glass-panel p-3 flex flex-col items-center justify-center gap-1 hover:bg-white/5 transition-colors">
+                      <div className="flex items-center gap-2 text-[10px] text-gray-500 uppercase tracking-wider mb-1">
+                        <Icon size={12} />
+                        <span>{label}</span>
+                      </div>
+                      <span className="text-lg font-semibold text-gray-200 font-mono">
+                        {systemInfo ? getValue(systemInfo) : "-"}
+                      </span>
                     </div>
-                    <span className="text-lg font-semibold text-gray-200 font-mono">
-                      {systemInfo ? formatBytes(systemInfo.db_stats.db_size_bytes) : "-"}
-                    </span>
-                  </div>
-                  <div className="glass-panel p-3 flex flex-col items-center justify-center gap-1 hover:bg-white/5 transition-colors">
-                    <div className="flex items-center gap-2 text-[10px] text-gray-500 uppercase tracking-wider mb-1">
-                      <FileText size={12} />
-                      <span>Reports</span>
-                    </div>
-                    <span className="text-lg font-semibold text-gray-200 font-mono">
-                      {systemInfo?.db_stats.report_count ?? 0}
-                    </span>
-                  </div>
+                  ))}
                 </div>
 
                 {/* Actions Group */}

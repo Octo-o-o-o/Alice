@@ -74,6 +74,46 @@ pub fn get_hook_command(event_name: &str, include_project: bool) -> String {
     }
 }
 
+/// Generate the PreToolUse hook command for Claude Code.
+/// Writes a pre_tool_use event to hooks-events.jsonl.
+/// On Unix, uses `printf` instead of `echo` for proper variable expansion
+/// (avoids the single-quote expansion issue with `$CLAUDE_SESSION_ID`).
+/// On Windows, delegates to `get_hook_command` since PowerShell handles expansion natively.
+pub fn get_pre_tool_use_hook_command() -> String {
+    if cfg!(target_os = "windows") {
+        return get_hook_command("pre_tool_use", false);
+    }
+    r#"printf '{"event":"pre_tool_use","session_id":"%s","timestamp":%s}\n' "$CLAUDE_SESSION_ID" "$(date +%s)" >> ~/.alice/hooks-events.jsonl"#.to_string()
+}
+
+/// Generate the Gemini hook shell script content.
+/// The script reads JSON from stdin (Gemini passes hook data via stdin),
+/// extracts the tool name, and POSTs to Alice's HTTP notification server.
+pub fn get_gemini_hook_script(port: u16) -> String {
+    format!(
+        r#"#!/bin/bash
+# Alice Gemini Hook Script (auto-generated)
+# Called by Gemini CLI before tool execution (BeforeTool hook).
+# Reads JSON hook data from stdin, forwards to Alice's notification server.
+
+ALICE_PORT=$(cat ~/.alice/http_port 2>/dev/null || echo "{port}")
+HOOK_INPUT=$(cat)
+
+if command -v jq &>/dev/null; then
+  TOOL=$(echo "$HOOK_INPUT" | jq -r '.name // "unknown"' 2>/dev/null || echo "unknown")
+else
+  TOOL="unknown"
+fi
+
+curl -s -X POST "http://127.0.0.1:$ALICE_PORT/notify" \
+  -H "Content-Type: application/json" \
+  -d "{{\"title\":\"Gemini\",\"body\":\"Wants to use: $TOOL\",\"provider\":\"gemini\",\"event_type\":\"tool_permission\"}}" \
+  > /dev/null 2>&1 || true
+"#,
+        port = port
+    )
+}
+
 /// Decode an encoded project path from Claude Code's directory structure.
 /// Claude Code encodes paths by replacing path separators with `-`.
 ///
@@ -102,16 +142,11 @@ pub fn decode_project_path(encoded: &str) -> String {
     }
 
     // Unix: -Users-... or -home-...
-    if let Some(stripped) = decoded
-        .strip_prefix("-Users-")
-        .or_else(|| decoded.strip_prefix("-home-"))
-    {
-        let prefix = if decoded.starts_with("-Users-") {
-            "Users"
-        } else {
-            "home"
-        };
-        return format!("/{}/{}", prefix, stripped.replace('-', "/"));
+    for prefix in &["Users", "home"] {
+        let encoded_prefix = format!("-{}-", prefix);
+        if let Some(stripped) = decoded.strip_prefix(encoded_prefix.as_str()) {
+            return format!("/{}/{}", prefix, stripped.replace('-', "/"));
+        }
     }
 
     // Already an absolute path (Unix `/...` or Windows `C:\...`)
@@ -167,19 +202,12 @@ pub fn get_gemini_command() -> &'static str {
 /// Get the platform-appropriate Git command name.
 /// Returns `None` if git is not found on PATH.
 pub fn get_git_command() -> Option<&'static str> {
-    if cfg!(target_os = "windows") {
-        if is_cli_installed("git.exe") {
-            return Some("git.exe");
-        }
-        if is_cli_installed("git") {
-            return Some("git");
-        }
-        None
-    } else if is_cli_installed("git") {
-        Some("git")
+    let candidates: &[&str] = if cfg!(target_os = "windows") {
+        &["git.exe", "git"]
     } else {
-        None
-    }
+        &["git"]
+    };
+    candidates.iter().copied().find(|cmd| is_cli_installed(cmd))
 }
 
 /// Extract the last path component (file/directory name) from a path string,
@@ -206,14 +234,33 @@ fn build_shell_command(working_dir: Option<&str>, command: &str) -> String {
     }
 }
 
+/// Spawn a process and map any launch error to a descriptive message.
+fn spawn_process(cmd: &str, args: &[&str], context: &str) -> Result<(), String> {
+    std::process::Command::new(cmd)
+        .args(args)
+        .spawn()
+        .map_err(|e| format!("Failed to open {}: {}", context, e))?;
+    Ok(())
+}
+
 /// Run an AppleScript via `osascript` and map errors to a descriptive message.
 fn run_applescript(script: &str, app_name: &str) -> Result<(), String> {
-    std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .spawn()
-        .map_err(|e| format!("Failed to open {}: {}", app_name, e))?;
-    Ok(())
+    spawn_process("osascript", &["-e", script], app_name)
+}
+
+/// Build the shell command string from working_dir and command, then format it
+/// into an AppleScript template and execute it. The `template` must contain a
+/// single `{}` placeholder where the shell command will be inserted.
+fn execute_via_applescript(
+    working_dir: Option<&str>,
+    command: &str,
+    template: &str,
+    app_name: &str,
+) -> Result<(), String> {
+    let escaped = escape_for_applescript(command);
+    let full_cmd = build_shell_command(working_dir, &escaped);
+    let script = template.replace("{}", &full_cmd);
+    run_applescript(&script, app_name)
 }
 
 /// Execute a command in a visible terminal window.
@@ -269,28 +316,22 @@ pub fn execute_in_terminal(
 /// Execute command in the system default terminal
 fn execute_in_system_terminal(working_dir: Option<&str>, command: &str) -> Result<(), String> {
     if cfg!(target_os = "macos") {
-        let escaped = escape_for_applescript(command);
-        let full_cmd = build_shell_command(working_dir, &escaped);
-        let script = format!(
+        execute_via_applescript(
+            working_dir,
+            command,
             r#"tell application "Terminal"
     activate
     do script "{}"
 end tell"#,
-            full_cmd
-        );
-        run_applescript(&script, "Terminal")
+            "Terminal",
+        )
     } else if cfg!(target_os = "windows") {
         let full_cmd = if let Some(dir) = working_dir {
             format!("cd /d \"{}\" && {}", dir, command)
         } else {
             command.to_string()
         };
-
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "cmd", "/k", &full_cmd])
-            .spawn()
-            .map_err(|e| format!("Failed to open cmd: {}", e))?;
-        Ok(())
+        spawn_process("cmd", &["/c", "start", "cmd", "/k", &full_cmd], "cmd")
     } else {
         Err("Unsupported platform".to_string())
     }
@@ -298,9 +339,9 @@ end tell"#,
 
 /// Execute command in iTerm2 (macOS only)
 fn execute_in_iterm2(working_dir: Option<&str>, command: &str) -> Result<(), String> {
-    let escaped = escape_for_applescript(command);
-    let full_cmd = build_shell_command(working_dir, &escaped);
-    let script = format!(
+    execute_via_applescript(
+        working_dir,
+        command,
         r#"tell application "iTerm"
     activate
     tell current window
@@ -310,36 +351,28 @@ fn execute_in_iterm2(working_dir: Option<&str>, command: &str) -> Result<(), Str
         end tell
     end tell
 end tell"#,
-        full_cmd
-    );
-    run_applescript(&script, "iTerm2")
+        "iTerm2",
+    )
 }
 
 /// Execute command in Windows Terminal (Windows only)
 fn execute_in_windows_terminal(working_dir: Option<&str>, command: &str) -> Result<(), String> {
-    let mut wt_args = vec![];
+    let mut wt_args: Vec<String> = Vec::new();
 
     if let Some(dir) = working_dir {
-        wt_args.push("-d".to_string());
-        wt_args.push(format!("\"{}\"", dir));
+        wt_args.extend(["-d".to_string(), format!("\"{}\"", dir)]);
     }
+    wt_args.extend(["cmd".to_string(), "/k".to_string(), command.to_string()]);
 
-    wt_args.push("cmd".to_string());
-    wt_args.push("/k".to_string());
-    wt_args.push(command.to_string());
-
-    std::process::Command::new("wt")
-        .args(&wt_args)
-        .spawn()
-        .map_err(|e| format!("Failed to open Windows Terminal: {}", e))?;
-    Ok(())
+    let arg_refs: Vec<&str> = wt_args.iter().map(|s| s.as_str()).collect();
+    spawn_process("wt", &arg_refs, "Windows Terminal")
 }
 
 /// Execute command in Warp terminal (macOS only)
 fn execute_in_warp(working_dir: Option<&str>, command: &str) -> Result<(), String> {
-    let escaped = escape_for_applescript(command);
-    let full_cmd = build_shell_command(working_dir, &escaped);
-    let script = format!(
+    execute_via_applescript(
+        working_dir,
+        command,
         r#"tell application "Warp"
     activate
     tell application "System Events"
@@ -349,9 +382,8 @@ fn execute_in_warp(working_dir: Option<&str>, command: &str) -> Result<(), Strin
         keystroke return
     end tell
 end tell"#,
-        full_cmd
-    );
-    run_applescript(&script, "Warp")
+        "Warp",
+    )
 }
 
 /// Execute command in a custom terminal
@@ -374,11 +406,7 @@ fn execute_in_custom_terminal(
         ("sh", "-c")
     };
 
-    std::process::Command::new(shell)
-        .args([flag, &final_command])
-        .spawn()
-        .map_err(|e| format!("Failed to execute custom terminal: {}", e))?;
-    Ok(())
+    spawn_process(shell, &[flag, &final_command], "custom terminal")
 }
 
 /// Get list of available terminal apps for the current platform
@@ -404,10 +432,10 @@ pub fn get_available_terminals() -> Vec<(&'static str, &'static str)> {
         }
     }
 
-    if cfg!(target_os = "windows") {
-        if is_cli_installed("wt.exe") || is_cli_installed("wt") {
-            terminals.push(("windows_terminal", "Windows Terminal"));
-        }
+    if cfg!(target_os = "windows")
+        && (is_cli_installed("wt.exe") || is_cli_installed("wt"))
+    {
+        terminals.push(("windows_terminal", "Windows Terminal"));
     }
 
     terminals.push(("custom", "Custom..."));

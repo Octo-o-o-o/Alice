@@ -111,15 +111,15 @@ fn read_credentials_from_keychain() -> Option<ClaudeCredentials> {
 
     // Format subscription type as display name (e.g., "max" -> "Claude Max")
     let plan_display = oauth.subscription_type.map(|s| {
-        let label = match s.to_lowercase().as_str() {
+        let capitalized = match s.to_lowercase().as_str() {
             "max" => "Max",
             "pro" => "Pro",
             "free" => "Free",
             "team" => "Team",
             "enterprise" => "Enterprise",
-            _ => return format!("Claude {}", s),
+            _ => &s,
         };
-        format!("Claude {}", label)
+        format!("Claude {}", capitalized)
     });
 
     Some(ClaudeCredentials {
@@ -214,18 +214,15 @@ pub async fn fetch_oauth_usage(access_token: &str) -> Result<OAuthUsageResponse,
     Err(last_error)
 }
 
-/// Calculate burn rate from historical usage
-pub fn calculate_burn_rate(
-    _current_percent: f64,
-    history: &[(i64, f64)], // (timestamp_ms, percent)
-) -> Option<f64> {
+/// Calculate burn rate from historical usage (% per hour)
+pub fn calculate_burn_rate(history: &[(i64, f64)]) -> Option<f64> {
     if history.len() < 2 {
         return None;
     }
 
     // Use last hour of data points
     let now = chrono::Utc::now().timestamp_millis();
-    let one_hour_ago = now - 3600_000;
+    let one_hour_ago = now - 3_600_000;
 
     let recent: Vec<_> = history
         .iter()
@@ -239,7 +236,7 @@ pub fn calculate_burn_rate(
     let first = recent.first()?;
     let last = recent.last()?;
 
-    let time_diff_hours = (last.0 - first.0) as f64 / 3600_000.0;
+    let time_diff_hours = (last.0 - first.0) as f64 / 3_600_000.0;
     let percent_diff = last.1 - first.1;
 
     if time_diff_hours > 0.0 {
@@ -249,19 +246,12 @@ pub fn calculate_burn_rate(
     }
 }
 
-/// Estimate time until limit is reached
-pub fn estimate_time_to_limit(
-    current_percent: f64,
-    burn_rate_per_hour: f64,
-) -> Option<i32> {
+/// Estimate time until limit is reached (in minutes)
+pub fn estimate_time_to_limit(current_percent: f64, burn_rate_per_hour: f64) -> Option<i32> {
     if burn_rate_per_hour <= 0.0 {
         return None;
     }
-
-    let remaining_percent = 100.0 - current_percent;
-    let hours_remaining = remaining_percent / burn_rate_per_hour;
-    let minutes_remaining = (hours_remaining * 60.0) as i32;
-
+    let minutes_remaining = ((100.0 - current_percent) / burn_rate_per_hour * 60.0) as i32;
     Some(minutes_remaining.max(0))
 }
 
@@ -276,12 +266,10 @@ pub fn format_reset_countdown(reset_at: &str) -> String {
     let hours = duration.num_hours();
     let minutes = duration.num_minutes() % 60;
 
-    if hours > 0 {
-        format!("{}h {}m", hours, minutes)
-    } else if minutes > 0 {
-        format!("{}m", minutes)
-    } else {
-        "Soon".to_string()
+    match (hours, minutes) {
+        (h, m) if h > 0 => format!("{}h {}m", h, m),
+        (_, m) if m > 0 => format!("{}m", m),
+        _ => "Soon".to_string(),
     }
 }
 
@@ -296,10 +284,10 @@ impl UsageHistory {
     const MAX_HISTORY_POINTS: usize = 100;
 
     fn add_point(history: &mut Vec<(i64, f64)>, percent: f64) {
-        let now = chrono::Utc::now().timestamp_millis();
-        history.push((now, percent));
+        history.push((chrono::Utc::now().timestamp_millis(), percent));
         if history.len() > Self::MAX_HISTORY_POINTS {
-            *history = history.split_off(history.len() - Self::MAX_HISTORY_POINTS);
+            let excess = history.len() - Self::MAX_HISTORY_POINTS;
+            history.drain(..excess);
         }
     }
 
@@ -313,28 +301,26 @@ impl UsageHistory {
     }
 
     pub fn get_session_burn_rate(&self) -> Option<f64> {
-        if self.session_history.len() < 2 {
-            return None;
-        }
-        let last = self.session_history.last()?;
-        calculate_burn_rate(last.1, &self.session_history)
+        calculate_burn_rate(&self.session_history)
     }
+}
+
+fn usage_history_path() -> std::path::PathBuf {
+    crate::platform::get_alice_dir().join("usage_history.json")
 }
 
 /// Save usage history to disk
 pub fn save_usage_history(history: &UsageHistory) -> Result<(), String> {
-    let path = crate::platform::get_alice_dir().join("usage_history.json");
     let content = serde_json::to_string_pretty(history)
         .map_err(|e| format!("Failed to serialize history: {}", e))?;
-    std::fs::write(&path, content)
+    std::fs::write(usage_history_path(), content)
         .map_err(|e| format!("Failed to write history: {}", e))?;
     Ok(())
 }
 
 /// Load usage history from disk
 pub fn load_usage_history() -> UsageHistory {
-    let path = crate::platform::get_alice_dir().join("usage_history.json");
-    std::fs::read_to_string(&path)
+    std::fs::read_to_string(usage_history_path())
         .ok()
         .and_then(|content| serde_json::from_str(&content).ok())
         .unwrap_or_default()
@@ -362,7 +348,7 @@ pub struct StatusIncident {
     pub updated_at: String,
 }
 
-/// Atlassian Statuspage API response types (used for typed deserialization)
+/// Atlassian Statuspage API response types
 #[derive(Deserialize)]
 struct StatusPageResponse {
     status: StatusPageInfo,
@@ -379,28 +365,7 @@ struct StatusPageInfo {
 #[derive(Deserialize)]
 struct IncidentsResponse {
     #[serde(default)]
-    incidents: Vec<StatusIncidentRaw>,
-}
-
-#[derive(Deserialize)]
-struct StatusIncidentRaw {
-    name: String,
-    status: String,
-    impact: String,
-    created_at: String,
-    updated_at: String,
-}
-
-impl From<StatusIncidentRaw> for StatusIncident {
-    fn from(raw: StatusIncidentRaw) -> Self {
-        Self {
-            name: raw.name,
-            status: raw.status,
-            impact: raw.impact,
-            created_at: raw.created_at,
-            updated_at: raw.updated_at,
-        }
-    }
+    incidents: Vec<StatusIncident>,
 }
 
 /// Fetch Anthropic service status from status page API
@@ -450,5 +415,5 @@ async fn fetch_incidents(client: &reqwest::Client) -> Result<Vec<StatusIncident>
         .await
         .map_err(|e| format!("Failed to parse incidents: {}", e))?;
 
-    Ok(parsed.incidents.into_iter().map(StatusIncident::from).collect())
+    Ok(parsed.incidents)
 }

@@ -1,11 +1,23 @@
 // Notification engine for session events
 
-#![allow(dead_code)]
+use std::borrow::Cow;
 
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
-/// Send a notification for task completion
+/// Emoji-to-spoken-label mapping for TTS output.
+const EMOJI_LABELS: &[(&str, &str)] = &[
+    ("✓", "Completed:"),
+    ("✗", "Error:"),
+    ("⚠", "Attention:"),
+    ("▶", "Started:"),
+    ("📋", ""),
+];
+
+// ---------------------------------------------------------------------------
+// Public notification helpers
+// ---------------------------------------------------------------------------
+
 pub fn notify_task_completed(
     app: &AppHandle,
     project_name: &str,
@@ -13,56 +25,62 @@ pub fn notify_task_completed(
     cost: f64,
     duration_secs: u64,
 ) -> Result<(), String> {
-    let title = format!("✓ {}", project_name);
-    let body = format!(
-        "\"{}\" finished ({}, ${:.2})",
-        truncate_str(prompt_snippet, 50),
-        format_duration(duration_secs),
-        cost
-    );
+    let snippet = truncate_str(prompt_snippet, 50);
+    let duration = format_duration(duration_secs);
+    let title = format!("✓ {project_name}");
+    let body = format!("\"{snippet}\" finished ({duration}, ${cost:.2})");
     send_notification(app, &title, &body)
 }
 
-/// Send a notification for task error
 pub fn notify_task_error(
     app: &AppHandle,
     project_name: &str,
     error_message: &str,
 ) -> Result<(), String> {
-    let title = format!("✗ {}", project_name);
-    let body = format!("Error: {}", truncate_str(error_message, 100));
-    send_notification(app, &title, &body)
+    let msg = truncate_str(error_message, 100);
+    send_notification(app, &format!("✗ {project_name}"), &format!("Error: {msg}"))
 }
 
-/// Send a notification when input is needed
 pub fn notify_needs_input(app: &AppHandle, project_name: &str) -> Result<(), String> {
-    let title = format!("⚠ {}", project_name);
-    send_notification(app, &title, "Waiting for user input")
+    send_notification(app, &format!("⚠ {project_name}"), "Waiting for user input")
 }
 
-/// Send a notification when queue task starts
 pub fn notify_queue_started(
     app: &AppHandle,
     project_name: &str,
     prompt_snippet: &str,
 ) -> Result<(), String> {
-    let title = format!("▶ Queue: {}", project_name);
-    let body = format!("Starting: \"{}\"", truncate_str(prompt_snippet, 50));
-    send_notification(app, &title, &body)
+    let snippet = truncate_str(prompt_snippet, 50);
+    send_notification(
+        app,
+        &format!("▶ Queue: {project_name}"),
+        &format!("Starting: \"{snippet}\""),
+    )
 }
 
-/// Send a notification for daily report
+#[allow(dead_code)]
 pub fn notify_daily_report(
     app: &AppHandle,
     date: &str,
     session_count: i32,
     total_cost: f64,
 ) -> Result<(), String> {
-    let body = format!("{}: {} sessions, ${:.2}", date, session_count, total_cost);
-    send_notification(app, "📋 Daily Report", &body)
+    send_notification(
+        app,
+        "📋 Daily Report",
+        &format!("{date}: {session_count} sessions, ${total_cost:.2}"),
+    )
 }
 
-/// Core notification sending function
+/// Truncates title/body to prevent overly long notifications from hook scripts.
+pub fn send_hook_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
+    send_notification(app, &truncate_str(title, 80), &truncate_str(body, 200))
+}
+
+// ---------------------------------------------------------------------------
+// Core notification dispatch
+// ---------------------------------------------------------------------------
+
 fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
     app.notification()
         .builder()
@@ -78,23 +96,22 @@ fn send_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), Str
     Ok(())
 }
 
-/// Speak notification using platform-native TTS
-fn speak_notification(title: &str, body: &str) {
-    let clean_title = title
-        .replace("✓", "Completed:")
-        .replace("✗", "Error:")
-        .replace("⚠", "Attention:")
-        .replace("▶", "Started:")
-        .replace("📋", "");
+// ---------------------------------------------------------------------------
+// Text-to-speech
+// ---------------------------------------------------------------------------
 
-    let text = format!("{} {}", clean_title.trim(), body);
+fn speak_notification(title: &str, body: &str) {
+    let clean_title = EMOJI_LABELS
+        .iter()
+        .fold(title.to_string(), |acc, &(emoji, label)| acc.replace(emoji, label));
+
+    let text = format!("{} {body}", clean_title.trim());
 
     std::thread::spawn(move || {
         let _ = build_tts_command(&text).output();
     });
 }
 
-/// Build a platform-specific TTS command
 #[cfg(target_os = "macos")]
 fn build_tts_command(text: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new("say");
@@ -127,34 +144,42 @@ fn build_tts_command(text: &str) -> std::process::Command {
     cmd
 }
 
-/// Format duration in human-readable format
+// ---------------------------------------------------------------------------
+// String helpers
+// ---------------------------------------------------------------------------
+
 fn format_duration(seconds: u64) -> String {
-    let minutes = seconds / 60;
-    let hours = minutes / 60;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
 
     if hours > 0 {
-        format!("{}h {}m", hours, minutes % 60)
+        format!("{hours}h {minutes}m")
     } else if minutes > 0 {
-        format!("{}m {}s", minutes, seconds % 60)
+        format!("{minutes}m {secs}s")
     } else {
-        format!("{}s", seconds)
+        format!("{secs}s")
     }
 }
 
-/// Truncate string to max length with ellipsis, respecting char boundaries
-fn truncate_str(s: &str, max_len: usize) -> String {
+fn truncate_str(s: &str, max_len: usize) -> Cow<'_, str> {
     if s.len() <= max_len {
-        return s.to_string();
+        return Cow::Borrowed(s);
     }
-    // Find a valid char boundary at or before max_len - 3
-    let mut end = max_len - 3;
+    // Walk backwards from the byte limit to find a char boundary (stable alternative
+    // to the nightly-only `floor_char_boundary`).
+    let mut end = max_len.saturating_sub(3);
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...", &s[..end])
+    Cow::Owned(format!("{}...", &s[..end]))
 }
 
-/// Session status change event for frontend
+// ---------------------------------------------------------------------------
+// Session status event (emitted to frontend)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionStatusEvent {
     pub session_id: String,
@@ -165,7 +190,7 @@ pub struct SessionStatusEvent {
     pub error_message: Option<String>,
 }
 
-/// Emit session status change to frontend and send notification
+#[allow(dead_code)]
 pub fn emit_session_status(app: &AppHandle, event: SessionStatusEvent) -> Result<(), String> {
     app.emit("session-status-changed", &event)
         .map_err(|e| e.to_string())?;

@@ -9,30 +9,39 @@ interface ProviderConfigCardProps {
   onDataDirChange?: (dataDir: string | null) => void;
 }
 
+const STATUS_STYLES = {
+  installed: { icon: CheckCircle2, iconClass: 'text-green-500', textClass: 'text-green-400' },
+  missing:   { icon: XCircle,      iconClass: 'text-yellow-500', textClass: 'text-yellow-400' },
+} as const;
+
+function getStatusText(provider: ProviderStatus): string {
+  if (!provider.installed) return 'Not installed';
+  if (provider.version) return `Installed \u00b7 ${provider.version}`;
+  return 'Installed';
+}
+
+function getToggleTitle(provider: ProviderStatus): string {
+  if (!provider.installed) return 'Not installed';
+  return provider.enabled ? 'Disable' : 'Enable';
+}
+
 export default function ProviderConfigCard({
   provider,
   onToggle,
   onDataDirChange,
-}: ProviderConfigCardProps) {
+}: ProviderConfigCardProps): React.ReactElement {
   const Icon = getProviderIcon(provider.id);
   const color = getProviderColor(provider.id);
   const [isExpanded, setIsExpanded] = useState(false);
   const [customDataDir, setCustomDataDir] = useState(provider.custom_data_dir || '');
 
-  const handleDataDirSave = () => {
+  const status = provider.installed ? STATUS_STYLES.installed : STATUS_STYLES.missing;
+  const StatusIcon = status.icon;
+
+  function handleDataDirSave(): void {
     onDataDirChange?.(customDataDir.trim() || null);
     setIsExpanded(false);
-  };
-
-  const StatusIcon = provider.installed ? CheckCircle2 : XCircle;
-  const statusColor = provider.installed ? 'green' : 'yellow';
-  const statusText = provider.installed
-    ? `Installed${provider.version ? ` · ${provider.version}` : ''}`
-    : 'Not installed';
-
-  const toggleTitle = provider.installed
-    ? (provider.enabled ? 'Disable' : 'Enable')
-    : 'Not installed';
+  }
 
   return (
     <div
@@ -42,6 +51,7 @@ export default function ProviderConfigCard({
         borderLeftColor: provider.enabled ? color.primary : '#374151',
       }}
     >
+      {/* Header: icon, name, status, toggle */}
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
           <div
@@ -59,9 +69,9 @@ export default function ProviderConfigCard({
               {provider.display_name}
             </h4>
             <div className="flex items-center gap-1 mt-0.5">
-              <StatusIcon size={10} className={`text-${statusColor}-500`} />
-              <span className={`text-[10px] text-${statusColor}-400`}>
-                {statusText}
+              <StatusIcon size={10} className={status.iconClass} />
+              <span className={`text-[10px] ${status.textClass}`}>
+                {getStatusText(provider)}
               </span>
             </div>
           </div>
@@ -73,7 +83,7 @@ export default function ProviderConfigCard({
           className={`relative w-9 h-5 rounded-full transition-colors ${
             provider.enabled ? 'bg-blue-500' : 'bg-gray-700'
           } ${!provider.installed ? 'opacity-50 cursor-not-allowed' : ''}`}
-          title={toggleTitle}
+          title={getToggleTitle(provider)}
         >
           <span
             className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full transition-transform ${
@@ -83,6 +93,7 @@ export default function ProviderConfigCard({
         </button>
       </div>
 
+      {/* Data directory */}
       <div className="text-xs text-gray-500 flex items-start gap-1 mt-2">
         <FolderOpen size={12} className="mt-0.5 flex-shrink-0" />
         <div className="flex-1 min-w-0">
@@ -97,13 +108,14 @@ export default function ProviderConfigCard({
         </div>
       </div>
 
+      {/* Advanced settings (only when enabled and data dir is configurable) */}
       {provider.enabled && onDataDirChange && (
         <div className="mt-2 pt-2 border-t border-white/5">
           <button
             onClick={() => setIsExpanded(!isExpanded)}
             className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
           >
-            {isExpanded ? '▼' : '▶'} Advanced settings
+            {isExpanded ? '\u25BC' : '\u25B6'} Advanced settings
           </button>
 
           {isExpanded && (
@@ -134,6 +146,7 @@ export default function ProviderConfigCard({
         </div>
       )}
 
+      {/* Installation warning */}
       {!provider.installed && (
         <div className="mt-2 pt-2 border-t border-white/5">
           <p className="text-xs text-yellow-500/80">

@@ -1,10 +1,9 @@
-// Alice - Claude Code Desktop Assistant
-// A lightweight menu bar application for managing Claude Code tasks, sessions, and workflows
-
 mod auto_action;
 mod commands;
 mod config;
 mod database;
+mod hook_processor;
+mod http_server;
 mod notification;
 mod platform;
 mod providers;
@@ -17,13 +16,13 @@ mod watcher;
 
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WebviewWindow, WindowEvent,
+    AppHandle, Manager, WebviewWindow, WindowEvent,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Calculate the window position relative to the tray icon click.
+/// Calculate the window position anchored to the tray icon.
 ///
-/// Each platform anchors the window differently:
+/// Platform behavior:
 /// - macOS: below the menu bar, left-aligned with the tray icon
 /// - Windows: above the taskbar, left-aligned with the tray icon
 /// - Other: top of the screen with a small gap
@@ -68,21 +67,88 @@ fn toggle_window(window: &WebviewWindow, tray_position: tauri::PhysicalPosition<
         return;
     }
 
-    if let Some(scale_factor) = window.current_monitor().ok().flatten().map(|m| m.scale_factor()) {
-        if let Some((x, y)) = calculate_window_position(
-            window,
-            tray_position.x as i32,
-            tray_position.y as i32,
-            scale_factor,
-        ) {
-            let _ = window.set_position(tauri::Position::Physical(
-                tauri::PhysicalPosition::new(x, y),
-            ));
-        }
+    if let Some((x, y)) = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.scale_factor())
+        .and_then(|scale| {
+            calculate_window_position(
+                window,
+                tray_position.x as i32,
+                tray_position.y as i32,
+                scale,
+            )
+        })
+    {
+        let pos = tauri::Position::Physical(tauri::PhysicalPosition::new(x, y));
+        let _ = window.set_position(pos);
     }
 
     let _ = window.show();
     let _ = window.set_focus();
+}
+
+/// Initialize core services: database, queue, auto-action, and background workers.
+fn initialize_services(handle: &AppHandle) {
+    if let Err(e) = database::init_database(handle) {
+        tracing::error!("Failed to initialize database: {}", e);
+    }
+
+    queue::init_queue(handle);
+    auto_action::init_auto_action(handle);
+    hook_processor::start_hook_processor(handle.clone());
+
+    let watcher_handle = handle.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = watcher::start_watcher(watcher_handle) {
+            tracing::error!("Failed to start file watcher: {}", e);
+        }
+    });
+
+    let server_handle = handle.clone();
+    let server_port = config::load_config().hook_server_port;
+    tauri::async_runtime::spawn(async move {
+        http_server::start_http_server(server_handle, server_port).await;
+    });
+}
+
+/// Build the system tray icon with click-to-toggle behavior.
+fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = app.handle().clone();
+
+    TrayIconBuilder::with_id("main")
+        .icon(tauri::include_image!("icons/tray-icon.png"))
+        .icon_as_template(cfg!(target_os = "macos"))
+        .tooltip("Alice - Claude Code Assistant")
+        .on_tray_icon_event(move |_tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                position,
+                ..
+            } = event
+            {
+                if let Some(window) = handle.get_webview_window("main") {
+                    toggle_window(&window, position);
+                }
+            }
+        })
+        .build(app.handle())?;
+
+    Ok(())
+}
+
+/// Hide the main window when it loses focus.
+fn setup_hide_on_blur(app: &tauri::App) {
+    if let Some(window) = app.get_webview_window("main") {
+        let window_handle = window.clone();
+        window.on_window_event(move |event| {
+            if let WindowEvent::Focused(false) = event {
+                let _ = window_handle.hide();
+            }
+        });
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -103,52 +169,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
-            if let Err(e) = database::init_database(&app.handle().clone()) {
-                tracing::error!("Failed to initialize database: {}", e);
-            }
-
-            // Initialize queue executor
-            queue::init_queue(&app.handle());
-
-            // Initialize auto-action manager
-            auto_action::init_auto_action(&app.handle());
-
-            let watcher_handle = app.handle().clone();
-            std::thread::spawn(move || {
-                if let Err(e) = watcher::start_watcher(watcher_handle) {
-                    tracing::error!("Failed to start file watcher: {}", e);
-                }
-            });
-
-            let tray_handle = app.handle().clone();
-            let _tray = TrayIconBuilder::with_id("main")
-                .icon(tauri::include_image!("icons/tray-icon.png"))
-                .icon_as_template(cfg!(target_os = "macos"))
-                .tooltip("Alice - Claude Code Assistant")
-                .on_tray_icon_event(move |_tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        position,
-                        ..
-                    } = event
-                    {
-                        if let Some(window) = tray_handle.get_webview_window("main") {
-                            toggle_window(&window, position);
-                        }
-                    }
-                })
-                .build(app.handle())?;
-
-            if let Some(window) = app.get_webview_window("main") {
-                let w = window.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::Focused(false) = event {
-                        let _ = w.hide();
-                    }
-                });
-            }
-
+            initialize_services(app.handle());
+            build_tray(app)?;
+            setup_hide_on_blur(app);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -211,6 +234,8 @@ pub fn run() {
             commands::set_active_environment,
             commands::get_provider_statuses,
             commands::update_provider_config,
+            commands::get_hook_server_port,
+            commands::install_gemini_hooks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

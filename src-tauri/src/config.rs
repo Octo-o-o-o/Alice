@@ -4,6 +4,43 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+// ---------------------------------------------------------------------------
+// Serde default-value helpers
+// ---------------------------------------------------------------------------
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_auto_action_delay() -> u32 {
+    5
+}
+
+fn default_hook_server_port() -> u16 {
+    39512
+}
+
+fn default_report_language() -> String {
+    "auto".to_string()
+}
+
+fn default_environments() -> Vec<ClaudeEnvironment> {
+    vec![ClaudeEnvironment::default()]
+}
+
+fn default_provider_configs() -> HashMap<String, ProviderConfigData> {
+    let disabled = || ProviderConfigData { enabled: false, ..Default::default() };
+    HashMap::from([
+        ("claude".to_string(), ProviderConfigData::default()),
+        ("codex".to_string(), disabled()),
+        ("gemini".to_string(), disabled()),
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
@@ -35,6 +72,10 @@ pub enum TerminalApp {
     Custom,
 }
 
+// ---------------------------------------------------------------------------
+// Config structs
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoActionConfig {
     #[serde(default)]
@@ -45,16 +86,38 @@ pub struct AutoActionConfig {
     pub delay_minutes: u32,
 }
 
-fn default_auto_action_delay() -> u32 {
-    5
-}
-
 impl Default for AutoActionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             action_type: AutoActionType::default(),
             delay_minutes: default_auto_action_delay(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationConfig {
+    #[serde(default = "default_true")]
+    pub on_task_completed: bool,
+    #[serde(default = "default_true")]
+    pub on_task_error: bool,
+    #[serde(default = "default_true")]
+    pub on_needs_input: bool,
+    #[serde(default)]
+    pub on_queue_started: bool,
+    #[serde(default = "default_true")]
+    pub on_daily_report: bool,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            on_task_completed: true,
+            on_task_error: true,
+            on_needs_input: true,
+            on_queue_started: false,
+            on_daily_report: true,
         }
     }
 }
@@ -91,10 +154,6 @@ impl Default for ClaudeEnvironment {
     }
 }
 
-fn default_environments() -> Vec<ClaudeEnvironment> {
-    vec![ClaudeEnvironment::default()]
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfigData {
     #[serde(default = "default_true")]
@@ -110,14 +169,6 @@ impl Default for ProviderConfigData {
             data_dir: None,
         }
     }
-}
-
-fn default_provider_configs() -> HashMap<String, ProviderConfigData> {
-    HashMap::from([
-        ("claude".to_string(), ProviderConfigData::default()),
-        ("codex".to_string(), ProviderConfigData { enabled: false, ..Default::default() }),
-        ("gemini".to_string(), ProviderConfigData { enabled: false, ..Default::default() }),
-    ])
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,28 +212,11 @@ pub struct AppConfig {
     pub active_environment_id: Option<String>,
     #[serde(default = "default_provider_configs")]
     pub provider_configs: HashMap<String, ProviderConfigData>,
-}
-
-fn default_report_language() -> String {
-    "auto".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotificationConfig {
-    #[serde(default = "default_true")]
-    pub on_task_completed: bool,
-    #[serde(default = "default_true")]
-    pub on_task_error: bool,
-    #[serde(default = "default_true")]
-    pub on_needs_input: bool,
+    /// Port for the local HTTP notification server (used by provider hooks)
+    #[serde(default = "default_hook_server_port")]
+    pub hook_server_port: u16,
     #[serde(default)]
-    pub on_queue_started: bool,
-    #[serde(default = "default_true")]
-    pub on_daily_report: bool,
+    pub gemini_hooks_installed: bool,
 }
 
 impl Default for AppConfig {
@@ -206,21 +240,15 @@ impl Default for AppConfig {
             claude_environments: default_environments(),
             active_environment_id: None,
             provider_configs: default_provider_configs(),
+            hook_server_port: default_hook_server_port(),
+            gemini_hooks_installed: false,
         }
     }
 }
 
-impl Default for NotificationConfig {
-    fn default() -> Self {
-        Self {
-            on_task_completed: true,
-            on_task_error: true,
-            on_needs_input: true,
-            on_queue_started: false,
-            on_daily_report: true,
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Config persistence
+// ---------------------------------------------------------------------------
 
 fn get_config_path() -> PathBuf {
     crate::platform::get_alice_dir().join("config.json")
@@ -259,54 +287,82 @@ fn modify_and_save(mutate: impl FnOnce(&mut AppConfig) -> Result<(), String>) ->
     Ok(config)
 }
 
+// ---------------------------------------------------------------------------
+// Single-key config updates
+// ---------------------------------------------------------------------------
+
+/// Extract helpers that reduce noise in the match arms below.
+/// Each returns the parsed value or a sensible fallback matching the field's default.
+fn json_bool(value: &serde_json::Value, fallback: bool) -> bool {
+    value.as_bool().unwrap_or(fallback)
+}
+
+fn json_str(value: &serde_json::Value, fallback: &str) -> String {
+    value.as_str().unwrap_or(fallback).to_string()
+}
+
+fn json_u32(value: &serde_json::Value, fallback: u32) -> u32 {
+    value.as_u64().unwrap_or(fallback as u64) as u32
+}
+
 pub fn update_config_value(key: &str, value: serde_json::Value) -> Result<AppConfig, String> {
     modify_and_save(|config| {
         match key {
-            "onboarding_completed" => config.onboarding_completed = value.as_bool().unwrap_or(false),
-            "launch_at_login" => config.launch_at_login = value.as_bool().unwrap_or(false),
-            "auto_hide_on_blur" => config.auto_hide_on_blur = value.as_bool().unwrap_or(true),
-            "notification_sound" => config.notification_sound = value.as_bool().unwrap_or(true),
-            "voice_notifications" => config.voice_notifications = value.as_bool().unwrap_or(false),
-            "hooks_installed" => config.hooks_installed = value.as_bool().unwrap_or(false),
-            "data_retention_days" => config.data_retention_days = value.as_u64().unwrap_or(0) as u32,
-            "daily_report_time" => config.daily_report_time = value.as_str().unwrap_or("").to_string(),
-            "report_language" => config.report_language = value.as_str().unwrap_or("auto").to_string(),
-            "custom_terminal_command" => config.custom_terminal_command = value.as_str().unwrap_or("").to_string(),
-            "terminal_choice_made" => config.terminal_choice_made = value.as_bool().unwrap_or(false),
+            // Top-level booleans
+            "onboarding_completed" => config.onboarding_completed = json_bool(&value, false),
+            "launch_at_login"     => config.launch_at_login     = json_bool(&value, false),
+            "auto_hide_on_blur"   => config.auto_hide_on_blur   = json_bool(&value, true),
+            "notification_sound"  => config.notification_sound   = json_bool(&value, true),
+            "voice_notifications" => config.voice_notifications  = json_bool(&value, false),
+            "hooks_installed"     => config.hooks_installed      = json_bool(&value, false),
+            "terminal_choice_made"=> config.terminal_choice_made = json_bool(&value, false),
 
-            "notifications.on_task_completed" => config.notifications.on_task_completed = value.as_bool().unwrap_or(true),
-            "notifications.on_task_error" => config.notifications.on_task_error = value.as_bool().unwrap_or(true),
-            "notifications.on_needs_input" => config.notifications.on_needs_input = value.as_bool().unwrap_or(true),
-            "notifications.on_queue_started" => config.notifications.on_queue_started = value.as_bool().unwrap_or(false),
-            "notifications.on_daily_report" => config.notifications.on_daily_report = value.as_bool().unwrap_or(true),
+            // Top-level strings / numbers
+            "data_retention_days"     => config.data_retention_days     = json_u32(&value, 0),
+            "daily_report_time"       => config.daily_report_time       = json_str(&value, ""),
+            "report_language"         => config.report_language         = json_str(&value, "auto"),
+            "custom_terminal_command" => config.custom_terminal_command = json_str(&value, ""),
 
+            // Notification sub-keys
+            "notifications.on_task_completed" => config.notifications.on_task_completed = json_bool(&value, true),
+            "notifications.on_task_error"     => config.notifications.on_task_error     = json_bool(&value, true),
+            "notifications.on_needs_input"    => config.notifications.on_needs_input    = json_bool(&value, true),
+            "notifications.on_queue_started"  => config.notifications.on_queue_started  = json_bool(&value, false),
+            "notifications.on_daily_report"   => config.notifications.on_daily_report   = json_bool(&value, true),
+
+            // Enum fields
             "theme" => config.theme = match value.as_str().unwrap_or("system") {
                 "light" => Theme::Light,
-                "dark" => Theme::Dark,
-                _ => Theme::System,
+                "dark"  => Theme::Dark,
+                _       => Theme::System,
             },
             "terminal_app" => config.terminal_app = match value.as_str().unwrap_or("system") {
-                "background" => TerminalApp::Background,
-                "iterm2" => TerminalApp::ITerm2,
+                "background"       => TerminalApp::Background,
+                "iterm2"           => TerminalApp::ITerm2,
                 "windows_terminal" => TerminalApp::WindowsTerminal,
-                "warp" => TerminalApp::Warp,
-                "custom" => TerminalApp::Custom,
-                _ => TerminalApp::System,
+                "warp"             => TerminalApp::Warp,
+                "custom"           => TerminalApp::Custom,
+                _                  => TerminalApp::System,
             },
 
-            "auto_action.enabled" => config.auto_action.enabled = value.as_bool().unwrap_or(false),
+            // Auto-action sub-keys
+            "auto_action.enabled" => config.auto_action.enabled = json_bool(&value, false),
             "auto_action.action_type" => config.auto_action.action_type = match value.as_str().unwrap_or("none") {
-                "sleep" => AutoActionType::Sleep,
+                "sleep"    => AutoActionType::Sleep,
                 "shutdown" => AutoActionType::Shutdown,
-                _ => AutoActionType::None,
+                _          => AutoActionType::None,
             },
-            "auto_action.delay_minutes" => config.auto_action.delay_minutes = value.as_u64().unwrap_or(5) as u32,
+            "auto_action.delay_minutes" => config.auto_action.delay_minutes = json_u32(&value, 5),
 
             _ => return Err(format!("Unknown config key: {}", key)),
         }
         Ok(())
     })
 }
+
+// ---------------------------------------------------------------------------
+// Database stats (co-located with config since it reads app data dir)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbStats {
@@ -317,7 +373,7 @@ pub struct DbStats {
 pub fn get_db_stats() -> DbStats {
     let alice_dir = crate::platform::get_alice_dir();
 
-    let db_size = std::fs::metadata(alice_dir.join("alice.db"))
+    let db_size_bytes = std::fs::metadata(alice_dir.join("alice.db"))
         .map(|m| m.len())
         .unwrap_or(0);
 
@@ -325,8 +381,12 @@ pub fn get_db_stats() -> DbStats {
         .map(|entries| entries.filter_map(|e| e.ok()).count())
         .unwrap_or(0);
 
-    DbStats { db_size_bytes: db_size, report_count }
+    DbStats { db_size_bytes, report_count }
 }
+
+// ---------------------------------------------------------------------------
+// Claude environment management
+// ---------------------------------------------------------------------------
 
 pub fn get_active_environment() -> ClaudeEnvironment {
     let config = load_config();
@@ -389,6 +449,10 @@ pub fn set_active_environment(id: &str) -> Result<AppConfig, String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// CLI detection helpers
+// ---------------------------------------------------------------------------
+
 pub fn is_claude_installed() -> bool {
     crate::platform::is_cli_installed("claude")
 }
@@ -404,6 +468,10 @@ pub fn get_claude_version() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Provider config helpers
+// ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
 pub fn get_provider_config(provider_id: &str) -> ProviderConfigData {

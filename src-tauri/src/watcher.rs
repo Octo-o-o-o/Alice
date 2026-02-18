@@ -1,10 +1,7 @@
 // File watcher for multi-provider session directories
 
-#![allow(dead_code)]
-
 use crate::database;
 use crate::providers::{Provider, ProviderId};
-use crate::session::SessionStatus;
 use crate::tray::{set_tray_state, TrayState};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -23,7 +20,7 @@ pub struct SessionUpdateEvent {
 
 /// Check whether a path points to a JSONL file
 fn is_jsonl(path: &Path) -> bool {
-    path.extension().map(|e| e == "jsonl").unwrap_or(false)
+    path.extension().is_some_and(|e| e == "jsonl")
 }
 
 /// Build a mapping from session directories to their provider IDs.
@@ -53,7 +50,10 @@ fn build_provider_dir_map() -> HashMap<PathBuf, ProviderId> {
 }
 
 /// Find which provider a path belongs to by checking watched directory prefixes.
-fn find_provider_for_path(path: &Path, dir_to_provider: &HashMap<PathBuf, ProviderId>) -> Option<ProviderId> {
+fn find_provider_for_path(
+    path: &Path,
+    dir_to_provider: &HashMap<PathBuf, ProviderId>,
+) -> Option<ProviderId> {
     dir_to_provider
         .iter()
         .find(|(watched_dir, _)| path.starts_with(watched_dir))
@@ -62,11 +62,7 @@ fn find_provider_for_path(path: &Path, dir_to_provider: &HashMap<PathBuf, Provid
 
 /// Walk a directory and process every JSONL session file using the given provider.
 /// Returns the number of successfully processed sessions.
-fn scan_provider_sessions(
-    app: &AppHandle,
-    dir: &Path,
-    provider: &dyn Provider,
-) -> u32 {
+fn scan_provider_sessions(app: &AppHandle, dir: &Path, provider: &dyn Provider) -> u32 {
     if !dir.exists() {
         return 0;
     }
@@ -80,7 +76,12 @@ fn scan_provider_sessions(
         if is_jsonl(path) {
             match process_session_file(app, path, provider) {
                 Ok(()) => count += 1,
-                Err(e) => tracing::warn!("Failed to process {} session file {:?}: {}", provider.id(), path, e),
+                Err(e) => tracing::warn!(
+                    "Failed to process {} session file {:?}: {}",
+                    provider.id(),
+                    path,
+                    e
+                ),
             }
         }
     }
@@ -96,7 +97,10 @@ pub fn start_watcher(app: AppHandle) -> Result<(), Box<dyn std::error::Error + S
         return Ok(());
     }
 
-    tracing::info!("Starting file watcher for {} provider directories", dir_to_provider.len());
+    tracing::info!(
+        "Starting file watcher for {} provider directories",
+        dir_to_provider.len()
+    );
 
     // Initial scan for all provider directories
     for (dir, provider_id) in &dir_to_provider {
@@ -117,17 +121,14 @@ pub fn start_watcher(app: AppHandle) -> Result<(), Box<dyn std::error::Error + S
         Config::default().with_poll_interval(Duration::from_millis(500)),
     )?;
 
-    // Watch all provider directories recursively
     for (dir, provider_id) in &dir_to_provider {
         tracing::info!("Watching {} directory: {:?}", provider_id, dir);
         watcher.watch(dir, RecursiveMode::Recursive)?;
     }
 
-    // Debounce map to avoid processing the same file multiple times
     let mut last_processed: HashMap<PathBuf, Instant> = HashMap::new();
     let debounce_duration = Duration::from_millis(500);
 
-    // Process events
     for event in rx {
         for path in event.paths {
             if !is_jsonl(&path) {
@@ -143,13 +144,17 @@ pub fn start_watcher(app: AppHandle) -> Result<(), Box<dyn std::error::Error + S
             }
             last_processed.insert(path.clone(), now);
 
-            // Resolve the provider (fall back to Claude for backward compatibility)
-            let provider_id = find_provider_for_path(&path, &dir_to_provider)
-                .unwrap_or(ProviderId::Claude);
+            let provider_id =
+                find_provider_for_path(&path, &dir_to_provider).unwrap_or(ProviderId::Claude);
             let provider = crate::providers::get_provider(provider_id);
 
             if let Err(e) = process_session_file(&app, &path, provider.as_ref()) {
-                tracing::error!("Failed to process {} session file {:?}: {}", provider_id, path, e);
+                tracing::error!(
+                    "Failed to process {} session file {:?}: {}",
+                    provider_id,
+                    path,
+                    e
+                );
             }
         }
 
@@ -169,37 +174,34 @@ fn process_session_file(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::debug!("Processing {} session file: {:?}", provider.id(), path);
 
-    let session = provider.parse_session(path)
+    let session = provider
+        .parse_session(path)
         .map_err(|e| format!("Provider parse error: {}", e))?;
 
     database::upsert_session(&session)?;
 
-    let tray_state = match session.status {
-        SessionStatus::Active => TrayState::Active,
-        SessionStatus::NeedsInput => TrayState::Warning,
-        SessionStatus::Error => TrayState::Error,
-        SessionStatus::Completed => TrayState::Success,
-        SessionStatus::Idle => TrayState::Idle,
-    };
-    set_tray_state(app, tray_state);
+    let status_str = session.status.as_str().to_string();
+    set_tray_state(app, TrayState::from(session.status));
 
-    app.emit("session-updated", SessionUpdateEvent {
-        session_id: session.session_id.clone(),
-        project_path: session.project_path.clone(),
-        status: format!("{:?}", session.status).to_lowercase(),
-    })?;
+    app.emit(
+        "session-updated",
+        SessionUpdateEvent {
+            session_id: session.session_id,
+            project_path: session.project_path,
+            status: status_str,
+        },
+    )?;
 
     Ok(())
 }
 
 /// Force rescan all session files to update token data (all providers)
-pub fn rescan_all_sessions(app: &AppHandle) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+pub fn rescan_all_sessions(
+    app: &AppHandle,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
     let dir_to_provider = build_provider_dir_map();
 
     tracing::info!("Rescan: Found {} provider directories", dir_to_provider.len());
-    for (dir, provider_id) in &dir_to_provider {
-        tracing::info!("  - {:?}: {:?}", provider_id, dir);
-    }
 
     let mut count: u32 = 0;
     for (dir, provider_id) in &dir_to_provider {
@@ -210,23 +212,9 @@ pub fn rescan_all_sessions(app: &AppHandle) -> Result<u32, Box<dyn std::error::E
         count += scanned;
     }
 
-    tracing::info!("Rescan complete: {} sessions updated across all providers", count);
+    tracing::info!(
+        "Rescan complete: {} sessions updated across all providers",
+        count
+    );
     Ok(count)
-}
-
-/// Watch for history.jsonl changes (Claude-specific, for backward compatibility)
-pub fn watch_history_file(_app: &AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let claude_dir = crate::platform::get_claude_dir();
-    let history_file = claude_dir.join("history.jsonl");
-
-    if !history_file.exists() {
-        tracing::info!("Claude history file not found, skipping watch");
-        return Ok(());
-    }
-
-    // Parse and index history entries
-    // This provides additional metadata for search
-    // Implementation deferred to later phase
-
-    Ok(())
 }

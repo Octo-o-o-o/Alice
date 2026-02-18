@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Sparkles,
@@ -19,7 +20,7 @@ import {
   RefreshCw,
   Cpu,
   Command,
-  Zap
+  Zap,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { OnboardingStatus, HookVerifyResult, ScanResult } from "../lib/types";
@@ -40,7 +41,7 @@ interface StatusItemProps {
   status: "success" | "warning" | "error";
   label: string;
   detail?: string;
-  action?: React.ReactNode;
+  action?: ReactNode;
 }
 
 interface Step1Props {
@@ -78,9 +79,30 @@ interface Step4Props {
   onStartScan: () => void;
 }
 
+interface FeatureCardProps {
+  icon: LucideIcon;
+  color: string;
+  title: string;
+  description: string;
+}
+
+interface PreferenceItemProps {
+  icon: LucideIcon;
+  label: string;
+  description: string;
+  checked: boolean;
+  onChange: () => void;
+}
+
+interface StatCardProps {
+  value: number;
+  label: string;
+  color: string;
+}
+
 // --- Shared sub-components ---
 
-function StepHeader({ title, subtitle, gradient = "from-blue-400 to-purple-400" }: StepHeaderProps): React.ReactElement {
+function StepHeader({ title, subtitle, gradient = "from-blue-400 to-purple-400" }: StepHeaderProps): ReactElement {
   return (
     <div className="text-center mb-8">
       <h2 className={`text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r ${gradient} mb-2 tracking-tight`}>
@@ -91,14 +113,14 @@ function StepHeader({ title, subtitle, gradient = "from-blue-400 to-purple-400" 
   );
 }
 
-function StatusItem({ status, label, detail, action }: StatusItemProps): React.ReactElement {
-  const icons = {
+function StatusItem({ status, label, detail, action }: StatusItemProps): ReactElement {
+  const icons: Record<StatusItemProps["status"], LucideIcon> = {
     success: Check,
     warning: AlertTriangle,
     error: X,
   };
 
-  const colors = {
+  const colors: Record<StatusItemProps["status"], string> = {
     success: "bg-emerald-500/20 text-emerald-400",
     warning: "bg-yellow-500/20 text-yellow-400",
     error: "bg-red-500/20 text-red-400",
@@ -122,7 +144,7 @@ function StatusItem({ status, label, detail, action }: StatusItemProps): React.R
   );
 }
 
-function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: () => void }): React.ReactElement {
+function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: () => void }): ReactElement {
   return (
     <button
       onClick={(e) => {
@@ -142,9 +164,73 @@ function ToggleSwitch({ checked, onChange }: { checked: boolean; onChange: () =>
   );
 }
 
+function FeatureCard({ icon: Icon, color, title, description }: FeatureCardProps): ReactElement {
+  return (
+    <div className="p-4 bg-white/5 border border-white/5 rounded-xl hover:bg-white/[0.07] transition-colors">
+      <div className="flex items-center gap-3">
+        <div className={`p-2 bg-${color}-500/20 rounded-lg`}>
+          <Icon size={18} className={`text-${color}-400`} />
+        </div>
+        <div>
+          <h3 className="text-sm font-medium text-gray-200">{title}</h3>
+          <p className="text-xs text-gray-500">{description}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PreferenceItem({ icon: Icon, label, description, checked, onChange }: PreferenceItemProps): ReactElement {
+  return (
+    <div className="flex items-center justify-between p-3 rounded-xl hover:bg-white/5 transition-colors group">
+      <div className="flex items-center gap-3">
+        <div className={`p-2 rounded-lg transition-colors ${checked ? "bg-blue-500/20 text-blue-400" : "bg-gray-800 text-gray-500 group-hover:bg-gray-700"}`}>
+          <Icon size={18} />
+        </div>
+        <div>
+          <p className="text-sm font-medium text-gray-200">{label}</p>
+          <p className="text-xs text-gray-500">{description}</p>
+        </div>
+      </div>
+      <ToggleSwitch checked={checked} onChange={onChange} />
+    </div>
+  );
+}
+
+function StatCard({ value, label, color }: StatCardProps): ReactElement {
+  return (
+    <div className="p-4 bg-white/[0.03] border border-white/5 rounded-2xl">
+      <p className={`text-3xl font-bold text-${color}-400 tracking-tight`}>{value}</p>
+      <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mt-1">{label}</p>
+    </div>
+  );
+}
+
+// --- Helpers ---
+
+function makeHookResult(success: boolean): HookVerifyResult {
+  return {
+    success,
+    settings_path: "",
+    hooks_file: "",
+    session_start_installed: success,
+    session_end_installed: success,
+  };
+}
+
+function getProgressDotClass(dotStep: number, currentStep: number): string {
+  if (dotStep === currentStep) {
+    return "w-6 bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]";
+  }
+  if (dotStep < currentStep) {
+    return "w-1.5 bg-blue-500/50";
+  }
+  return "w-1.5 bg-gray-700";
+}
+
 // --- Main component ---
 
-export default function OnboardingWizard({ onComplete }: OnboardingWizardProps): React.ReactElement {
+export default function OnboardingWizard({ onComplete }: OnboardingWizardProps): ReactElement {
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [status, setStatus] = useState<OnboardingStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -168,52 +254,39 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps):
   const [scanning, setScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState(0);
 
-  useEffect(() => {
-    loadStatus();
-  }, []);
-
-  const loadStatus = async () => {
+  async function loadStatus(): Promise<void> {
     setLoading(true);
     try {
       const result = await invoke<OnboardingStatus>("get_onboarding_status", {});
       setStatus(result);
-
       if (result.hooks_installed) {
-        setHooksResult({
-          success: true,
-          settings_path: "",
-          hooks_file: "",
-          session_start_installed: true,
-          session_end_installed: true,
-        });
+        setHooksResult(makeHookResult(true));
       }
     } catch (e) {
       console.error("Failed to load onboarding status:", e);
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const installHooks = async () => {
+  useEffect(() => {
+    loadStatus();
+  }, []);
+
+  async function installHooks(): Promise<void> {
     setHooksInstalling(true);
     try {
       const result = await invoke<HookVerifyResult>("install_and_verify_hooks", {});
       setHooksResult(result);
     } catch (e) {
       console.error("Failed to install hooks:", e);
-      setHooksResult({
-        success: false,
-        settings_path: "",
-        hooks_file: "",
-        session_start_installed: false,
-        session_end_installed: false,
-      });
+      setHooksResult(makeHookResult(false));
     } finally {
       setHooksInstalling(false);
     }
-  };
+  }
 
-  const savePreferences = async () => {
+  async function savePreferences(): Promise<void> {
     try {
       await invoke("update_config", { key: "notification_sound", value: preferences.notificationSound });
       await invoke("update_config", { key: "voice_notifications", value: preferences.voiceNotifications });
@@ -223,7 +296,7 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps):
     } catch (e) {
       console.error("Failed to save preferences:", e);
     }
-  };
+  }
 
   const startScan = useCallback(async () => {
     setScanning(true);
@@ -241,31 +314,29 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps):
 
     try {
       const result = await invoke<ScanResult>("scan_claude_directory", {});
-      clearInterval(progressInterval);
-      setScanProgress(100);
       setScanResult(result);
     } catch (e) {
       console.error("Failed to scan:", e);
-      clearInterval(progressInterval);
-      setScanProgress(100);
       setScanResult({ session_count: 0, project_count: 0, total_tokens: 0, projects: [] });
     } finally {
+      clearInterval(progressInterval);
+      setScanProgress(100);
       setScanning(false);
     }
   }, []);
 
-  const completeOnboarding = async () => {
+  async function completeOnboarding(): Promise<void> {
     try {
       await invoke("update_config", { key: "onboarding_completed", value: true });
       onComplete();
     } catch (e) {
       console.error("Failed to complete onboarding:", e);
     }
-  };
+  }
 
   const canProceed = step !== 1 || status?.cli_installed === true;
 
-  const handleNext = async () => {
+  async function handleNext(): Promise<void> {
     if (step === 3) {
       await savePreferences();
     }
@@ -278,13 +349,13 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps):
         setTimeout(() => startScan(), 300);
       }
     }
-  };
+  }
 
-  const handleBack = () => {
+  function handleBack(): void {
     if (step > 1) {
       setStep((step - 1) as 1 | 2 | 3 | 4);
     }
-  };
+  }
 
   if (loading) {
     return (
@@ -338,15 +409,12 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps):
 
         {/* Footer Navigation */}
         <div className="p-6 bg-white/[0.02] border-t border-white/5 flex items-center justify-between relative mt-auto">
-
-          {/* Progress Indicators (Dots) */}
+          {/* Progress Indicators */}
           <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex gap-2">
             {[1, 2, 3, 4].map((s) => (
               <div
                 key={s}
-                className={`h-1.5 rounded-full transition-all duration-300 ${s === step ? "w-6 bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]" :
-                  s < step ? "w-1.5 bg-blue-500/50" : "w-1.5 bg-gray-700"
-                  }`}
+                className={`h-1.5 rounded-full transition-all duration-300 ${getProgressDotClass(s, step)}`}
               />
             ))}
           </div>
@@ -371,7 +439,6 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps):
         </div>
       </div>
 
-      {/* Skip Button - Outside the card for minimalism */}
       <button
         onClick={completeOnboarding}
         className="absolute bottom-6 text-xs text-gray-500 hover:text-gray-300 transition-colors"
@@ -384,8 +451,7 @@ export default function OnboardingWizard({ onComplete }: OnboardingWizardProps):
 
 // --- Step components ---
 
-function Step1Welcome({ status, onRefresh }: Step1Props): React.ReactElement {
-
+function Step1Welcome({ status, onRefresh }: Step1Props): ReactElement {
   const cliStatus = status?.cli_installed ? "success" : "error";
   const loginStatus = status?.credentials_found ? "success" : "warning";
   const dirStatus = status?.claude_dir_exists ? "success" : "warning";
@@ -447,7 +513,7 @@ function Step1Welcome({ status, onRefresh }: Step1Props): React.ReactElement {
   );
 }
 
-function Step2Hooks({ status, installing, result, showPreview, onTogglePreview, onInstall }: Step2Props): React.ReactElement {
+function Step2Hooks({ status, installing, result, showPreview, onTogglePreview, onInstall }: Step2Props): ReactElement {
   const isInstalled = result?.success || status?.hooks_installed;
 
   return (
@@ -459,34 +525,21 @@ function Step2Hooks({ status, installing, result, showPreview, onTogglePreview, 
       />
 
       <div className="space-y-4">
-        {/* Feature Cards */}
         <div className="grid grid-cols-1 gap-3">
-          <div className="p-4 bg-white/5 border border-white/5 rounded-xl hover:bg-white/[0.07] transition-colors">
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-blue-500/20 rounded-lg">
-                <Zap size={18} className="text-blue-400" />
-              </div>
-              <div>
-                <h3 className="text-sm font-medium text-gray-200">Real-time Activity</h3>
-                <p className="text-xs text-gray-500">Track when sessions start and end</p>
-              </div>
-            </div>
-          </div>
-
-          <div className="p-4 bg-white/5 border border-white/5 rounded-xl hover:bg-white/[0.07] transition-colors">
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-purple-500/20 rounded-lg">
-                <Cpu size={18} className="text-purple-400" />
-              </div>
-              <div>
-                <h3 className="text-sm font-medium text-gray-200">Token Usage</h3>
-                <p className="text-xs text-gray-500">Monitor costs and token consumption</p>
-              </div>
-            </div>
-          </div>
+          <FeatureCard
+            icon={Zap}
+            color="blue"
+            title="Real-time Activity"
+            description="Track when sessions start and end"
+          />
+          <FeatureCard
+            icon={Cpu}
+            color="purple"
+            title="Token Usage"
+            description="Monitor costs and token consumption"
+          />
         </div>
 
-        {/* Action Area */}
         <div className="mt-8">
           {isInstalled ? (
             <div className="flex flex-col items-center justify-center p-6 bg-emerald-500/5 border border-emerald-500/10 rounded-xl">
@@ -538,27 +591,10 @@ function Step2Hooks({ status, installing, result, showPreview, onTogglePreview, 
   );
 }
 
-function PreferenceItem({ icon: Icon, label, description, checked, onChange }: { icon: LucideIcon; label: string; description: string; checked: boolean; onChange: () => void }) {
-  return (
-    <div className="flex items-center justify-between p-3 rounded-xl hover:bg-white/5 transition-colors group">
-      <div className="flex items-center gap-3">
-        <div className={`p-2 rounded-lg transition-colors ${checked ? "bg-blue-500/20 text-blue-400" : "bg-gray-800 text-gray-500 group-hover:bg-gray-700"}`}>
-          <Icon size={18} />
-        </div>
-        <div>
-          <p className="text-sm font-medium text-gray-200">{label}</p>
-          <p className="text-xs text-gray-500">{description}</p>
-        </div>
-      </div>
-      <ToggleSwitch checked={checked} onChange={onChange} />
-    </div>
-  );
-}
-
-function Step3Preferences({ platform, preferences, onChange }: Step3Props): React.ReactElement {
-  const toggle = (key: keyof Preferences) => {
+function Step3Preferences({ platform, preferences, onChange }: Step3Props): ReactElement {
+  function toggle(key: keyof Preferences): void {
     onChange({ ...preferences, [key]: !preferences[key] });
-  };
+  }
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -607,13 +643,39 @@ function Step3Preferences({ platform, preferences, onChange }: Step3Props): Reac
   );
 }
 
-function Step4Completion({ scanResult, scanning, scanProgress, onStartScan }: Step4Props): React.ReactElement {
+function Step4Completion({ scanResult, scanning, scanProgress, onStartScan }: Step4Props): ReactElement {
   const scanDone = scanResult != null && !scanning;
+
+  function getScanState(): { iconClass: string; icon: ReactElement; title: string; subtitle: string } {
+    if (scanning) {
+      return {
+        iconClass: "bg-emerald-500/10 text-emerald-400 border border-emerald-500/30",
+        icon: <Loader2 size={40} className="animate-spin" />,
+        title: "Scanning Sessions...",
+        subtitle: "Indexing your Claude Code history in the background.",
+      };
+    }
+    if (scanDone) {
+      return {
+        iconClass: "bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-emerald-500/40",
+        icon: <Check size={40} className="drop-shadow-md" />,
+        title: "All Set!",
+        subtitle: "Alice is ready to help you manage your coding sessions.",
+      };
+    }
+    return {
+      iconClass: "bg-gray-800 text-gray-400",
+      icon: <FolderSearch size={40} />,
+      title: "Finalizing...",
+      subtitle: "One last step to index your data.",
+    };
+  }
+
+  const { iconClass, icon, title, subtitle } = getScanState();
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-4 duration-500 text-center">
       <div className="mb-8 relative inline-flex items-center justify-center">
-        {/* Background pulses */}
         {scanning && (
           <>
             <div className="absolute inset-0 bg-emerald-500/30 rounded-full animate-ping opacity-75" />
@@ -621,25 +683,13 @@ function Step4Completion({ scanResult, scanning, scanProgress, onStartScan }: St
           </>
         )}
 
-        <div className={`w-20 h-20 rounded-2xl flex items-center justify-center shadow-xl transition-all duration-500 ${scanning ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/30" :
-          scanDone ? "bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-emerald-500/40" :
-            "bg-gray-800 text-gray-400"
-          }`}>
-          {scanning ? <Loader2 size={40} className="animate-spin" /> :
-            scanDone ? <Check size={40} className="drop-shadow-md" /> :
-              <FolderSearch size={40} />}
+        <div className={`w-20 h-20 rounded-2xl flex items-center justify-center shadow-xl transition-all duration-500 ${iconClass}`}>
+          {icon}
         </div>
       </div>
 
-      <h2 className="text-2xl font-bold text-white mb-2">
-        {scanning ? "Scanning Sessions..." : scanDone ? "All Set!" : "Finalizing..."}
-      </h2>
-
-      <p className="text-sm text-gray-400 mb-8 max-w-xs mx-auto">
-        {scanning ? "Indexing your Claude Code history in the background." :
-          scanDone ? "Alice is ready to help you manage your coding sessions." :
-            "One last step to index your data."}
-      </p>
+      <h2 className="text-2xl font-bold text-white mb-2">{title}</h2>
+      <p className="text-sm text-gray-400 mb-8 max-w-xs mx-auto">{subtitle}</p>
 
       {scanning && (
         <div className="max-w-xs mx-auto mb-8">
@@ -652,14 +702,8 @@ function Step4Completion({ scanResult, scanning, scanProgress, onStartScan }: St
 
       {scanDone && scanResult && (
         <div className="grid grid-cols-2 gap-4 animate-in fade-in zoom-in-50 duration-500">
-          <div className="p-4 bg-white/[0.03] border border-white/5 rounded-2xl">
-            <p className="text-3xl font-bold text-emerald-400 tracking-tight">{scanResult.session_count}</p>
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mt-1">Sessions</p>
-          </div>
-          <div className="p-4 bg-white/[0.03] border border-white/5 rounded-2xl">
-            <p className="text-3xl font-bold text-blue-400 tracking-tight">{scanResult.project_count}</p>
-            <p className="text-xs text-gray-500 font-medium uppercase tracking-wider mt-1">Projects</p>
-          </div>
+          <StatCard value={scanResult.session_count} label="Sessions" color="emerald" />
+          <StatCard value={scanResult.project_count} label="Projects" color="blue" />
         </div>
       )}
 

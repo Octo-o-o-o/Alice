@@ -1,29 +1,36 @@
 // Session parsing and data structures
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 /// Session status
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
     Idle,
     Active,
+    #[default]
     Completed,
     Error,
     NeedsInput,
 }
 
-impl Default for SessionStatus {
-    fn default() -> Self {
-        SessionStatus::Completed
+impl SessionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionStatus::Idle => "idle",
+            SessionStatus::Active => "active",
+            SessionStatus::Completed => "completed",
+            SessionStatus::Error => "error",
+            SessionStatus::NeedsInput => "needsinput",
+        }
     }
 }
+
 
 /// Session summary for list views
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,11 +150,11 @@ pub struct JsonlLine {
     pub message_type: String,
     /// Timestamp can be either ISO 8601 string or milliseconds integer
     #[serde(default)]
-    pub timestamp: Option<serde_json::Value>,
+    pub timestamp: Option<Value>,
     #[serde(default)]
     pub message: Option<JsonlMessage>,
     #[serde(default)]
-    pub content: Option<serde_json::Value>,
+    pub content: Option<Value>,
     #[serde(rename = "sessionId")]
     pub session_id: Option<String>,
     pub project: Option<String>,
@@ -159,7 +166,7 @@ pub struct JsonlLine {
 pub struct JsonlMessage {
     pub id: Option<String>,
     pub role: Option<String>,
-    pub content: Option<serde_json::Value>,
+    pub content: Option<Value>,
     pub model: Option<String>,
     pub usage: Option<TokenUsage>,
     pub stop_reason: Option<String>,
@@ -262,24 +269,17 @@ pub fn parse_session_file(path: &Path) -> Result<Vec<JsonlLine>, std::io::Error>
 }
 
 /// Parse timestamp from various formats (ISO 8601 string or milliseconds integer)
-fn parse_timestamp(value: &serde_json::Value) -> Option<i64> {
+fn parse_timestamp(value: &Value) -> Option<i64> {
     match value {
-        // Integer milliseconds
-        serde_json::Value::Number(n) => n.as_i64(),
-        // ISO 8601 string like "2026-02-14T10:50:36.482Z"
-        serde_json::Value::String(s) => {
-            // Try parsing as ISO 8601
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
                 return Some(dt.timestamp_millis());
             }
-            // Try parsing without timezone (assume UTC)
-            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ") {
-                return Some(dt.and_utc().timestamp_millis());
-            }
+            // Timezone-less ISO 8601 (assume UTC)
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
                 return Some(dt.and_utc().timestamp_millis());
             }
-            // Try parsing as integer string
             s.parse::<i64>().ok()
         }
         _ => None,
@@ -296,87 +296,40 @@ fn extract_user_prompt(line: &JsonlLine) -> Option<String> {
         .or_else(|| line.content.as_ref().and_then(extract_text_from_content))
 }
 
+/// Return `Some(trimmed)` when the string is non-empty after trimming.
+fn non_empty_trimmed(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
 /// Extract text from content value, handling various formats
-fn extract_text_from_content(content: &serde_json::Value) -> Option<String> {
+fn extract_text_from_content(content: &Value) -> Option<String> {
     match content {
-        // Content is an array of text objects: [{"type": "text", "text": "..."}, ...]
-        serde_json::Value::Array(arr) => {
+        Value::Array(arr) => {
             for item in arr {
-                if let Some(obj) = item.as_object() {
-                    // Skip IDE context messages (ide_opened_file, ide_selection, etc.)
-                    if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
-                        if !text.starts_with('<') || !text.contains("ide_") {
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() {
-                                return Some(trimmed.to_string());
-                            }
-                        }
-                    }
+                let Some(text) = item
+                    .as_object()
+                    .and_then(|obj| obj.get("text"))
+                    .and_then(|t| t.as_str())
+                else {
+                    continue;
+                };
+                // Skip IDE context messages (ide_opened_file, ide_selection, etc.)
+                if text.starts_with('<') && text.contains("ide_") {
+                    continue;
+                }
+                if let result @ Some(_) = non_empty_trimmed(text) {
+                    return result;
                 }
             }
             None
         }
-        // Content is a direct string
-        serde_json::Value::String(s) => {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                Some(trimmed.to_string())
-            } else {
-                None
-            }
-        }
-        // Content is something else - try to convert to string
+        Value::String(s) => non_empty_trimmed(s),
         _ => {
             let s = content.to_string().trim_matches('"').to_string();
-            if !s.is_empty() && s != "null" {
-                Some(s)
-            } else {
-                None
-            }
+            if !s.is_empty() && s != "null" { Some(s) } else { None }
         }
     }
-}
-
-/// Extract images from content value
-fn extract_images_from_content(content: &serde_json::Value) -> Vec<ImageContent> {
-    let mut images = Vec::new();
-
-    if let serde_json::Value::Array(arr) = content {
-        for item in arr {
-            if let Some(obj) = item.as_object() {
-                // Check if this is an image content block
-                if obj.get("type").and_then(|t| t.as_str()) == Some("image") {
-                    if let Some(source) = obj.get("source").and_then(|s| s.as_object()) {
-                        let source_type = source.get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("base64")
-                            .to_string();
-
-                        let media_type = source.get("media_type")
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string());
-
-                        let data = source.get("data")
-                            .and_then(|d| d.as_str())
-                            .map(|s| s.to_string());
-
-                        let path = source.get("path")
-                            .and_then(|p| p.as_str())
-                            .map(|s| s.to_string());
-
-                        images.push(ImageContent {
-                            source_type,
-                            media_type,
-                            data,
-                            path,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    images
 }
 
 /// Extract IDs from content array items matching a given type.
@@ -404,39 +357,71 @@ fn extract_content_ids(line: &JsonlLine, type_name: &str, id_field: &str) -> Vec
         .collect()
 }
 
+/// Accumulated token counts and cost for a session.
+#[derive(Default)]
+struct TokenAccumulator {
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    total: i64,
+    cost_usd: f64,
+}
+
+impl TokenAccumulator {
+    /// Add a single usage entry, computing cost with the given model name.
+    fn add(&mut self, usage: &TokenUsage, model_name: &str) {
+        self.input += usage.input_tokens;
+        self.output += usage.output_tokens;
+        self.cache_read += usage.cache_read_input_tokens;
+        self.cache_write += usage.cache_creation_input_tokens
+            + usage.cache_creation.as_ref().map_or(0, |c| {
+                c.ephemeral_5m_input_tokens + c.ephemeral_1h_input_tokens
+            });
+        self.total += usage.input_tokens + usage.output_tokens + usage.cache_read_input_tokens;
+        self.cost_usd += ModelPricing::for_model(model_name).calculate_cost(usage);
+    }
+}
+
+/// Determine session status from accumulated indicators.
+/// The watcher may later override Completed -> Active based on file modification time.
+fn determine_status(
+    has_error: bool,
+    has_pending_tools: bool,
+    last_message_type: Option<&str>,
+    any_assistant_seen: bool,
+) -> SessionStatus {
+    if has_error {
+        SessionStatus::Error
+    } else if has_pending_tools || (last_message_type == Some("user") && !any_assistant_seen) {
+        SessionStatus::Active
+    } else {
+        SessionStatus::Completed
+    }
+}
+
 /// Extract session metadata from parsed JSONL
 pub fn extract_session_metadata(
     session_id: &str,
     project_path: &str,
     lines: &[JsonlLine],
 ) -> Session {
-    let project_name = Path::new(project_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| project_path.to_string());
+    let project_name = extract_project_name(project_path);
 
     let mut first_prompt: Option<String> = None;
     let mut started_at: i64 = 0;
     let mut last_active_at: i64 = 0;
     let mut last_human_message_at: i64 = 0;
     let mut message_count: i32 = 0;
-    let mut total_tokens: i64 = 0;
-    let mut total_cost_usd: f64 = 0.0;
-    // Detailed token breakdown
-    let mut input_tokens: i64 = 0;
-    let mut output_tokens: i64 = 0;
-    let mut cache_read_tokens: i64 = 0;
-    let mut cache_write_tokens: i64 = 0;
+    let mut tokens = TokenAccumulator::default();
     let mut model: Option<String> = None;
     let mut seen_keys: HashSet<String> = HashSet::new();
-    let mut last_assistant_stop_reason: Option<Option<String>> = None;
+    let mut any_assistant_seen = false;
     let mut last_message_type: Option<String> = None;
     let mut has_error = false;
-    // Track tool_use IDs without corresponding tool_result (indicates active execution)
     let mut pending_tool_use_ids: HashSet<String> = HashSet::new();
 
     for line in lines {
-        // Update min/max timestamps
         let ts = line.timestamp.as_ref().and_then(parse_timestamp);
         if let Some(ts) = ts {
             if started_at == 0 || ts < started_at {
@@ -461,7 +446,6 @@ pub fn extract_session_metadata(
                     first_prompt = extract_user_prompt(line);
                 }
 
-                // Remove completed tool_result IDs from pending set
                 for id in extract_content_ids(line, "tool_result", "tool_use_id") {
                     pending_tool_use_ids.remove(&id);
                 }
@@ -476,7 +460,6 @@ pub fn extract_session_metadata(
                     model = msg.model.clone();
                 }
 
-                // Track new tool_use IDs
                 for id in extract_content_ids(line, "tool_use", "id") {
                     pending_tool_use_ids.insert(id);
                 }
@@ -488,28 +471,11 @@ pub fn extract_session_metadata(
                         None => true, // older logs without IDs -- count each line
                     };
                     if is_new {
-                        input_tokens += usage.input_tokens;
-                        output_tokens += usage.output_tokens;
-                        cache_read_tokens += usage.cache_read_input_tokens;
-                        cache_write_tokens += usage.cache_creation_input_tokens
-                            + usage.cache_creation.as_ref().map_or(0, |c| {
-                                c.ephemeral_5m_input_tokens + c.ephemeral_1h_input_tokens
-                            });
-                        total_tokens += usage.input_tokens
-                            + usage.output_tokens
-                            + usage.cache_read_input_tokens;
-                        let pricing =
-                            ModelPricing::for_model(msg.model.as_deref().unwrap_or("sonnet"));
-                        total_cost_usd += pricing.calculate_cost(usage);
+                        tokens.add(usage, msg.model.as_deref().unwrap_or("sonnet"));
                     }
                 }
 
-                // Track stop_reason for status determination
-                if msg.stop_reason.is_some() {
-                    last_assistant_stop_reason = Some(msg.stop_reason.clone());
-                } else if last_assistant_stop_reason.is_none() {
-                    last_assistant_stop_reason = Some(None);
-                }
+                any_assistant_seen = true;
             }
             "system" => {
                 if let Some(ref content) = line.content {
@@ -526,18 +492,12 @@ pub fn extract_session_metadata(
         last_human_message_at = last_active_at;
     }
 
-    // Determine status from multiple indicators:
-    // pending tools, unanswered user message, or error state.
-    // Watcher may override Completed to Active based on file modification time.
-    let status = if has_error {
-        SessionStatus::Error
-    } else if !pending_tool_use_ids.is_empty() {
-        SessionStatus::Active
-    } else if last_message_type.as_deref() == Some("user") && last_assistant_stop_reason.is_none() {
-        SessionStatus::Active
-    } else {
-        SessionStatus::Completed
-    };
+    let status = determine_status(
+        has_error,
+        !pending_tool_use_ids.is_empty(),
+        last_message_type.as_deref(),
+        any_assistant_seen,
+    );
 
     Session {
         session_id: session_id.to_string(),
@@ -550,32 +510,26 @@ pub fn extract_session_metadata(
         last_active_at,
         last_human_message_at,
         message_count,
-        total_tokens,
-        total_cost_usd,
-        input_tokens,
-        output_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
+        total_tokens: tokens.total,
+        total_cost_usd: tokens.cost_usd,
+        input_tokens: tokens.input,
+        output_tokens: tokens.output,
+        cache_read_tokens: tokens.cache_read,
+        cache_write_tokens: tokens.cache_write,
         model,
         status,
         provider: crate::providers::ProviderId::Claude, // Default to Claude
     }
 }
 
-/// Check if a session file is currently active (recently modified)
-/// Uses 60 second threshold to account for long-running operations like:
-/// - Generating large files
-/// - Running compilation/build commands
-/// - Executing test suites
-/// - Waiting for slow network operations
+/// Check if a session file is currently active (modified within the last 60 seconds).
+/// The generous threshold accounts for long-running CLI operations.
 pub fn is_session_active(path: &Path) -> bool {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if let Ok(modified) = metadata.modified() {
-            let elapsed = modified.elapsed().unwrap_or_default();
-            return elapsed.as_secs() < 60; // Active if modified in last 60 seconds
-        }
-    }
-    false
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| t.elapsed().unwrap_or_default().as_secs() < 60)
+        .unwrap_or(false)
 }
 
 /// Extract project name from path

@@ -39,20 +39,15 @@ impl Provider for ClaudeProvider {
 
     fn get_session_dirs(&self) -> Vec<PathBuf> {
         let projects_dir = self.data_dir.join("projects");
-        if !projects_dir.exists() {
+        let Ok(entries) = std::fs::read_dir(&projects_dir) else {
             return vec![];
-        }
+        };
 
-        let mut dirs = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.is_dir() {
-                    dirs.push(path);
-                }
-            }
-        }
-        dirs
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect()
     }
 
     fn parse_session(&self, path: &Path) -> Result<Session, ProviderError> {
@@ -82,33 +77,31 @@ impl Provider for ClaudeProvider {
     }
 
     fn get_usage(&self) -> Result<Option<ProviderUsage>, ProviderError> {
-        let creds = match crate::usage::read_claude_credentials() {
-            Some(c) => c,
-            None => return Ok(Some(ProviderUsage::error(ProviderId::Claude, "No credentials found"))),
+        let Some(creds) = crate::usage::read_claude_credentials() else {
+            return Ok(Some(ProviderUsage::error(ProviderId::Claude, "No credentials found")));
         };
 
-        let access_token = match creds.access_token {
-            Some(t) => t,
-            None => return Ok(Some(ProviderUsage::error(ProviderId::Claude, "No access token"))),
+        let Some(access_token) = creds.access_token else {
+            return Ok(Some(ProviderUsage::error(ProviderId::Claude, "No access token")));
         };
 
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| ProviderError::UsageFetch(format!("Failed to create runtime: {}", e)))?;
 
-        let usage_result = runtime.block_on(crate::usage::fetch_oauth_usage(&access_token));
+        let oauth_usage = match runtime.block_on(crate::usage::fetch_oauth_usage(&access_token)) {
+            Ok(usage) => usage,
+            Err(e) => return Ok(Some(ProviderUsage::error(ProviderId::Claude, e))),
+        };
 
-        match usage_result {
-            Ok(oauth_usage) => Ok(Some(ProviderUsage {
-                id: ProviderId::Claude,
-                session_percent: oauth_usage.five_hour.utilization,
-                session_reset_at: Some(oauth_usage.five_hour.resets_at.clone()),
-                weekly_percent: Some(oauth_usage.seven_day.utilization),
-                weekly_reset_at: Some(oauth_usage.seven_day.resets_at),
-                last_updated: chrono::Utc::now().timestamp_millis(),
-                error: None,
-            })),
-            Err(e) => Ok(Some(ProviderUsage::error(ProviderId::Claude, e))),
-        }
+        Ok(Some(ProviderUsage {
+            id: ProviderId::Claude,
+            session_percent: oauth_usage.five_hour.utilization,
+            session_reset_at: Some(oauth_usage.five_hour.resets_at),
+            weekly_percent: Some(oauth_usage.seven_day.utilization),
+            weekly_reset_at: Some(oauth_usage.seven_day.resets_at),
+            last_updated: chrono::Utc::now().timestamp_millis(),
+            error: None,
+        }))
     }
 }
 

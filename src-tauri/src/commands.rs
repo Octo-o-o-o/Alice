@@ -7,12 +7,45 @@ use std::fmt::Write;
 use tauri::AppHandle;
 
 // ============================================================================
-// Helper
+// Helpers
 // ============================================================================
 
 /// Convert any `Display` error into the `String` error type Tauri commands require.
 fn str_err(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+/// Read a JSON settings file, merge `new_hooks` into its `"hooks"` object, and write it back.
+///
+/// If the file does not exist or is invalid JSON, starts from an empty object.
+fn merge_hooks_into_settings(
+    settings_path: &std::path::Path,
+    new_hooks: serde_json::Value,
+) -> Result<(), String> {
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = std::fs::read_to_string(settings_path).map_err(str_err)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let settings_obj = settings
+        .as_object_mut()
+        .ok_or("Settings is not a JSON object")?;
+
+    match settings_obj.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        Some(existing_hooks) => {
+            for (key, value) in new_hooks.as_object().unwrap() {
+                existing_hooks.insert(key.clone(), value.clone());
+            }
+        }
+        None => {
+            settings_obj.insert("hooks".to_string(), new_hooks);
+        }
+    }
+
+    let content = serde_json::to_string_pretty(&settings).map_err(str_err)?;
+    std::fs::write(settings_path, content).map_err(str_err)
 }
 
 // ============================================================================
@@ -128,10 +161,11 @@ pub async fn delete_session(app: AppHandle, session_id: String) -> Result<(), St
 
 #[tauri::command]
 pub async fn rescan_sessions(app: AppHandle) -> Result<u32, String> {
-    // Debug: log enabled providers
-    let enabled = crate::providers::get_enabled_providers();
-    tracing::info!("Enabled providers for rescan: {:?}",
-        enabled.iter().map(|p| p.id()).collect::<Vec<_>>());
+    let provider_ids: Vec<_> = crate::providers::get_enabled_providers()
+        .iter()
+        .map(|p| p.id())
+        .collect();
+    tracing::info!("Enabled providers for rescan: {:?}", provider_ids);
 
     crate::watcher::rescan_all_sessions(&app).map_err(str_err)
 }
@@ -151,18 +185,13 @@ pub async fn debug_get_codex_dirs() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 pub async fn debug_codex_db_sessions(app: AppHandle) -> Result<Vec<String>, String> {
-    use crate::database;
+    let sessions = database::get_sessions(&app, None, 5000).map_err(str_err)?;
 
-    let sessions = database::get_sessions(&app, None, 5000)
-        .map_err(|e| e.to_string())?;
-
-    let codex_sessions: Vec<String> = sessions
+    Ok(sessions
         .into_iter()
         .filter(|s| s.provider.to_string().to_lowercase() == "codex")
         .map(|s| format!("{} - {} - {}", s.session_id, s.started_at, s.project_path))
-        .collect();
-
-    Ok(codex_sessions)
+        .collect())
 }
 
 /// Export session as JSON or Markdown
@@ -330,22 +359,16 @@ pub async fn get_live_usage() -> Result<crate::usage::LiveUsageStats, String> {
         ..Default::default()
     };
 
-    let creds = match crate::usage::read_claude_credentials() {
-        Some(c) => c,
-        None => {
-            stats.error = Some("No credentials found".to_string());
-            return Ok(stats);
-        }
+    let Some(creds) = crate::usage::read_claude_credentials() else {
+        stats.error = Some("No credentials found".to_string());
+        return Ok(stats);
     };
 
     stats.account_email = creds.account_email;
 
-    let access_token = match creds.access_token {
-        Some(t) => t,
-        None => {
-            stats.error = Some("No access token found".to_string());
-            return Ok(stats);
-        }
+    let Some(access_token) = creds.access_token else {
+        stats.error = Some("No access token found".to_string());
+        return Ok(stats);
     };
 
     match crate::usage::fetch_oauth_usage(&access_token).await {
@@ -385,14 +408,8 @@ pub async fn has_claude_credentials() -> bool {
 #[tauri::command]
 pub async fn get_provider_usage(provider: String) -> Result<crate::providers::ProviderUsage, String> {
     match provider.as_str() {
-        "codex" => {
-            // Call async function directly to avoid nested runtime
-            crate::providers::codex::get_codex_usage().await
-        }
-        "gemini" => {
-            // Call async function directly to avoid nested runtime
-            crate::providers::gemini::get_gemini_usage().await
-        }
+        "codex" => crate::providers::codex::get_codex_usage().await,
+        "gemini" => crate::providers::gemini::get_gemini_usage().await,
         "claude" => Err("Use get_live_usage for Claude".to_string()),
         _ => Err(format!("Unknown provider: {}", provider)),
     }
@@ -591,37 +608,16 @@ pub async fn install_hooks() -> Result<HooksInstallResult, String> {
         "SessionEnd": [{
             "type": "command",
             "command": crate::platform::get_hook_command("session_end", false)
+        }],
+        "PreToolUse": [{
+            "type": "command",
+            "command": crate::platform::get_pre_tool_use_hook_command()
         }]
     });
 
-    // Read existing settings or start fresh
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path).map_err(str_err)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    // Merge new hooks into existing settings
-    let settings_obj = settings
-        .as_object_mut()
-        .ok_or("Settings is not a JSON object")?;
-
-    match settings_obj.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        Some(existing_hooks) => {
-            for (key, value) in new_hooks.as_object().unwrap() {
-                existing_hooks.insert(key.clone(), value.clone());
-            }
-        }
-        None => {
-            settings_obj.insert("hooks".to_string(), new_hooks);
-        }
-    }
-
-    // Write settings
+    // Merge new hooks into the Claude settings file
     std::fs::create_dir_all(&claude_dir).map_err(str_err)?;
-    let settings_content = serde_json::to_string_pretty(&settings).map_err(str_err)?;
-    std::fs::write(&settings_path, &settings_content).map_err(str_err)?;
+    merge_hooks_into_settings(&settings_path, new_hooks)?;
 
     // Ensure hooks events file exists
     let alice_dir = crate::platform::get_alice_dir();
@@ -878,11 +874,7 @@ pub async fn get_provider_statuses() -> Vec<ProviderStatus> {
                 .unwrap_or_default();
 
             let installed = provider.is_installed();
-            let version = if installed {
-                get_provider_version(&id_str)
-            } else {
-                None
-            };
+            let version = installed.then(|| get_provider_version(&id_str)).flatten();
 
             let data_dir = provider_config
                 .data_dir
@@ -912,9 +904,9 @@ pub async fn update_provider_config(
 }
 
 fn get_provider_version(provider_id: &str) -> Option<String> {
+    // Only providers with a --version flag are supported
     let command = match provider_id {
-        "claude" => "claude",
-        "codex" => "codex",
+        "claude" | "codex" => provider_id,
         _ => return None,
     };
 
@@ -922,7 +914,84 @@ fn get_provider_version(provider_id: &str) -> Option<String> {
         .arg("--version")
         .output()
         .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
+}
+
+// ============================================================================
+// HTTP Hook Server
+// ============================================================================
+
+#[tauri::command]
+pub async fn get_hook_server_port() -> u16 {
+    crate::config::load_config().hook_server_port
+}
+
+// ============================================================================
+// Gemini Hook Installation
+// ============================================================================
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GeminiHooksResult {
+    pub success: bool,
+    pub settings_path: String,
+    pub script_path: String,
+    pub message: String,
+}
+
+#[tauri::command]
+pub async fn install_gemini_hooks() -> Result<GeminiHooksResult, String> {
+    let config = crate::config::load_config();
+    let port = config.hook_server_port;
+
+    // Write the hook shell script to ~/.alice/scripts/gemini-hook.sh
+    let alice_dir = crate::platform::get_alice_dir();
+    let scripts_dir = alice_dir.join("scripts");
+    std::fs::create_dir_all(&scripts_dir).map_err(str_err)?;
+
+    let script_path = scripts_dir.join("gemini-hook.sh");
+    let script_content = crate::platform::get_gemini_hook_script(port);
+    std::fs::write(&script_path, &script_content).map_err(str_err)?;
+
+    // Make the script executable on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .map_err(str_err)?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).map_err(str_err)?;
+    }
+
+    // Write ~/.gemini/settings.json hooks
+    let gemini_dir = crate::platform::get_gemini_dir();
+    std::fs::create_dir_all(&gemini_dir).map_err(str_err)?;
+    let settings_path = gemini_dir.join("settings.json");
+
+    let script_path_str = script_path.to_string_lossy().to_string();
+    let new_hooks = serde_json::json!({
+        "BeforeTool": {
+            "command": script_path_str
+        }
+    });
+
+    merge_hooks_into_settings(&settings_path, new_hooks)?;
+
+    // Mark gemini hooks as installed
+    let mut config = crate::config::load_config();
+    config.gemini_hooks_installed = true;
+    let _ = crate::config::save_config(&config);
+
+    Ok(GeminiHooksResult {
+        success: true,
+        settings_path: settings_path.to_string_lossy().to_string(),
+        script_path: script_path.to_string_lossy().to_string(),
+        message: format!(
+            "Gemini hooks installed. Script at {}. Alice HTTP server running on port {}.",
+            script_path.display(),
+            port
+        ),
+    })
 }

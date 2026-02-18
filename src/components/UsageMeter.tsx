@@ -29,6 +29,12 @@ function formatResetTime(resetAt: string | null): string {
   }
 }
 
+function formatEstimatedLimit(minutes: number): string {
+  const hours = Math.round(minutes / 60);
+  const remainder = minutes % 60;
+  return `${hours}h ${remainder}m`;
+}
+
 interface ProgressBarProps {
   percent: number;
   height?: string;
@@ -45,12 +51,98 @@ function ProgressBar({ percent, height = "h-2" }: ProgressBarProps): React.React
   );
 }
 
-export default function UsageMeter({ compact = false }: UsageMeterProps) {
+interface MeterEntry {
+  label: string;
+  shortLabel: string;
+  percent: number;
+  resetAt: string | null;
+}
+
+function getMeterEntries(stats: LiveUsageStats): MeterEntry[] {
+  return [
+    { label: "Session (5h window)", shortLabel: "5h", percent: stats.session_percent, resetAt: stats.session_reset_at },
+    { label: "Weekly", shortLabel: "7d", percent: stats.weekly_percent, resetAt: stats.weekly_reset_at },
+  ];
+}
+
+function BurnRateWarning({ stats }: { stats: LiveUsageStats }): React.ReactElement | null {
+  if (!stats.burn_rate_per_hour || stats.burn_rate_per_hour <= 5) {
+    return null;
+  }
+
+  return (
+    <div className="flex items-center gap-1.5 px-2 py-1.5 bg-yellow-500/[0.06] border border-yellow-500/10 rounded text-[10px]">
+      <AlertTriangle className="w-3 h-3 text-yellow-400 shrink-0" />
+      <span className="text-yellow-300">
+        Burn rate ~{Math.round(stats.burn_rate_per_hour)}%/hr
+        {stats.estimated_limit_in_minutes != null && (
+          <> · Session limit in ~{formatEstimatedLimit(stats.estimated_limit_in_minutes)}</>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function AccountInfo({ email }: { email: string }): React.ReactElement {
+  return (
+    <div className="pt-2 border-t border-white/5">
+      <div className="flex items-center justify-between text-[10px]">
+        <span className="text-gray-500">Account</span>
+        <span className="text-gray-400">{email}</span>
+      </div>
+    </div>
+  );
+}
+
+function CompactView({ meters }: { meters: MeterEntry[] }): React.ReactElement {
+  return (
+    <div className="flex items-center gap-2">
+      {meters.map(({ shortLabel, percent }) => (
+        <div key={shortLabel} className="flex items-center gap-1">
+          <span className="text-[10px] text-gray-500">{shortLabel}</span>
+          <div className="w-12">
+            <ProgressBar percent={percent} height="h-1.5" />
+          </div>
+          <span className="text-[10px] text-gray-400 font-mono w-8">
+            {Math.round(percent)}%
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function FullView({ stats, meters }: { stats: LiveUsageStats; meters: MeterEntry[] }): React.ReactElement {
+  return (
+    <div className="space-y-4">
+      {meters.map(({ label, percent, resetAt }) => (
+        <div key={label} className="space-y-1">
+          <div className="flex justify-between text-[10px]">
+            <span className="text-gray-400 font-medium">{label}</span>
+            <span className="text-gray-300 font-mono">
+              {Math.round(percent)}% used
+            </span>
+          </div>
+          <ProgressBar percent={percent} />
+          <span className="text-[10px] text-gray-500">
+            Resets in {formatResetTime(resetAt)}
+          </span>
+        </div>
+      ))}
+
+      <BurnRateWarning stats={stats} />
+
+      {stats.account_email && <AccountInfo email={stats.account_email} />}
+    </div>
+  );
+}
+
+export default function UsageMeter({ compact = false }: UsageMeterProps): React.ReactElement | null {
   const [stats, setStats] = useState<LiveUsageStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [hasCredentials, setHasCredentials] = useState(false);
 
-  const loadUsage = async () => {
+  async function loadUsage(): Promise<void> {
     try {
       const hasCreds = await invoke<boolean>("has_claude_credentials");
       setHasCredentials(hasCreds);
@@ -64,7 +156,7 @@ export default function UsageMeter({ compact = false }: UsageMeterProps) {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
   useEffect(() => {
     loadUsage();
@@ -100,71 +192,11 @@ export default function UsageMeter({ compact = false }: UsageMeterProps) {
     return null;
   }
 
+  const meters = getMeterEntries(stats);
+
   if (compact) {
-    return (
-      <div className="flex items-center gap-2">
-        {[
-          { label: "5h", percent: stats.session_percent },
-          { label: "7d", percent: stats.weekly_percent },
-        ].map(({ label, percent }) => (
-          <div key={label} className="flex items-center gap-1">
-            <span className="text-[10px] text-gray-500">{label}</span>
-            <div className="w-12">
-              <ProgressBar percent={percent} height="h-1.5" />
-            </div>
-            <span className="text-[10px] text-gray-400 font-mono w-8">
-              {Math.round(percent)}%
-            </span>
-          </div>
-        ))}
-      </div>
-    );
+    return <CompactView meters={meters} />;
   }
 
-  const meters = [
-    { label: "Session (5h window)", percent: stats.session_percent, resetAt: stats.session_reset_at },
-    { label: "Weekly", percent: stats.weekly_percent, resetAt: stats.weekly_reset_at },
-  ];
-
-  return (
-    <div className="space-y-4">
-      {meters.map(({ label, percent, resetAt }) => (
-        <div key={label} className="space-y-1">
-          <div className="flex justify-between text-[10px]">
-            <span className="text-gray-400 font-medium">{label}</span>
-            <span className="text-gray-300 font-mono">
-              {Math.round(percent)}% used
-            </span>
-          </div>
-          <ProgressBar percent={percent} />
-          <span className="text-[10px] text-gray-500">
-            Resets in {formatResetTime(resetAt)}
-          </span>
-        </div>
-      ))}
-
-      {/* Burn rate warning */}
-      {stats.burn_rate_per_hour && stats.burn_rate_per_hour > 5 && (
-        <div className="flex items-center gap-1.5 px-2 py-1.5 bg-yellow-500/[0.06] border border-yellow-500/10 rounded text-[10px]">
-          <AlertTriangle className="w-3 h-3 text-yellow-400 shrink-0" />
-          <span className="text-yellow-300">
-            Burn rate ~{Math.round(stats.burn_rate_per_hour)}%/hr
-            {stats.estimated_limit_in_minutes && (
-              <> · Session limit in ~{Math.round(stats.estimated_limit_in_minutes / 60)}h {stats.estimated_limit_in_minutes % 60}m</>
-            )}
-          </span>
-        </div>
-      )}
-
-      {/* Account info */}
-      {stats.account_email && (
-        <div className="pt-2 border-t border-white/5">
-          <div className="flex items-center justify-between text-[10px]">
-            <span className="text-gray-500">Account</span>
-            <span className="text-gray-400">{stats.account_email}</span>
-          </div>
-        </div>
-      )}
-    </div>
-  );
+  return <FullView stats={stats} meters={meters} />;
 }

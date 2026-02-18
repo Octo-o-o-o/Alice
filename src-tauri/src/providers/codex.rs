@@ -99,10 +99,9 @@ pub async fn get_codex_usage() -> Result<ProviderUsage, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "No access_token in tokens object".to_string())?;
 
-    match fetch_codex_oauth_usage(access_token).await {
-        Ok(usage) => Ok(usage),
-        Err(e) => Ok(ProviderUsage::error(ProviderId::Codex, &e)),
-    }
+    fetch_codex_oauth_usage(access_token)
+        .await
+        .or_else(|e| Ok(ProviderUsage::error(ProviderId::Codex, &e)))
 }
 
 /// Recursively collect subdirectories at a given depth.
@@ -199,49 +198,44 @@ fn parse_iso_timestamp(ts: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
+/// Known line types for the 2026 format
+const CODEX_2026_LINE_TYPES: &[&str] = &[
+    "session_meta", "turn_context", "event_msg", "item", "response_item",
+];
+
 /// Check if a line type is a known 2026 format type
 fn is_2026_line_type(line_type: Option<&str>) -> bool {
-    matches!(
-        line_type,
-        Some("session_meta") | Some("turn_context") | Some("event_msg") | Some("item") | Some("response_item")
-    )
+    line_type.is_some_and(|t| CODEX_2026_LINE_TYPES.contains(&t))
 }
 
 /// Parse a single JSONL line, trying both 2026 and 2025 formats
 fn parse_codex_line(line_str: &str) -> Option<ParsedCodexLine> {
-    // Try 2026 format first - check for specific 2026 type values
-    // 2026 format has types like: session_meta, turn_context, event_msg, item
-    // 2025 format has types like: message (which should NOT be treated as 2026)
+    // Try 2026 format first (types: session_meta, turn_context, event_msg, item, response_item).
+    // 2025 format uses "message" which must NOT be treated as 2026.
     if let Ok(line2026) = serde_json::from_str::<Codex2026Line>(line_str) {
-        // Only treat as 2026 format if it has a known 2026 type AND payload
-        if is_2026_line_type(line2026.line_type.as_deref()) && line2026.payload.is_some() {
-            let timestamp_ms = line2026.timestamp
-                .as_ref()
-                .and_then(|ts| parse_iso_timestamp(ts));
+        let line_type = line2026.line_type.as_deref();
 
-            let mut model = None;
-            let mut token_usage_2026 = None;
+        if is_2026_line_type(line_type) && line2026.payload.is_some() {
+            let payload = line2026.payload.as_ref().unwrap();
+            let timestamp_ms = line2026.timestamp.as_deref().and_then(parse_iso_timestamp);
 
-            if let Some(ref payload) = line2026.payload {
-                // Extract model from turn_context
-                if line2026.line_type.as_deref() == Some("turn_context") {
-                    model = payload.get("model")
-                        .and_then(|m| m.as_str())
-                        .map(|s| s.to_string());
-                }
+            let model = if line_type == Some("turn_context") {
+                payload.get("model").and_then(|m| m.as_str()).map(String::from)
+            } else {
+                None
+            };
 
-                // Extract token counts from event_msg with type=token_count
-                if line2026.line_type.as_deref() == Some("event_msg") {
-                    if payload.get("type").and_then(|t| t.as_str()) == Some("token_count") {
-                        if let Some(info) = payload.get("info") {
-                            // Parse total_token_usage (cumulative for the session)
-                            if let Some(usage) = info.get("total_token_usage") {
-                                token_usage_2026 = serde_json::from_value(usage.clone()).ok();
-                            }
-                        }
-                    }
-                }
-            }
+            // Extract cumulative token usage from event_msg with type=token_count
+            let token_usage_2026 = if line_type == Some("event_msg")
+                && payload.get("type").and_then(|t| t.as_str()) == Some("token_count")
+            {
+                payload
+                    .get("info")
+                    .and_then(|info| info.get("total_token_usage"))
+                    .and_then(|usage| serde_json::from_value(usage.clone()).ok())
+            } else {
+                None
+            };
 
             return Some(ParsedCodexLine {
                 timestamp_ms,
@@ -253,16 +247,13 @@ fn parse_codex_line(line_str: &str) -> Option<ParsedCodexLine> {
     }
 
     // Try 2025 format
-    if let Ok(line2025) = serde_json::from_str::<CodexJsonlLine>(line_str) {
-        return Some(ParsedCodexLine {
-            timestamp_ms: line2025.timestamp,
-            model: line2025.turn_context.and_then(|tc| tc.model),
-            token_count: line2025.token_count,
-            token_usage_2026: None,
-        });
-    }
-
-    None
+    let line2025: CodexJsonlLine = serde_json::from_str(line_str).ok()?;
+    Some(ParsedCodexLine {
+        timestamp_ms: line2025.timestamp,
+        model: line2025.turn_context.and_then(|tc| tc.model),
+        token_count: line2025.token_count,
+        token_usage_2026: None,
+    })
 }
 
 fn parse_codex_session_file(path: &Path) -> Result<Vec<ParsedCodexLine>, std::io::Error> {
@@ -294,6 +285,25 @@ fn system_time_to_millis(time: std::time::SystemTime, fallback: i64) -> i64 {
         .unwrap_or(fallback)
 }
 
+/// Extract (created, modified) timestamps from file metadata, falling back to now.
+fn timestamps_from_file_metadata(path: &Path) -> (i64, i64) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let Some(meta) = std::fs::metadata(path).ok() else {
+        return (now, now);
+    };
+    let created = meta
+        .created()
+        .ok()
+        .map(|t| system_time_to_millis(t, now))
+        .unwrap_or(now);
+    let modified = meta
+        .modified()
+        .ok()
+        .map(|t| system_time_to_millis(t, created))
+        .unwrap_or(created);
+    (created, modified)
+}
+
 /// OpenAI model pricing (per 1M tokens)
 /// GPT-4o: input $2.5, output $10, cached $1.25
 /// GPT-5.2-codex: input $2, output $8, cached $0.5
@@ -322,21 +332,15 @@ impl CodexModelPricing {
         }
     }
 
-    /// Calculate cost given token counts
-    /// - input_tokens: total input tokens (includes cached)
-    /// - output_tokens: total output tokens (includes reasoning)
-    /// - cached_input_tokens: subset of input_tokens that were cached (cheaper)
+    /// Calculate cost given token counts.
+    /// `input_tokens` includes cached; `output_tokens` includes reasoning.
+    /// `cached_input_tokens` is the subset of `input_tokens` that were cached (cheaper rate).
     fn calculate_cost(&self, input_tokens: i64, output_tokens: i64, cached_input_tokens: i64) -> f64 {
-        // Non-cached input tokens pay full price
         let non_cached_input = input_tokens - cached_input_tokens;
-        // Cached input tokens get discount
-        let cached_input = cached_input_tokens;
-        // All output tokens (including reasoning) pay same price
-        let output = output_tokens;
 
         (non_cached_input as f64 / 1_000_000.0) * self.input
-            + (cached_input as f64 / 1_000_000.0) * self.cached
-            + (output as f64 / 1_000_000.0) * self.output
+            + (cached_input_tokens as f64 / 1_000_000.0) * self.cached
+            + (output_tokens as f64 / 1_000_000.0) * self.output
     }
 }
 
@@ -385,28 +389,9 @@ fn build_codex_session(session_id: &str, path: &Path, lines: &[ParsedCodexLine])
     }
 
     // Resolve timestamps: prefer JSONL data, fall back to file metadata
-    let file_metadata = std::fs::metadata(path).ok();
-    let now = chrono::Utc::now().timestamp_millis();
-
     let (started_at, last_active_at) = match (first_timestamp, last_timestamp) {
         (Some(first), Some(last)) => (first, last),
-        _ => {
-            if let Some(ref meta) = file_metadata {
-                let created = meta
-                    .created()
-                    .ok()
-                    .map(|t| system_time_to_millis(t, now))
-                    .unwrap_or(now);
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .map(|t| system_time_to_millis(t, created))
-                    .unwrap_or(created);
-                (created, modified)
-            } else {
-                (now, now)
-            }
-        }
+        _ => timestamps_from_file_metadata(path),
     };
 
     let project_path = path
@@ -455,6 +440,22 @@ fn build_codex_session(session_id: &str, path: &Path, lines: &[ParsedCodexLine])
         status,
         provider: ProviderId::Codex,
     }
+}
+
+/// Extract (used_percent, reset_at) from a rate-limit window JSON object.
+fn extract_rate_window(window: Option<&serde_json::Value>) -> (Option<f64>, Option<String>) {
+    let percent = window
+        .and_then(|w| w.get("used_percent"))
+        .and_then(|v| v.as_i64())
+        .map(|i| i as f64);
+
+    let reset_at = window
+        .and_then(|w| w.get("reset_at"))
+        .and_then(|v| v.as_i64())
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+        .map(|dt| dt.to_rfc3339());
+
+    (percent, reset_at)
 }
 
 /// Fetch Codex usage from OAuth API
@@ -512,41 +513,14 @@ async fn fetch_codex_oauth_usage(access_token: &str) -> Result<ProviderUsage, St
     let primary = rate_limit.and_then(|r| r.get("primary_window"));
     let secondary = rate_limit.and_then(|r| r.get("secondary_window"));
 
-    // Extract session usage (primary window - typically 5h)
-    let session_percent = primary
-        .and_then(|p| p.get("used_percent"))
-        .and_then(|v| v.as_i64())
-        .map(|i| i as f64)
-        .unwrap_or(0.0);
-
-    let session_reset_at = primary
-        .and_then(|p| p.get("reset_at"))
-        .and_then(|v| v.as_i64())
-        .map(|ts| {
-            chrono::DateTime::from_timestamp(ts, 0)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default()
-        });
-
-    // Extract weekly usage (secondary window)
-    let weekly_percent = secondary
-        .and_then(|s| s.get("used_percent"))
-        .and_then(|v| v.as_i64())
-        .map(|i| i as f64);
-
-    let weekly_reset_at = secondary
-        .and_then(|s| s.get("reset_at"))
-        .and_then(|v| v.as_i64())
-        .and_then(|ts| {
-            chrono::DateTime::from_timestamp(ts, 0)
-                .map(|dt| dt.to_rfc3339())
-        });
+    let (session_percent, session_reset_at) = extract_rate_window(primary);
+    let (weekly_pct, weekly_reset_at) = extract_rate_window(secondary);
 
     Ok(ProviderUsage {
         id: ProviderId::Codex,
-        session_percent,
+        session_percent: session_percent.unwrap_or(0.0),
         session_reset_at,
-        weekly_percent,
+        weekly_percent: weekly_pct,
         weekly_reset_at,
         last_updated: chrono::Utc::now().timestamp_millis(),
         error: None,

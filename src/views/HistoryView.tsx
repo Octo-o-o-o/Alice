@@ -1,9 +1,10 @@
-import React, { useEffect, useState, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
+import { useEffect, useState, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Clock, Search, SearchX, Filter, X, ChevronDown } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { GroupedVirtuoso } from "react-virtuoso";
 import SessionCard from "../components/SessionCard";
-import { Session } from "../lib/types";
+import type { Session } from "../lib/types";
 import { getModKey } from "../lib/platform";
 import { getProviderColor } from "../lib/provider-colors";
 
@@ -123,6 +124,30 @@ function FilterDate({ label, value, onChange }: FilterDateProps): React.ReactEle
   );
 }
 
+// --- Shared UI helpers ---
+
+function Spinner({ className = "w-5 h-5" }: { className?: string }): React.ReactElement {
+  return (
+    <div className={`${className} border-2 border-blue-500 border-t-transparent rounded-full animate-spin`} />
+  );
+}
+
+interface EmptyStateProps {
+  icon: LucideIcon;
+  title: string;
+  subtitle: string;
+}
+
+function EmptyState({ icon: Icon, title, subtitle }: EmptyStateProps): React.ReactElement {
+  return (
+    <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-3">
+      <Icon size={32} className="opacity-50" />
+      <p className="text-sm">{title}</p>
+      <p className="text-xs text-gray-600">{subtitle}</p>
+    </div>
+  );
+}
+
 // --- Main component ---
 
 const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
@@ -151,7 +176,7 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
 
   async function loadProjects(): Promise<void> {
     try {
-      const result = await invoke<string[]>("get_projects", {});
+      const result = await invoke<string[]>("get_projects");
       setProjects(result);
     } catch (error) {
       console.error("Failed to load projects:", error);
@@ -177,11 +202,7 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
     try {
       const result = await invoke<Session[]>("search_sessions_filtered", {
         query: searchQuery.trim() || null,
-        project: filters.project,
-        status: filters.status,
-        model: filters.model,
-        dateFrom: filters.dateFrom,
-        dateTo: filters.dateTo,
+        ...filters,
         limit: 50,
       });
       setSessions(result);
@@ -198,7 +219,7 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
   }, []);
 
   useEffect(() => {
-    const debounce = setTimeout(() => {
+    const timer = setTimeout(() => {
       if (hasActiveSearch) {
         searchWithFilters();
       } else {
@@ -206,7 +227,7 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
       }
     }, 300);
 
-    return () => clearTimeout(debounce);
+    return () => clearTimeout(timer);
   }, [searchQuery, filters]);
 
   const { groupCounts, groupLabels, flatSessions } = useMemo(() => {
@@ -222,10 +243,14 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
     [projects],
   );
 
+  function handleDeleteSession(sessionId: string): void {
+    setSessions((prev) => prev.filter((s) => s.session_id !== sessionId));
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full">
-        <div className="w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+        <Spinner className="w-6 h-6" />
       </div>
     );
   }
@@ -324,30 +349,24 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
       <div className="flex-1 overflow-y-auto">
         {searching && (
           <div className="flex items-center justify-center py-8">
-            <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+            <Spinner />
           </div>
         )}
 
         {!searching && sessions.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-3">
-            {hasActiveSearch ? (
-              <>
-                <SearchX size={32} className="opacity-50" />
-                <p className="text-sm">No matching sessions</p>
-                <p className="text-xs text-gray-600">
-                  Try different search terms or adjust filters
-                </p>
-              </>
-            ) : (
-              <>
-                <Clock size={32} className="opacity-50" />
-                <p className="text-sm">No sessions found</p>
-                <p className="text-xs text-gray-600">
-                  Your Claude Code history will appear here
-                </p>
-              </>
-            )}
-          </div>
+          hasActiveSearch ? (
+            <EmptyState
+              icon={SearchX}
+              title="No matching sessions"
+              subtitle="Try different search terms or adjust filters"
+            />
+          ) : (
+            <EmptyState
+              icon={Clock}
+              title="No sessions found"
+              subtitle="Your Claude Code history will appear here"
+            />
+          )
         )}
 
         {!searching && sessions.length > 0 && (
@@ -360,28 +379,27 @@ const HistoryView = forwardRef<HistoryViewRef>(function HistoryView(_, ref) {
                 </h3>
               </div>
             )}
-            itemContent={(index) => (
-              <div className="px-3 py-1">
-                <div className="flex gap-2">
-                  <div
-                    className="w-1 rounded-full shrink-0"
-                    style={{ backgroundColor: getProviderColor(flatSessions[index].provider).primary }}
-                  />
-                  <div className="flex-1 min-w-0">
-                    <SessionCard
-                      key={flatSessions[index].session_id}
-                      session={flatSessions[index]}
-                      compact
-                      onDelete={(sessionId) => {
-                        setSessions((prev) =>
-                          prev.filter((s) => s.session_id !== sessionId)
-                        );
-                      }}
+            itemContent={(index) => {
+              const session = flatSessions[index];
+              return (
+                <div className="px-3 py-1">
+                  <div className="flex gap-2">
+                    <div
+                      className="w-1 rounded-full shrink-0"
+                      style={{ backgroundColor: getProviderColor(session.provider).primary }}
                     />
+                    <div className="flex-1 min-w-0">
+                      <SessionCard
+                        key={session.session_id}
+                        session={session}
+                        compact
+                        onDelete={handleDeleteSession}
+                      />
+                    </div>
                   </div>
                 </div>
-              </div>
-            )}
+              );
+            }}
             className="h-full"
           />
         )}

@@ -10,9 +10,10 @@ pub mod codex;
 pub mod gemini;
 
 /// Provider identifier
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderId {
+    #[default]
     Claude,
     Codex,
     Gemini,
@@ -44,11 +45,6 @@ impl ProviderId {
     }
 }
 
-impl Default for ProviderId {
-    fn default() -> Self {
-        ProviderId::Claude
-    }
-}
 
 impl std::fmt::Display for ProviderId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,8 +100,6 @@ pub struct ProviderUsage {
 
 impl ProviderUsage {
     /// Create a usage result representing an error state for a given provider.
-    /// Eliminates the repeated pattern of constructing zeroed-out ProviderUsage
-    /// with only the error field populated.
     #[allow(dead_code)]
     pub fn error(id: ProviderId, message: impl Into<String>) -> Self {
         Self {
@@ -116,26 +110,6 @@ impl ProviderUsage {
             weekly_reset_at: None,
             last_updated: chrono::Utc::now().timestamp_millis(),
             error: Some(message.into()),
-        }
-    }
-}
-
-/// Provider configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    pub id: ProviderId,
-    pub enabled: bool,
-    pub display_name: String,
-    pub data_dir: Option<PathBuf>,
-}
-
-impl Default for ProviderConfig {
-    fn default() -> Self {
-        Self {
-            id: ProviderId::Claude,
-            enabled: true,
-            display_name: "Claude".to_string(),
-            data_dir: None,
         }
     }
 }
@@ -206,15 +180,9 @@ pub fn get_enabled_providers() -> Vec<Box<dyn Provider>> {
     get_all_providers()
         .into_iter()
         .filter(|provider| {
-            let provider_key = match provider.id() {
-                ProviderId::Claude => "claude",
-                ProviderId::Codex => "codex",
-                ProviderId::Gemini => "gemini",
-            };
-
             config
                 .provider_configs
-                .get(provider_key)
+                .get(provider.id().cli_command())
                 .map(|cfg| cfg.enabled)
                 .unwrap_or(false)
         })

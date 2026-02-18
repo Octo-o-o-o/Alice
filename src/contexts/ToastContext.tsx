@@ -1,19 +1,23 @@
-import { createContext, useContext, useState, useCallback, useMemo, ReactNode } from "react";
-import { ToastContainer, ToastData, ToastType } from "../components/Toast";
+import React, { createContext, useContext, useState, useCallback, useMemo, type ReactNode } from "react";
+import { ToastContainer, type ToastData, type ToastType } from "../components/Toast";
+
+const TOAST_TYPES: ToastType[] = ["success", "error", "info", "warning"];
+
+type ToastShorthand = (message: string) => void;
 
 interface ToastContextValue {
   showToast: (type: ToastType, message: string, duration?: number) => void;
-  success: (message: string) => void;
-  error: (message: string) => void;
-  info: (message: string) => void;
-  warning: (message: string) => void;
+  success: ToastShorthand;
+  error: ToastShorthand;
+  info: ToastShorthand;
+  warning: ToastShorthand;
 }
 
 const ToastContext = createContext<ToastContextValue | null>(null);
 
 let toastId = 0;
 
-export function ToastProvider({ children }: { children: ReactNode }) {
+export function ToastProvider({ children }: { children: ReactNode }): React.ReactElement {
   const [toasts, setToasts] = useState<ToastData[]>([]);
 
   const showToast = useCallback((type: ToastType, message: string, duration?: number) => {
@@ -25,13 +29,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  const value = useMemo<ToastContextValue>(() => ({
-    showToast,
-    success: (message: string) => showToast("success", message),
-    error: (message: string) => showToast("error", message),
-    info: (message: string) => showToast("info", message),
-    warning: (message: string) => showToast("warning", message),
-  }), [showToast]);
+  const value = useMemo<ToastContextValue>(() => {
+    const shorthands = Object.fromEntries(
+      TOAST_TYPES.map((type) => [type, (message: string) => showToast(type, message)])
+    ) as Record<ToastType, ToastShorthand>;
+
+    return { showToast, ...shorthands };
+  }, [showToast]);
 
   return (
     <ToastContext.Provider value={value}>

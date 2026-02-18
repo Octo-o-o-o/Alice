@@ -1,39 +1,16 @@
 @import "tailwindcss";
 
-/* Design Tokens from UI_SPEC.md */
+/* ===== Design Tokens (Tailwind v4 @theme) ===== */
 @theme {
-  /* Color Palette */
-  --color-gray-750: #2d3342;
-  --color-gray-850: #1a202c;
-  --color-gray-900: #111827;
-  --color-gray-950: #0B0F19;
-  --color-alice-bg: rgb(20, 20, 30);
-  --color-alice-border: rgba(255, 255, 255, 0.08);
-
-  /* Shadows */
-  --shadow-glass: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  /* Glow shadows */
   --shadow-glow-blue: 0 0 15px rgba(59, 130, 246, 0.3);
   --shadow-glow-red: 0 0 15px rgba(239, 68, 68, 0.3);
   --shadow-glow-yellow: 0 0 15px rgba(245, 158, 11, 0.3);
   --shadow-glow-green: 0 0 15px rgba(16, 185, 129, 0.3);
 
   /* Animations */
-  --animate-float: float 6s ease-in-out infinite;
-  --animate-pulse-slow: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
   --animate-shimmer: shimmer-slide 1.5s infinite;
   --animate-toast-in: toast-in 0.3s ease-out;
-
-  @keyframes float {
-
-    0%,
-    100% {
-      transform: translateY(0);
-    }
-
-    50% {
-      transform: translateY(-5px);
-    }
-  }
 
   @keyframes shimmer-slide {
     0% {
@@ -58,7 +35,7 @@
   }
 }
 
-/* Font imports - Inter and JetBrains Mono */
+/* ===== Font Imports ===== */
 @font-face {
   font-family: 'Inter';
   src: url('./assets/fonts/Inter-Variable.woff2') format('woff2');
@@ -75,7 +52,7 @@
   font-display: swap;
 }
 
-/* Base styles */
+/* ===== Base Styles ===== */
 :root {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
   font-synthesis: none;
@@ -94,14 +71,10 @@
   --color-border-subtle: rgba(255, 255, 255, 0.05);
 
   --color-text-primary: #e5e7eb;
-  /* gray-200 */
   --color-text-secondary: #9ca3af;
-  /* gray-400 */
   --color-text-muted: #6b7280;
-  /* gray-500 */
 
-  --color-header-bg: rgba(17, 24, 39, 0.8);
-  --color-nav-bg: rgba(17, 24, 39, 0.8);
+  --color-chrome-bg: rgba(17, 24, 39, 0.8);
 
   --color-input-bg: rgba(255, 255, 255, 0.05);
   --color-input-border: rgba(255, 255, 255, 0.1);
@@ -113,28 +86,22 @@
   --color-scrollbar-hover: rgba(255, 255, 255, 0.2);
 }
 
-/* Light theme */
+/* ===== Light Theme ===== */
 :root.light {
   --color-bg-primary: #ffffff;
   --color-bg-secondary: #f9fafb;
-  /* gray-50 */
   --color-bg-glass: rgba(255, 255, 255, 0.8);
   --color-bg-card: rgba(0, 0, 0, 0.02);
 
   --color-border: rgba(0, 0, 0, 0.06);
-  /* Subtle border */
   --color-border-strong: rgba(0, 0, 0, 0.1);
   --color-border-subtle: rgba(0, 0, 0, 0.04);
 
   --color-text-primary: #111827;
-  /* gray-900 */
   --color-text-secondary: #4b5563;
-  /* gray-600 */
   --color-text-muted: #6b7280;
-  /* gray-500 */
 
-  --color-header-bg: rgba(255, 255, 255, 0.85);
-  --color-nav-bg: rgba(255, 255, 255, 0.85);
+  --color-chrome-bg: rgba(255, 255, 255, 0.85);
 
   --color-input-bg: rgba(0, 0, 0, 0.03);
   --color-input-border: rgba(0, 0, 0, 0.08);
@@ -145,13 +112,14 @@
   --color-scrollbar: rgba(0, 0, 0, 0.1);
   --color-scrollbar-hover: rgba(0, 0, 0, 0.25);
 
-  /* Retune shadow glows for light bg visibility */
+  /* Retune glow shadows for light backgrounds */
   --shadow-glow-blue: 0 0 10px rgba(59, 130, 246, 0.25);
   --shadow-glow-red: 0 0 10px rgba(239, 68, 68, 0.25);
   --shadow-glow-yellow: 0 0 10px rgba(245, 158, 11, 0.25);
   --shadow-glow-green: 0 0 10px rgba(16, 185, 129, 0.25);
 }
 
+/* ===== Document Reset ===== */
 html,
 body,
 #root {
@@ -167,7 +135,7 @@ body {
   transition: background-color 0.3s ease, color 0.3s ease;
 }
 
-/* Scrollbar styling */
+/* ===== Scrollbar ===== */
 ::-webkit-scrollbar {
   width: 6px;
 }
@@ -186,7 +154,7 @@ body {
   background: var(--color-scrollbar-hover);
 }
 
-/* Glass effect utility classes */
+/* ===== Glass Panel ===== */
 .glass-panel {
   background: var(--color-bg-glass);
   backdrop-filter: blur(16px);
@@ -196,19 +164,20 @@ body {
   transition: all 0.3s ease;
 }
 
-/* For Windows fallback where backdrop-filter doesn't work well */
 @supports not (backdrop-filter: blur(16px)) {
   .glass-panel {
     background: var(--color-bg-primary);
   }
 }
 
-/* Monospace font utility */
+/* ===== Utility Classes ===== */
+
+/* Monospace font */
 .font-mono {
   font-family: 'JetBrains Mono', ui-monospace, monospace;
 }
 
-/* Drag handle for window */
+/* Window drag regions */
 .drag-region {
   -webkit-app-region: drag;
   app-region: drag;
@@ -261,127 +230,94 @@ body {
   box-shadow: var(--shadow-glow-red);
 }
 
-/* Line clamp utilities */
-.line-clamp-1 {
+/* Line clamp utilities (shared base + per-line variants) */
+[class^="line-clamp-"],
+[class*=" line-clamp-"] {
   overflow: hidden;
   display: -webkit-box;
   -webkit-box-orient: vertical;
+}
+
+.line-clamp-1 {
   -webkit-line-clamp: 1;
 }
 
 .line-clamp-2 {
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
 
 .line-clamp-3 {
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
 }
 
-/* ===== Light Mode Overrides (Refined) ===== */
-/* These overrides map dark-mode specific Tailwind utilities to semantic light-mode values */
+/* ===== Light Mode Overrides ===== */
+/* Maps dark-mode Tailwind utilities to semantic light-mode values */
 
+/* Header and nav chrome */
 :root.light header,
 :root.light nav {
-  background: var(--color-header-bg) !important;
+  background: var(--color-chrome-bg) !important;
   border-top-color: var(--color-border) !important;
 }
 
-/* Text color overrides - ensuring readability */
+/* Gray text: invert dark shades to light-readable equivalents */
 :root.light .text-gray-100 {
   color: #111827 !important;
 }
 
-/* Main headings: gray-100 -> gray-900 */
 :root.light .text-gray-200 {
   color: #1f2937 !important;
 }
 
-/* Body text: gray-200 -> gray-800 */
 :root.light .text-gray-300 {
   color: #374151 !important;
 }
 
-/* Secondary: gray-300 -> gray-700 */
 :root.light .text-gray-400 {
   color: #4b5563 !important;
 }
 
-/* Muted: gray-400 -> gray-600 */
 :root.light .text-gray-500 {
   color: #6b7280 !important;
 }
 
-/* Icons: gray-500 -> gray-500 (Accessible) */
 :root.light .text-gray-600 {
   color: #9ca3af !important;
 }
 
-/* Deep muted -> lighter */
-
-/* Accent color readability fixes for Light Mode */
-/* Map light pastels (300/400) to darker saturations (600/700) */
-:root.light .text-blue-100 {
-  color: #1e40af !important;
-}
-
+/* Accent text: map light pastels to darker saturations for readability */
+:root.light .text-blue-100,
 :root.light .text-blue-200 {
   color: #1e40af !important;
 }
 
-:root.light .text-blue-300 {
-  color: #2563eb !important;
-}
-
+:root.light .text-blue-300,
 :root.light .text-blue-400 {
   color: #2563eb !important;
 }
 
-:root.light .text-purple-300 {
-  color: #9333ea !important;
-}
-
+:root.light .text-purple-300,
 :root.light .text-purple-400 {
   color: #9333ea !important;
 }
 
-:root.light .text-red-300 {
-  color: #dc2626 !important;
-}
-
+:root.light .text-red-300,
 :root.light .text-red-400 {
   color: #dc2626 !important;
 }
 
-:root.light .text-yellow-300 {
-  color: #d97706 !important;
-}
-
-:root.light .text-yellow-400 {
-  color: #d97706 !important;
-}
-
+:root.light .text-yellow-300,
+:root.light .text-yellow-400,
 :root.light .text-yellow-500 {
   color: #d97706 !important;
 }
 
-:root.light .text-green-300 {
-  color: #16a34a !important;
-}
-
+:root.light .text-green-300,
 :root.light .text-green-400 {
   color: #16a34a !important;
 }
 
-/* Note: We DO NOT override .text-white globally.
-   Buttons/Badges using text-white should stay white.
-   Headings should use text-gray-100/200 to auto-flip.
-   However, hover states on icon buttons might need inversion. */
+/* Hover text: invert white hover to dark */
 :root.light .hover\:text-white:hover {
   color: #111827 !important;
 }
@@ -407,7 +343,6 @@ body {
   background-color: #f9fafb !important;
 }
 
-/* Translucent backgrounds handling */
 :root.light .bg-gray-950\/80,
 :root.light .bg-gray-950\/95 {
   background-color: rgba(249, 250, 251, 0.95) !important;
@@ -426,7 +361,11 @@ body {
   border-color: var(--color-border-subtle) !important;
 }
 
-:root.light .border-white\/10 {
+:root.light .border-white\/10,
+:root.light .border-t,
+:root.light .border-b,
+:root.light .border-r,
+:root.light .border-l {
   border-color: var(--color-border) !important;
 }
 
@@ -434,25 +373,11 @@ body {
   border-color: var(--color-border-strong) !important;
 }
 
-:root.light .border-t {
-  border-color: var(--color-border) !important;
-}
-
-:root.light .border-b {
-  border-color: var(--color-border) !important;
-}
-
-:root.light .border-r {
-  border-color: var(--color-border) !important;
-}
-
-:root.light .border-l {
-  border-color: var(--color-border) !important;
-}
-
-/* Input and card backgrounds - delicate touch */
+/* Translucent background overrides */
 :root.light .bg-white\/3,
-:root.light .bg-white\/\[0\.03\] {
+:root.light .bg-white\/\[0\.03\],
+:root.light .bg-white\/\[0\.01\],
+:root.light .bg-white\/\[0\.02\] {
   background-color: var(--color-bg-card) !important;
 }
 
@@ -460,7 +385,12 @@ body {
   background-color: rgba(0, 0, 0, 0.06) !important;
 }
 
-/* Hover states */
+:root.light .bg-white\/\[0\.04\],
+:root.light .hover\:bg-white\/\[0\.04\]:hover {
+  background-color: rgba(0, 0, 0, 0.04) !important;
+}
+
+/* Hover state overrides */
 :root.light .hover\:bg-white\/6:hover,
 :root.light .hover\:bg-white\/\[0\.06\]:hover,
 :root.light .hover\:bg-white\/5:hover {
@@ -475,14 +405,4 @@ body {
 :root.light .hover\:border-white\/10:hover,
 :root.light .hover\:border-white\/\[0\.1\]:hover {
   border-color: rgba(0, 0, 0, 0.15) !important;
-}
-
-:root.light .bg-white\/\[0\.01\],
-:root.light .bg-white\/\[0\.02\] {
-  background-color: var(--color-bg-card) !important;
-}
-
-:root.light .bg-white\/\[0\.04\],
-:root.light .hover\:bg-white\/\[0\.04\]:hover {
-  background-color: rgba(0, 0, 0, 0.04) !important;
 }

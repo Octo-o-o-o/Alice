@@ -2,30 +2,30 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
-  Plus,
-  ListTodo,
-  Play,
-  Pause,
-  Trash2,
-  GripVertical,
-  Square,
-  ChevronRight,
   CheckSquare,
-  Square as SquareEmpty,
+  ChevronRight,
   FolderOpen,
-  X,
+  GripVertical,
+  ListTodo,
+  Pause,
+  Play,
+  Plus,
+  Square,
+  Square as SquareEmpty,
   Terminal,
+  Trash2,
+  X,
 } from "lucide-react";
 import {
-  DndContext,
   closestCenter,
-  KeyboardSensor,
-  PointerSensor,
-  useSensor,
-  useSensors,
+  DndContext,
   DragEndEvent,
   DragStartEvent,
+  KeyboardSensor,
+  PointerSensor,
   useDroppable,
+  useSensor,
+  useSensors,
 } from "@dnd-kit/core";
 import {
   arrayMove,
@@ -35,7 +35,7 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Task, QueueStatusEvent, QueueStartResult, TerminalOption } from "../lib/types";
+import { QueueStartResult, QueueStatusEvent, Task, TerminalOption } from "../lib/types";
 import { useToast } from "../contexts/ToastContext";
 
 // --- Helpers ---
@@ -44,16 +44,24 @@ function projectName(path: string): string {
   return path.split(/[/\\]/).pop() ?? path;
 }
 
+const PRIORITY_COLORS: Record<string, string> = {
+  high: "bg-red-500",
+  low: "bg-blue-500",
+};
+const DEFAULT_PRIORITY_COLOR = "bg-yellow-500";
+
 function priorityColor(priority: string): string {
-  if (priority === "high") return "bg-red-500";
-  if (priority === "low") return "bg-blue-500";
-  return "bg-yellow-500";
+  return PRIORITY_COLORS[priority] ?? DEFAULT_PRIORITY_COLOR;
 }
 
+const TERMINAL_SUBTITLES: Record<string, string> = {
+  background: "Hidden execution",
+};
+const DEFAULT_TERMINAL_SUBTITLE = "Watch Claude work";
+
 function terminalSubtitle(value: string): string | null {
-  if (value === "background") return "Hidden execution";
-  if (value !== "custom") return "Watch Claude work";
-  return null;
+  if (value === "custom") return null;
+  return TERMINAL_SUBTITLES[value] ?? DEFAULT_TERMINAL_SUBTITLE;
 }
 
 async function invokeUpdateTaskStatus(id: string, status: string): Promise<void> {
@@ -99,24 +107,27 @@ function TerminalPickerModal({
         </p>
 
         <div className="space-y-2 mb-4">
-          {terminalOptions.map((option) => (
-            <button
-              key={option.value}
-              onClick={() => onSelectTerminal(option.value)}
-              className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors ${
-                selectedTerminal === option.value
-                  ? "bg-blue-600 text-white"
-                  : "bg-white/5 text-gray-300 hover:bg-white/10"
-              }`}
-            >
-              {option.label}
-              {terminalSubtitle(option.value) && (
-                <span className="block text-xs opacity-60 mt-0.5">
-                  {terminalSubtitle(option.value)}
-                </span>
-              )}
-            </button>
-          ))}
+          {terminalOptions.map((option) => {
+            const subtitle = terminalSubtitle(option.value);
+            return (
+              <button
+                key={option.value}
+                onClick={() => onSelectTerminal(option.value)}
+                className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-colors ${
+                  selectedTerminal === option.value
+                    ? "bg-blue-600 text-white"
+                    : "bg-white/5 text-gray-300 hover:bg-white/10"
+                }`}
+              >
+                {option.label}
+                {subtitle && (
+                  <span className="block text-xs opacity-60 mt-0.5">
+                    {subtitle}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </div>
 
         <label className="flex items-center gap-2 mb-4 cursor-pointer">
@@ -428,7 +439,6 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps): React.
   const [terminalOptions, setTerminalOptions] = useState<TerminalOption[]>([]);
   const [selectedTerminal, setSelectedTerminal] = useState<string>("system");
   const [rememberChoice, setRememberChoice] = useState(true);
-  const inputRef = useRef<HTMLInputElement>(null);
   const projectPickerRef = useRef<HTMLDivElement>(null);
   const toast = useToast();
 
@@ -440,6 +450,7 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps): React.
   const backlogTasks = tasks.filter((t) => t.status === "backlog");
   const queuedTasks = tasks.filter((t) => t.status === "queued" || t.status === "running");
   const completedTasks = tasks.filter((t) => t.status === "completed" || t.status === "failed");
+  const activeDragTask = activeId ? tasks.find((t) => t.id === activeId) : null;
 
   // --- Data loading ---
 
@@ -666,6 +677,17 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps): React.
     setActiveId(event.active.id as string);
   }
 
+  async function moveTaskToSection(taskId: string, targetStatus: string, label: string): Promise<void> {
+    try {
+      await invokeUpdateTaskStatus(taskId, targetStatus);
+      loadTasks();
+      toast.success(`Task moved to ${label}`);
+    } catch (error) {
+      console.error(`Failed to move task to ${label}:`, error);
+      toast.error("Failed to move task");
+    }
+  }
+
   async function handleDragEnd(event: DragEndEvent): Promise<void> {
     const { active, over } = event;
     setActiveId(null);
@@ -677,39 +699,21 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps): React.
     const activeTask = tasks.find((t) => t.id === activeTaskId);
     if (!activeTask) return;
 
-    const isBacklog = (t: Task) => t.status === "backlog";
-    const isQueued = (t: Task) => t.status === "queued" || t.status === "running";
-
-    const fromBacklog = isBacklog(activeTask);
-    const fromQueue = isQueued(activeTask);
+    const activeStatus = activeTask.status;
+    const fromBacklog = activeStatus === "backlog";
+    const fromQueue = activeStatus === "queued" || activeStatus === "running";
 
     const overTask = tasks.find((t) => t.id === overTaskId);
-    const toBacklog = overTaskId === "backlog-dropzone" || (overTask && isBacklog(overTask));
-    const toQueue = overTaskId === "queue-dropzone" || (overTask && isQueued(overTask));
+    const toBacklog = overTaskId === "backlog-dropzone" || overTask?.status === "backlog";
+    const toQueue = overTaskId === "queue-dropzone" || overTask?.status === "queued" || overTask?.status === "running";
 
-    // Cross-section: backlog -> queue
+    // Cross-section moves
     if (fromBacklog && toQueue) {
-      try {
-        await invokeUpdateTaskStatus(activeTaskId, "queued");
-        loadTasks();
-        toast.success("Task moved to queue");
-      } catch (error) {
-        console.error("Failed to move task to queue:", error);
-        toast.error("Failed to move task");
-      }
+      await moveTaskToSection(activeTaskId, "queued", "queue");
       return;
     }
-
-    // Cross-section: queue -> backlog (only if not running)
-    if (fromQueue && toBacklog && activeTask.status !== "running") {
-      try {
-        await invokeUpdateTaskStatus(activeTaskId, "backlog");
-        loadTasks();
-        toast.success("Task moved to backlog");
-      } catch (error) {
-        console.error("Failed to move task to backlog:", error);
-        toast.error("Failed to move task");
-      }
+    if (fromQueue && toBacklog && activeStatus !== "running") {
+      await moveTaskToSection(activeTaskId, "backlog", "backlog");
       return;
     }
 
@@ -726,7 +730,6 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps): React.
 
     const reordered = arrayMove(sectionTasks, oldIndex, newIndex);
 
-    // Optimistic update
     setTasks((prev) => {
       if (fromBacklog) {
         const others = prev.filter((t) => t.status !== "backlog");
@@ -743,13 +746,6 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps): React.
       toast.error("Failed to save order");
       loadTasks();
     }
-  }
-
-  // --- Project picker callbacks ---
-
-  function handleSelectProject(project: string | null): void {
-    setSelectedProject(project);
-    setShowProjectPicker(false);
   }
 
   // --- Render ---
@@ -781,15 +777,12 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps): React.
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            if (!isComposing) {
-              createTask();
-            }
+            if (!isComposing) createTask();
           }}
           className="flex flex-col gap-2"
         >
           <div className="flex items-center gap-2">
             <input
-              ref={inputRef}
               type="text"
               value={newTaskPrompt}
               onChange={(e) => setNewTaskPrompt(e.target.value)}
@@ -819,7 +812,10 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps): React.
                 <ProjectPickerDropdown
                   projects={projects}
                   selectedProject={selectedProject}
-                  onSelect={handleSelectProject}
+                  onSelect={(project) => {
+                    setSelectedProject(project);
+                    setShowProjectPicker(false);
+                  }}
                 />
               )}
             </div>
@@ -898,7 +894,7 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps): React.
                 <div className="text-center py-6 text-gray-500 text-sm">
                   <ListTodo size={24} className="mx-auto mb-2 opacity-50" />
                   <p>No tasks yet</p>
-                  {activeId && queuedTasks.find((t) => t.id === activeId) && (
+                  {activeDragTask && activeDragTask.status !== "backlog" && (
                     <p className="text-xs text-blue-400 mt-2">Drop here to move to backlog</p>
                   )}
                 </div>
@@ -964,7 +960,7 @@ export default function TasksView({ onTaskCountChange }: TasksViewProps): React.
             <DroppableSection id="queue-dropzone">
               {queuedTasks.length === 0 ? (
                 <div className="text-center py-4 text-gray-600 text-xs">
-                  {activeId && backlogTasks.find((t) => t.id === activeId) ? (
+                  {activeDragTask && activeDragTask.status === "backlog" ? (
                     <p className="text-blue-400">Drop here to add to queue</p>
                   ) : (
                     <p>Move tasks here to queue them for execution</p>

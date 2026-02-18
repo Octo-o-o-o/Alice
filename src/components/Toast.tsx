@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { CheckCircle2, XCircle, Info, AlertTriangle, X } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 
 export type ToastType = "success" | "error" | "info" | "warning";
 
@@ -15,7 +16,10 @@ interface ToastProps {
   onDismiss: (id: string) => void;
 }
 
-const toastStyles: Record<ToastType, { icon: typeof Info; iconColor: string; container: string }> = {
+const EXIT_ANIMATION_MS = 200;
+const DEFAULT_DURATION_MS = 3000;
+
+const toastStyles: Record<ToastType, { icon: LucideIcon; iconColor: string; container: string }> = {
   success: {
     icon: CheckCircle2,
     iconColor: "text-green-400",
@@ -38,32 +42,27 @@ const toastStyles: Record<ToastType, { icon: typeof Info; iconColor: string; con
   },
 };
 
-export function Toast({ toast, onDismiss }: ToastProps) {
+export function Toast({ toast, onDismiss }: ToastProps): React.ReactElement {
   const [isExiting, setIsExiting] = useState(false);
   const { icon: Icon, iconColor, container } = toastStyles[toast.type];
-  const duration = toast.duration ?? 3000;
+  const duration = toast.duration ?? DEFAULT_DURATION_MS;
 
   useEffect(() => {
-    if (duration > 0) {
-      const exitTimer = setTimeout(() => {
-        setIsExiting(true);
-      }, duration - 200);
+    if (duration <= 0) return;
 
-      const dismissTimer = setTimeout(() => {
-        onDismiss(toast.id);
-      }, duration);
+    const exitTimer = setTimeout(() => setIsExiting(true), duration - EXIT_ANIMATION_MS);
+    const dismissTimer = setTimeout(() => onDismiss(toast.id), duration);
 
-      return () => {
-        clearTimeout(exitTimer);
-        clearTimeout(dismissTimer);
-      };
-    }
+    return () => {
+      clearTimeout(exitTimer);
+      clearTimeout(dismissTimer);
+    };
   }, [toast.id, duration, onDismiss]);
 
-  const handleDismiss = () => {
+  function handleDismiss(): void {
     setIsExiting(true);
-    setTimeout(() => onDismiss(toast.id), 200);
-  };
+    setTimeout(() => onDismiss(toast.id), EXIT_ANIMATION_MS);
+  }
 
   return (
     <div
@@ -88,7 +87,7 @@ interface ToastContainerProps {
   onDismiss: (id: string) => void;
 }
 
-export function ToastContainer({ toasts, onDismiss }: ToastContainerProps) {
+export function ToastContainer({ toasts, onDismiss }: ToastContainerProps): React.ReactElement {
   return (
     <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-xs">
       {toasts.map((toast) => (

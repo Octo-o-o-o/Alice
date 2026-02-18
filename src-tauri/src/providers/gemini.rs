@@ -3,10 +3,13 @@
 // Partial implementation: supports usage tracking (OAuth quota API) and task execution.
 // Session file parsing is not implemented (format unknown).
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
 use super::{Provider, ProviderError, ProviderId, ProviderUsage};
 use crate::session::Session;
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 
 /// Gemini provider
 pub struct GeminiProvider {
@@ -24,13 +27,6 @@ impl GeminiProvider {
     #[allow(dead_code)]
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self { data_dir }
-    }
-
-    #[allow(dead_code)]
-    fn read_oauth_credentials(&self) -> Option<GeminiOAuthCredentials> {
-        let creds_path = self.data_dir.join("oauth_creds.json");
-        let content = std::fs::read_to_string(&creds_path).ok()?;
-        serde_json::from_str(&content).ok()
     }
 }
 
@@ -60,9 +56,8 @@ impl Provider for GeminiProvider {
     }
 
     fn get_usage(&self) -> Result<Option<ProviderUsage>, ProviderError> {
-        // OAuth usage requires async context - use get_gemini_usage() instead
         Err(ProviderError::UsageFetch(
-            "Use get_gemini_usage() async function for OAuth providers".to_string()
+            "Use get_gemini_usage() async function for OAuth providers".to_string(),
         ))
     }
 
@@ -71,39 +66,15 @@ impl Provider for GeminiProvider {
     }
 }
 
-/// Public async function to get Gemini usage (avoids nested runtime issues)
-pub async fn get_gemini_usage() -> Result<ProviderUsage, String> {
-    let data_dir = crate::platform::get_gemini_dir();
-    let creds_path = data_dir.join("oauth_creds.json");
+// -- OAuth credentials --
 
-    if !creds_path.exists() {
-        return Ok(ProviderUsage::error(ProviderId::Gemini, "No OAuth credentials found"));
-    }
-
-    let content = std::fs::read_to_string(&creds_path)
-        .map_err(|e| format!("Failed to read credentials: {}", e))?;
-
-    let creds: GeminiOAuthCredentials = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse credentials: {}", e))?;
-
-    let access_token = creds.access_token
-        .ok_or_else(|| "No access token in credentials".to_string())?;
-
-    match fetch_gemini_oauth_usage(&access_token).await {
-        Ok(usage) => Ok(usage),
-        Err(e) => Ok(ProviderUsage::error(ProviderId::Gemini, &e)),
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GeminiOAuthCredentials {
     access_token: Option<String>,
-    refresh_token: Option<String>,
-    #[serde(rename = "expiry_date")]
-    expiry_date: Option<f64>,
 }
 
-/// Google Cloud Code Quota API response structures
+// -- Quota API response structures --
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct GeminiQuotaBucket {
     #[serde(rename = "remainingFraction")]
@@ -116,13 +87,46 @@ struct GeminiQuotaBucket {
     token_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GeminiQuotaResponse {
     buckets: Option<Vec<GeminiQuotaBucket>>,
 }
 
-/// Fetch Gemini usage from Google Cloud Code Quota API
-/// Response format: https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota
+// -- Public async usage entry point --
+
+/// Public async function to get Gemini usage (avoids nested runtime issues).
+pub async fn get_gemini_usage() -> Result<ProviderUsage, String> {
+    let data_dir = crate::platform::get_gemini_dir();
+    let creds_path = data_dir.join("oauth_creds.json");
+
+    if !creds_path.exists() {
+        return Ok(ProviderUsage::error(
+            ProviderId::Gemini,
+            "No OAuth credentials found",
+        ));
+    }
+
+    let content = std::fs::read_to_string(&creds_path)
+        .map_err(|e| format!("Failed to read credentials: {}", e))?;
+
+    let creds: GeminiOAuthCredentials = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse credentials: {}", e))?;
+
+    let access_token = creds
+        .access_token
+        .ok_or_else(|| "No access token in credentials".to_string())?;
+
+    fetch_gemini_oauth_usage(&access_token)
+        .await
+        .or_else(|e| Ok(ProviderUsage::error(ProviderId::Gemini, &e)))
+}
+
+// -- Quota fetching and parsing --
+
+/// Fetch Gemini usage from Google Cloud Code Quota API.
+///
+/// Response format from `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`:
+/// ```json
 /// {
 ///   "buckets": [
 ///     {
@@ -133,6 +137,7 @@ struct GeminiQuotaResponse {
 ///     }
 ///   ]
 /// }
+/// ```
 #[allow(dead_code)]
 async fn fetch_gemini_oauth_usage(access_token: &str) -> Result<ProviderUsage, String> {
     let client = reqwest::Client::builder()
@@ -172,54 +177,81 @@ async fn fetch_gemini_oauth_usage(access_token: &str) -> Result<ProviderUsage, S
         return Err("No quota buckets in response".to_string());
     }
 
-    // Group by model, keeping the lowest remaining fraction (usually input tokens)
-    let mut model_quotas: std::collections::HashMap<String, (f64, Option<String>)> = std::collections::HashMap::new();
+    let model_quotas = aggregate_model_quotas(&buckets);
+    build_usage_from_quotas(&model_quotas)
+}
+
+/// A model's lowest remaining fraction and corresponding reset time.
+struct ModelQuota {
+    remaining_fraction: f64,
+    reset_time: Option<String>,
+}
+
+/// Group quota buckets by model, keeping the lowest remaining fraction per model.
+fn aggregate_model_quotas(buckets: &[GeminiQuotaBucket]) -> HashMap<String, ModelQuota> {
+    let mut quotas: HashMap<String, ModelQuota> = HashMap::new();
 
     for bucket in buckets {
-        if let (Some(model_id), Some(fraction)) = (bucket.model_id, bucket.remaining_fraction) {
-            model_quotas
-                .entry(model_id.clone())
-                .and_modify(|(existing_fraction, existing_reset)| {
-                    if fraction < *existing_fraction {
-                        *existing_fraction = fraction;
-                        *existing_reset = bucket.reset_time.clone();
-                    }
-                })
-                .or_insert((fraction, bucket.reset_time.clone()));
-        }
+        let (Some(model_id), Some(fraction)) =
+            (bucket.model_id.as_ref(), bucket.remaining_fraction)
+        else {
+            continue;
+        };
+
+        quotas
+            .entry(model_id.clone())
+            .and_modify(|existing| {
+                if fraction < existing.remaining_fraction {
+                    existing.remaining_fraction = fraction;
+                    existing.reset_time = bucket.reset_time.clone();
+                }
+            })
+            .or_insert(ModelQuota {
+                remaining_fraction: fraction,
+                reset_time: bucket.reset_time.clone(),
+            });
     }
 
-    // Separate Pro and Flash models
-    let mut pro_quotas: Vec<(f64, Option<String>)> = Vec::new();
-    let mut flash_quotas: Vec<(f64, Option<String>)> = Vec::new();
+    quotas
+}
 
-    for (model_id, (fraction, reset)) in model_quotas {
-        let model_lower = model_id.to_lowercase();
-        if model_lower.contains("pro") {
-            pro_quotas.push((fraction, reset));
-        } else if model_lower.contains("flash") {
-            flash_quotas.push((fraction, reset));
-        }
-    }
+/// Find the minimum remaining fraction among models whose names contain `keyword`.
+fn min_quota_for_tier<'a>(
+    quotas: &'a HashMap<String, ModelQuota>,
+    keyword: &str,
+) -> Option<&'a ModelQuota> {
+    quotas
+        .iter()
+        .filter(|(model_id, _)| model_id.to_lowercase().contains(keyword))
+        .map(|(_, quota)| quota)
+        .min_by(|a, b| {
+            a.remaining_fraction
+                .partial_cmp(&b.remaining_fraction)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
 
-    // Find minimum quota for each tier
-    let pro_min = pro_quotas.iter().min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    let flash_min = flash_quotas.iter().min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+/// Convert a remaining fraction (0.0..1.0) to a used percentage (0..100).
+fn remaining_to_used_percent(remaining_fraction: f64) -> f64 {
+    (1.0 - remaining_fraction) * 100.0
+}
 
-    // Calculate used percentage from remaining fraction
-    // Pro = primary window (24h), Flash = secondary window (24h)
-    let session_percent = pro_min.map(|(frac, _)| (1.0 - frac) * 100.0).unwrap_or(0.0);
-    let session_reset_at = pro_min.and_then(|(_, reset)| reset.clone());
-
-    let weekly_percent = flash_min.map(|(frac, _)| (1.0 - frac) * 100.0);
-    let weekly_reset_at = flash_min.and_then(|(_, reset)| reset.clone());
+/// Build the final ProviderUsage from aggregated per-model quotas.
+/// Pro models map to the session (primary) window; Flash models to the weekly (secondary) window.
+fn build_usage_from_quotas(
+    model_quotas: &HashMap<String, ModelQuota>,
+) -> Result<ProviderUsage, String> {
+    let pro_min = min_quota_for_tier(model_quotas, "pro");
+    let flash_min = min_quota_for_tier(model_quotas, "flash");
 
     Ok(ProviderUsage {
         id: ProviderId::Gemini,
-        session_percent,
-        session_reset_at,
-        weekly_percent,
-        weekly_reset_at,
+        session_percent: pro_min
+            .map(|q| remaining_to_used_percent(q.remaining_fraction))
+            .unwrap_or(0.0),
+        session_reset_at: pro_min.and_then(|q| q.reset_time.clone()),
+        weekly_percent: flash_min.map(|q| remaining_to_used_percent(q.remaining_fraction)),
+        weekly_reset_at: flash_min.and_then(|q| q.reset_time.clone()),
         last_updated: chrono::Utc::now().timestamp_millis(),
         error: None,
     })

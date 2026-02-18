@@ -362,6 +362,10 @@ impl WhereBuilder {
         self.params.push(Box::new(param));
     }
 
+    fn is_empty(&self) -> bool {
+        self.conditions.is_empty()
+    }
+
     fn to_where_clause(&self) -> String {
         if self.conditions.is_empty() {
             String::new()
@@ -382,28 +386,19 @@ impl WhereBuilder {
 /// The set of columns searched against for text queries.
 const SEARCH_FIELDS: [&str; 3] = ["s.first_prompt", "s.label", "s.project_name"];
 
-/// Build a LIKE condition that matches `pattern` against all search fields with OR.
-fn like_any_field(pattern: &str, params: &mut Vec<String>) -> String {
+/// Build a LIKE/NOT LIKE condition across all search fields.
+/// `negate = false` produces `(field1 LIKE ? OR field2 LIKE ? ...)`.
+/// `negate = true`  produces `(field1 NOT LIKE ? AND field2 NOT LIKE ? ...)`.
+fn like_across_fields(pattern: &str, negate: bool, params: &mut Vec<String>) -> String {
+    let (op, join) = if negate { ("NOT LIKE", " AND ") } else { ("LIKE", " OR ") };
     let conditions: Vec<String> = SEARCH_FIELDS
         .iter()
         .map(|field| {
             params.push(pattern.to_string());
-            format!("{} LIKE ?", field)
+            format!("{} {} ?", field, op)
         })
         .collect();
-    format!("({})", conditions.join(" OR "))
-}
-
-/// Build a NOT LIKE condition that excludes `pattern` from all search fields.
-fn not_like_any_field(pattern: &str, params: &mut Vec<String>) -> String {
-    let conditions: Vec<String> = SEARCH_FIELDS
-        .iter()
-        .map(|field| {
-            params.push(pattern.to_string());
-            format!("{} NOT LIKE ?", field)
-        })
-        .collect();
-    format!("({})", conditions.join(" AND "))
+    format!("({})", conditions.join(join))
 }
 
 /// Tokenize search query, preserving quoted strings as single tokens.
@@ -413,30 +408,27 @@ fn tokenize_search_query(query: &str) -> Vec<String> {
     let mut current = String::new();
     let mut in_quotes = false;
 
+    /// Flush `current` into `tokens` if non-empty.
+    fn flush(current: &mut String, tokens: &mut Vec<String>) {
+        if !current.is_empty() {
+            tokens.push(std::mem::take(current));
+        }
+    }
+
     for ch in query.chars() {
         match ch {
+            '"' if in_quotes => {
+                current.push('"');
+                flush(&mut current, &mut tokens);
+                in_quotes = false;
+            }
             '"' => {
-                if in_quotes {
-                    current.push('"');
-                    if !current.is_empty() {
-                        tokens.push(current.clone());
-                        current.clear();
-                    }
-                    in_quotes = false;
-                } else {
-                    if !current.is_empty() {
-                        tokens.push(current.clone());
-                        current.clear();
-                    }
-                    current.push('"');
-                    in_quotes = true;
-                }
+                flush(&mut current, &mut tokens);
+                current.push('"');
+                in_quotes = true;
             }
             ' ' | '\t' | '\n' if !in_quotes => {
-                if !current.is_empty() {
-                    tokens.push(current.clone());
-                    current.clear();
-                }
+                flush(&mut current, &mut tokens);
             }
             _ => {
                 current.push(ch);
@@ -477,13 +469,13 @@ fn parse_search_query(query: &str) -> (String, Vec<String>) {
             let literal = &token[1..token.len()-1];
             if !literal.is_empty() {
                 let pattern = format!("%{}%", literal);
-                and_conditions.push(like_any_field(&pattern, &mut params));
+                and_conditions.push(like_across_fields(&pattern, false, &mut params));
             }
         } else if let Some(term) = token.strip_prefix('-') {
             // NOT condition
             if !term.is_empty() {
                 let pattern = format!("%{}%", term);
-                and_conditions.push(not_like_any_field(&pattern, &mut params));
+                and_conditions.push(like_across_fields(&pattern, true, &mut params));
             }
         } else if token.contains('|') {
             // OR condition
@@ -493,7 +485,7 @@ fn parse_search_query(query: &str) -> (String, Vec<String>) {
                     .iter()
                     .map(|term| {
                         let pattern = format!("%{}%", term);
-                        like_any_field(&pattern, &mut params)
+                        like_across_fields(&pattern, false, &mut params)
                     })
                     .collect();
                 and_conditions.push(format!("({})", or_conditions.join(" OR ")));
@@ -501,7 +493,7 @@ fn parse_search_query(query: &str) -> (String, Vec<String>) {
         } else {
             // Regular AND term
             let pattern = format!("%{}%", token);
-            and_conditions.push(like_any_field(&pattern, &mut params));
+            and_conditions.push(like_across_fields(&pattern, false, &mut params));
         }
     }
 
@@ -517,16 +509,19 @@ fn parse_search_query(query: &str) -> (String, Vec<String>) {
 // Row mappers
 // ============================================================================
 
+/// Parse a provider column value, defaulting to Claude when absent or unrecognized.
+fn parse_provider(row: &rusqlite::Row, index: usize) -> crate::providers::ProviderId {
+    row.get::<_, String>(index)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(crate::providers::ProviderId::Claude)
+}
+
 /// Map a database row to a Session.
 fn map_session_row(row: &rusqlite::Row) -> Result<Session, rusqlite::Error> {
     let status_str: String = row.get(17)?;
     let tags_str: Option<String> = row.get(5)?;
     let last_active_at: i64 = row.get(7)?;
-
-    let provider_str: Option<String> = row.get(18).ok();
-    let provider = provider_str
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(crate::providers::ProviderId::Claude);
 
     Ok(Session {
         session_id: row.get(0)?,
@@ -549,17 +544,12 @@ fn map_session_row(row: &rusqlite::Row) -> Result<Session, rusqlite::Error> {
         cache_write_tokens: row.get::<_, Option<i64>>(15)?.unwrap_or(0),
         model: row.get(16)?,
         status: session_status_from_str(&status_str),
-        provider,
+        provider: parse_provider(row, 18),
     })
 }
 
 fn map_task_row(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
     let status_str: String = row.get(3)?;
-
-    let provider_str: Option<String> = row.get(22).ok();
-    let provider = provider_str
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(crate::providers::ProviderId::Claude);
 
     Ok(Task {
         id: row.get(0)?,
@@ -584,7 +574,7 @@ fn map_task_row(row: &rusqlite::Row) -> Result<Task, rusqlite::Error> {
         created_at: row.get(19)?,
         started_at: row.get(20)?,
         completed_at: row.get(21)?,
-        provider,
+        provider: parse_provider(row, 22),
     })
 }
 
@@ -614,20 +604,22 @@ fn is_file_recently_modified(path: &std::path::Path, seconds: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// Parse a date string (YYYY-MM-DD) into a start-of-day millisecond timestamp.
-fn date_to_start_ms(date_str: &str) -> Option<i64> {
+/// Parse a date string (YYYY-MM-DD) into a millisecond timestamp at the given time.
+fn date_to_ms(date_str: &str, h: u32, m: u32, s: u32) -> Option<i64> {
     chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
         .ok()
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .and_then(|d| d.and_hms_opt(h, m, s))
         .map(|dt| dt.and_utc().timestamp_millis())
+}
+
+/// Parse a date string (YYYY-MM-DD) into a start-of-day millisecond timestamp.
+fn date_to_start_ms(date_str: &str) -> Option<i64> {
+    date_to_ms(date_str, 0, 0, 0)
 }
 
 /// Parse a date string (YYYY-MM-DD) into an end-of-day millisecond timestamp.
 fn date_to_end_ms(date_str: &str) -> Option<i64> {
-    chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(23, 59, 59))
-        .map(|dt| dt.and_utc().timestamp_millis())
+    date_to_ms(date_str, 23, 59, 59)
 }
 
 /// Get the next sort_order value for a table.
@@ -662,30 +654,23 @@ pub fn get_sessions(
 ) -> Result<Vec<Session>, DatabaseError> {
     let conn = get_db()?;
 
-    let (sql, sessions) = if let Some(proj) = project {
-        let sql = format!(
-            "SELECT {} FROM sessions WHERE project_path = ?1 ORDER BY last_human_message_at DESC LIMIT ?2",
-            SESSION_COLUMNS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![proj, limit], map_session_row)?
-            .filter_map(|r| r.ok())
-            .collect();
-        (sql, rows)
-    } else {
-        let sql = format!(
-            "SELECT {} FROM sessions ORDER BY last_human_message_at DESC LIMIT ?1",
-            SESSION_COLUMNS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![limit], map_session_row)?
-            .filter_map(|r| r.ok())
-            .collect();
-        (sql, rows)
-    };
-    drop(sql);
+    let mut wb = WhereBuilder::new();
+    if let Some(proj) = project {
+        wb.push("project_path = ?", proj.to_string());
+    }
+    wb.push_param(limit);
+
+    let sql = format!(
+        "SELECT {} FROM sessions {} ORDER BY last_human_message_at DESC LIMIT ?",
+        SESSION_COLUMNS,
+        wb.to_where_clause()
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let sessions = stmt
+        .query_map(rusqlite::params_from_iter(wb.param_refs()), map_session_row)?
+        .filter_map(|r| r.ok())
+        .collect();
 
     Ok(sessions)
 }
@@ -1203,35 +1188,26 @@ pub fn get_tasks(
 ) -> Result<Vec<Task>, DatabaseError> {
     let conn = get_db()?;
 
-    let sql = match (status.is_some(), project.is_some()) {
-        (true, true) => {
-            "SELECT * FROM tasks WHERE status = ?1 AND project_path = ?2 ORDER BY sort_order ASC"
-        }
-        (true, false) => "SELECT * FROM tasks WHERE status = ?1 ORDER BY sort_order ASC",
-        (false, true) => "SELECT * FROM tasks WHERE project_path = ?1 ORDER BY sort_order ASC",
-        (false, false) => "SELECT * FROM tasks ORDER BY status, sort_order ASC",
+    let mut wb = WhereBuilder::new();
+    if let Some(s) = status {
+        wb.push("status = ?", s.to_string());
+    }
+    if let Some(p) = project {
+        wb.push("project_path = ?", p.to_string());
+    }
+
+    let order_by = if wb.is_empty() {
+        "ORDER BY status, sort_order ASC"
+    } else {
+        "ORDER BY sort_order ASC"
     };
 
-    let mut stmt = conn.prepare(sql)?;
-
-    let tasks: Vec<Task> = match (status, project) {
-        (Some(s), Some(p)) => stmt
-            .query_map(params![s.to_string(), p], map_task_row)?
-            .filter_map(|r| r.ok())
-            .collect(),
-        (Some(s), None) => stmt
-            .query_map(params![s.to_string()], map_task_row)?
-            .filter_map(|r| r.ok())
-            .collect(),
-        (None, Some(p)) => stmt
-            .query_map(params![p], map_task_row)?
-            .filter_map(|r| r.ok())
-            .collect(),
-        (None, None) => stmt
-            .query_map([], map_task_row)?
-            .filter_map(|r| r.ok())
-            .collect(),
-    };
+    let sql = format!("SELECT * FROM tasks {} {}", wb.to_where_clause(), order_by);
+    let mut stmt = conn.prepare(&sql)?;
+    let tasks = stmt
+        .query_map(rusqlite::params_from_iter(wb.param_refs()), map_task_row)?
+        .filter_map(|r| r.ok())
+        .collect();
 
     Ok(tasks)
 }
@@ -1347,18 +1323,19 @@ pub fn delete_task(_app: &AppHandle, id: &str) -> Result<(), DatabaseError> {
     Ok(())
 }
 
+/// Update sort_order for rows in `table` based on the order of `ids`.
+fn reorder_items(conn: &Connection, table: &str, ids: &[String]) -> Result<(), DatabaseError> {
+    let sql = format!("UPDATE {} SET sort_order = ?1 WHERE id = ?2", table);
+    for (index, id) in ids.iter().enumerate() {
+        conn.execute(&sql, params![index as i32, id])?;
+    }
+    Ok(())
+}
+
 /// Reorder tasks by updating sort_order based on the order of task_ids
 pub fn reorder_tasks(_app: &AppHandle, task_ids: Vec<String>) -> Result<(), DatabaseError> {
     let conn = get_db()?;
-
-    for (index, task_id) in task_ids.iter().enumerate() {
-        conn.execute(
-            "UPDATE tasks SET sort_order = ?1 WHERE id = ?2",
-            params![index as i32, task_id],
-        )?;
-    }
-
-    Ok(())
+    reorder_items(&conn, "tasks", &task_ids)
 }
 
 // ============================================================================
@@ -1495,15 +1472,7 @@ pub fn delete_favorite(_app: &AppHandle, id: &str) -> Result<(), DatabaseError> 
 /// Reorder favorites
 pub fn reorder_favorites(_app: &AppHandle, favorite_ids: Vec<String>) -> Result<(), DatabaseError> {
     let conn = get_db()?;
-
-    for (index, favorite_id) in favorite_ids.iter().enumerate() {
-        conn.execute(
-            "UPDATE favorites SET sort_order = ?1 WHERE id = ?2",
-            params![index as i32, favorite_id],
-        )?;
-    }
-
-    Ok(())
+    reorder_items(&conn, "favorites", &favorite_ids)
 }
 
 /// Get all images from a session by parsing its JSONL file
@@ -1530,69 +1499,45 @@ pub fn get_session_images(
         return Ok(vec![]);
     }
 
-    // Parse JSONL and extract images
+    // Parse JSONL and extract images from both message.content and line.content (older format)
     let lines = crate::session::parse_session_file(&session_file)?;
-    let mut images = Vec::new();
-
-    for line in lines {
-        // Extract images from message content
-        if let Some(ref msg) = line.message {
-            if let Some(ref content) = msg.content {
-                let extracted = extract_images_from_json(content);
-                images.extend(extracted);
-            }
-        }
-        // Also check line.content for older formats
-        if let Some(ref content) = line.content {
-            let extracted = extract_images_from_json(content);
-            images.extend(extracted);
-        }
-    }
+    let images = lines
+        .iter()
+        .flat_map(|line| {
+            let msg_content = line.message.as_ref().and_then(|m| m.content.as_ref());
+            let line_content = line.content.as_ref();
+            msg_content.into_iter().chain(line_content).flat_map(extract_images_from_json)
+        })
+        .collect();
 
     Ok(images)
 }
 
 /// Helper function to extract images from JSON content
 fn extract_images_from_json(content: &serde_json::Value) -> Vec<crate::session::ImageContent> {
-    let mut images = Vec::new();
-
-    if let serde_json::Value::Array(arr) = content {
-        for item in arr {
-            if let Some(obj) = item.as_object() {
-                if obj.get("type").and_then(|t| t.as_str()) == Some("image") {
-                    if let Some(source) = obj.get("source").and_then(|s| s.as_object()) {
-                        let source_type = source
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("base64")
-                            .to_string();
-
-                        let media_type = source
-                            .get("media_type")
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string());
-
-                        let data = source
-                            .get("data")
-                            .and_then(|d| d.as_str())
-                            .map(|s| s.to_string());
-
-                        let path = source
-                            .get("path")
-                            .and_then(|p| p.as_str())
-                            .map(|s| s.to_string());
-
-                        images.push(crate::session::ImageContent {
-                            source_type,
-                            media_type,
-                            data,
-                            path,
-                        });
-                    }
-                }
-            }
-        }
+    /// Get a string field from a JSON object, returning an owned String.
+    fn str_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+        obj.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
     }
 
-    images
+    let arr = match content {
+        serde_json::Value::Array(arr) => arr,
+        _ => return Vec::new(),
+    };
+
+    arr.iter()
+        .filter_map(|item| {
+            let obj = item.as_object()?;
+            if obj.get("type").and_then(|t| t.as_str()) != Some("image") {
+                return None;
+            }
+            let source = obj.get("source").and_then(|s| s.as_object())?;
+            Some(crate::session::ImageContent {
+                source_type: str_field(source, "type").unwrap_or_else(|| "base64".to_string()),
+                media_type: str_field(source, "media_type"),
+                data: str_field(source, "data"),
+                path: str_field(source, "path"),
+            })
+        })
+        .collect()
 }
