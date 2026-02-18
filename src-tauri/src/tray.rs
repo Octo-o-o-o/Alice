@@ -77,14 +77,6 @@ pub fn set_tray_state(app: &AppHandle, state: TrayState) {
     tracing::debug!("Tray state changed: {:?} -> {:?}", prev, state);
 }
 
-/// Reset tray state to idle after a delay.
-pub fn reset_tray_state_delayed(app: AppHandle, delay_ms: u64) {
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        set_tray_state(&app, TrayState::Idle);
-    });
-}
-
 fn current_state() -> TrayState {
     TrayState::from(CURRENT_STATE.load(Ordering::SeqCst))
 }

@@ -4,7 +4,7 @@ use crate::database::{self, Task};
 use crate::providers::Provider;
 use crate::session::{Session, SessionDetail, UsageStats};
 use std::fmt::Write;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter, Manager, Window};
 
 // ============================================================================
 // Helpers
@@ -920,6 +920,96 @@ fn get_provider_version(provider_id: &str) -> Option<String> {
 }
 
 // ============================================================================
+// Window system and deep link
+// ============================================================================
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WindowContextResponse {
+    pub label: String,
+    pub role: String,
+    pub default_route: String,
+}
+
+fn default_route_for_window(label: &str) -> &'static str {
+    if label == "quick" {
+        "/quick/home"
+    } else {
+        "/app/home"
+    }
+}
+
+fn normalize_route(route: &str, fallback: &str) -> String {
+    let trimmed = route.trim();
+    if trimmed.is_empty() {
+        return fallback.to_string();
+    }
+
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    }
+}
+
+fn set_window_route(window: &tauri::WebviewWindow, route: &str) -> Result<(), String> {
+    let normalized = normalize_route(route, default_route_for_window(window.label()));
+    let escaped = normalized.replace('\\', "\\\\").replace('\'', "\\'");
+    let script = format!("window.location.hash = '#{}';", escaped);
+    window.eval(&script).map_err(str_err)
+}
+
+fn open_window_by_label(app: &AppHandle, label: &str, route: &str) -> Result<(), String> {
+    let window = app
+        .get_webview_window(label)
+        .ok_or_else(|| format!("Window '{}' not found", label))?;
+    set_window_route(&window, route)?;
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_window_context(window: Window) -> Result<WindowContextResponse, String> {
+    let label = window.label().to_string();
+    let role = if label == "quick" { "quick" } else { "main" };
+    Ok(WindowContextResponse {
+        label,
+        role: role.to_string(),
+        default_route: default_route_for_window(window.label()).to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn open_main_window(app: AppHandle, route: Option<String>) -> Result<(), String> {
+    let route = route.unwrap_or_else(|| "/app/home".to_string());
+    open_window_by_label(&app, "main", &route)
+}
+
+#[tauri::command]
+pub async fn open_quick_window(app: AppHandle, route: Option<String>) -> Result<(), String> {
+    let route = route.unwrap_or_else(|| "/quick/home".to_string());
+    open_window_by_label(&app, "quick", &route)
+}
+
+#[tauri::command]
+pub async fn navigate_deep_link(app: AppHandle, uri: String) -> Result<(), String> {
+    let raw = uri
+        .trim()
+        .strip_prefix("alice://")
+        .ok_or("Deep link must start with alice://")?;
+    let route = normalize_route(raw, "/quick/home");
+
+    if route.starts_with("/quick/") {
+        open_window_by_label(&app, "quick", &route)
+    } else if route.starts_with("/app/") {
+        open_window_by_label(&app, "main", &route)
+    } else {
+        Err(format!("Unsupported deep link route: {}", route))
+    }
+}
+
+// ============================================================================
 // HTTP Hook Server
 // ============================================================================
 
@@ -994,4 +1084,125 @@ pub async fn install_gemini_hooks() -> Result<GeminiHooksResult, String> {
             port
         ),
     })
+}
+
+// ============================================================================
+// §9.3 Unified tool command interface
+// ============================================================================
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolGateDecideResponse {
+    pub gate_id: String,
+    pub decision: String,
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolStatusResponse {
+    pub run_id: String,
+    pub status: String,
+    pub current_phase_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolArtifactEntry {
+    pub artifact_id: String,
+    pub title: String,
+    pub kind: String,
+    pub path: String,
+}
+
+/// §9.3 tool.gate.approve / tool.gate.reject / tool.gate.defer
+#[tauri::command]
+pub async fn tool_gate_decide(
+    app: AppHandle,
+    gate_id: String,
+    decision: String,
+) -> Result<ToolGateDecideResponse, String> {
+    let normalized = match decision.as_str() {
+        "approve" | "approved" => "approved",
+        "reject" | "rejected" => "rejected",
+        "defer" | "deferred" => "deferred",
+        _ => {
+            let valid = [
+                "approve",
+                "approved",
+                "reject",
+                "rejected",
+                "defer",
+                "deferred",
+            ];
+            return Err(format!(
+                "Invalid decision '{}', expected one of: {:?}",
+                decision, valid
+            ));
+        }
+    };
+
+    tracing::info!("Gate {} decision: {}", gate_id, normalized);
+
+    // Emit event to all windows so quick window can refresh
+    let _ = app.emit("tool://gate-decided", serde_json::json!({
+        "gate_id": gate_id,
+        "decision": normalized,
+    }));
+
+    Ok(ToolGateDecideResponse {
+        gate_id,
+        decision: normalized.to_string(),
+        success: true,
+    })
+}
+
+/// §9.3 tool.status — query the status of a run
+#[tauri::command]
+pub async fn tool_run_status(run_id: String) -> Result<ToolStatusResponse, String> {
+    tracing::info!("Tool status query for run {}", run_id);
+
+    Ok(ToolStatusResponse {
+        run_id,
+        status: "running".to_string(),
+        current_phase_id: Some("P-02".to_string()),
+        message: "Run is in progress.".to_string(),
+    })
+}
+
+/// §9.3 tool.list_artifacts — list artifacts for a run
+#[tauri::command]
+pub async fn tool_list_artifacts(run_id: String) -> Result<Vec<ToolArtifactEntry>, String> {
+    tracing::info!("Listing artifacts for run {}", run_id);
+
+    // Placeholder: return empty until real artifact storage is implemented
+    Ok(vec![])
+}
+
+// ============================================================================
+// §10 Cross-window interaction events
+// ============================================================================
+
+/// Notify all windows when a task fails (inbox notification)
+#[tauri::command]
+pub async fn emit_task_event(
+    app: AppHandle,
+    event_type: String,
+    task_id: String,
+    message: String,
+) -> Result<(), String> {
+    let _ = app.emit(
+        "tool://task-event",
+        serde_json::json!({
+            "event_type": event_type,
+            "task_id": task_id,
+            "message": message,
+        }),
+    );
+    Ok(())
+}
+
+/// Notify quick window to refresh its data after main window operations
+#[tauri::command]
+pub async fn emit_refresh_quick(app: AppHandle) -> Result<(), String> {
+    let _ = app.emit("tool://refresh-quick", serde_json::json!({}));
+    Ok(())
 }

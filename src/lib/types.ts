@@ -404,3 +404,88 @@ export interface ProviderStatus {
   enabled: boolean;
   custom_data_dir: string | null;
 }
+
+// ---------------------------------------------------------------------------
+// Window system and tool platform entities
+// ---------------------------------------------------------------------------
+
+export type WindowRole = "quick" | "main";
+
+export interface WindowContext {
+  label: string;
+  role: WindowRole;
+  default_route: string;
+}
+
+export type RunStatus = "queued" | "running" | "blocked" | "completed" | "failed";
+
+export type GateDecision = "pending" | "approved" | "rejected" | "deferred";
+
+export type RiskLevel = "low" | "medium" | "high";
+
+export interface ToolPhase {
+  phase_id: string;
+  name: string;
+  status: RunStatus;
+  dod: string[];
+  verification_summary: string;
+  rollback_notes: string | null;
+}
+
+export interface ToolGate {
+  gate_id: string;
+  run_id: string;
+  phase_id: string;
+  title: string;
+  reason: string;
+  decision: GateDecision;
+  created_at: number;
+}
+
+export interface ToolArtifact {
+  artifact_id: string;
+  run_id: string;
+  phase_id: string | null;
+  kind: "md" | "json" | "log";
+  title: string;
+  path: string;
+  created_at: number;
+}
+
+export interface ToolRun {
+  run_id: string;
+  tool_id: string;
+  project_name: string;
+  provider: ProviderId;
+  status: RunStatus;
+  current_phase_id: string | null;
+  started_at: number;
+  updated_at: number;
+  score_before: number | null;
+  score_after: number | null;
+  residual_risk: string | null;
+}
+
+export interface ToolManifest {
+  tool_id: string;
+  name: string;
+  category: string;
+  risk_level: RiskLevel;
+  entry_routes: {
+    quick: string[];
+    main: string[];
+  };
+  state_machine: {
+    steps: string[];
+    gates: string[];
+    retry_policy: string;
+  };
+  input_schema: string;
+  output_schema: string;
+  artifact_spec: string[];
+  quick_actions: string[];
+  permissions: {
+    allow_auto_modify_code: boolean;
+    allow_auto_commit: boolean;
+  };
+}

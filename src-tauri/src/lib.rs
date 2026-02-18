@@ -60,8 +60,8 @@ fn calculate_window_position(
     Some((x.max(gap), y))
 }
 
-/// Toggle window visibility: hide if visible, position and show if hidden.
-fn toggle_window(window: &WebviewWindow, tray_position: tauri::PhysicalPosition<f64>) {
+/// Toggle quick window visibility: hide if visible, position and show if hidden.
+fn toggle_quick_window(window: &WebviewWindow, tray_position: tauri::PhysicalPosition<f64>) {
     if window.is_visible().unwrap_or(false) {
         let _ = window.hide();
         return;
@@ -129,8 +129,8 @@ fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } = event
             {
-                if let Some(window) = handle.get_webview_window("main") {
-                    toggle_window(&window, position);
+                if let Some(window) = handle.get_webview_window("quick") {
+                    toggle_quick_window(&window, position);
                 }
             }
         })
@@ -139,9 +139,13 @@ fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Hide the main window when it loses focus.
+/// Hide quick window on blur when configured.
 fn setup_hide_on_blur(app: &tauri::App) {
-    if let Some(window) = app.get_webview_window("main") {
+    if !config::load_config().auto_hide_on_blur {
+        return;
+    }
+
+    if let Some(window) = app.get_webview_window("quick") {
         let window_handle = window.clone();
         window.on_window_event(move |event| {
             if let WindowEvent::Focused(false) = event {
@@ -236,6 +240,15 @@ pub fn run() {
             commands::update_provider_config,
             commands::get_hook_server_port,
             commands::install_gemini_hooks,
+            commands::get_window_context,
+            commands::open_main_window,
+            commands::open_quick_window,
+            commands::navigate_deep_link,
+            commands::tool_gate_decide,
+            commands::tool_run_status,
+            commands::tool_list_artifacts,
+            commands::emit_task_event,
+            commands::emit_refresh_quick,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

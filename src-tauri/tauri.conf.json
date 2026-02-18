@@ -14,8 +14,8 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "label": "main",
-        "title": "Alice",
+        "label": "quick",
+        "title": "Alice Quick",
         "width": 360,
         "height": 640,
         "maxHeight": 800,
@@ -24,6 +24,20 @@
         "visible": false,
         "resizable": false,
         "skipTaskbar": true,
+        "alwaysOnTop": false
+      },
+      {
+        "label": "main",
+        "title": "Alice",
+        "width": 1200,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 640,
+        "decorations": true,
+        "transparent": false,
+        "visible": false,
+        "resizable": true,
+        "skipTaskbar": false,
         "alwaysOnTop": false
       }
     ],
